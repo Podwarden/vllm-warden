@@ -1,0 +1,30 @@
+[project]
+name = "vllm-warden"
+version = "2.0.0"
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "ASYNC"]
+ignore = ["E501"]
+
+[tool.ruff.lint.flake8-bugbear]
+# fastapi.Depends() is always safe in function-parameter defaults.
+extend-immutable-calls = ["fastapi.Depends", "Depends"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra --strict-markers"
+markers = [
+    "integration: requires real subprocess + filesystem",
+]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true

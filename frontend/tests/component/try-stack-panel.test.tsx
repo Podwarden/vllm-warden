@@ -1,0 +1,366 @@
+// TryStackHistory (#162) — presentational attempt list on the model detail
+// try-stack panel.
+//
+// Pins the contract from the backend GET /api/models/{id}/try-stack shape:
+//   - the engine combo (channel + vLLM version) renders per attempt
+//   - a failed attempt surfaces its error and the classifier's suggested next
+//     combo (suggested_next.suggestion)
+//   - an ok attempt renders without a suggestion (nothing to suggest)
+//
+// The container (TryStackPanel) wraps the SWR fetch + POST round-trips; this
+// suite drives the pure presentational export directly, no fetch stub needed.
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import {
+  render,
+  screen,
+  fireEvent,
+  waitFor,
+  cleanup,
+} from "@testing-library/react";
+import { SWRConfig } from "swr";
+import {
+  TryStackHistory,
+  TryStackPanel,
+  type StackAttempt,
+} from "@/components/models/try-stack-panel";
+import { setAccessToken, setCsrfToken } from "@/lib/auth-fetch";
+
+const FAILED: StackAttempt = {
+  id: "a1",
+  channel: "cuda-stable",
+  vllm_version: "0.20.0",
+  image: "vllm/vllm-openai:v0.20.0",
+  result: "failed",
+  error: "oom",
+  category: "oom",
+  suggested_next: { suggestion: "lower gpu_memory_utilization" },
+  created_at: "now",
+};
+
+const OK: StackAttempt = {
+  id: "a2",
+  channel: "cuda-nightly",
+  vllm_version: "0.21.0",
+  image: "vllm/vllm-openai:nightly",
+  result: "ok",
+  error: null,
+  category: null,
+  suggested_next: null,
+  created_at: "later",
+};
+
+describe("TryStackHistory", () => {
+  afterEach(cleanup);
+
+  it("renders attempts with result + suggestion", () => {
+    render(<TryStackHistory attempts={[FAILED]} />);
+    expect(screen.getByText(/cuda-stable/)).toBeInTheDocument();
+    expect(screen.getByText(/0\.20\.0/)).toBeInTheDocument();
+    expect(screen.getByText(/oom/)).toBeInTheDocument();
+    expect(screen.getByText(/lower gpu_memory_utilization/)).toBeInTheDocument();
+  });
+
+  it("renders an ok attempt without a suggestion", () => {
+    render(<TryStackHistory attempts={[OK]} />);
+    expect(screen.getByText(/cuda-nightly/)).toBeInTheDocument();
+    expect(screen.queryByText(/Suggested next/i)).toBeNull();
+  });
+
+  it("renders an empty-state hint when there are no attempts", () => {
+    render(<TryStackHistory attempts={[]} />);
+    expect(screen.getByText(/no attempts/i)).toBeInTheDocument();
+  });
+});
+
+// TryStackPanel container — the try / report / save round-trips.
+//
+// The defect this pins: a "pending" attempt must be reportable as ok/failed
+// THROUGH THE UI (POST /api/models/{id}/try-stack/{attempt_id}), otherwise the
+// "Save working combo as template" button (gated on result === "ok") is
+// unreachable. Network is stubbed at the global `fetch` boundary so the
+// auth-fetch wrapper is exercised end-to-end; SWR cache is isolated per test
+// via a fresh provider Map.
+
+const PENDING: StackAttempt = {
+  id: "att-1",
+  channel: "cuda-stable",
+  vllm_version: "0.20.0",
+  image: "vllm/vllm-openai:v0.20.0",
+  result: "pending",
+  error: null,
+  category: null,
+  suggested_next: null,
+  created_at: "now",
+};
+
+function json(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+interface Captured {
+  url: string;
+  method: string;
+  body: Record<string, unknown> | null;
+}
+
+// Stub GET try-stack (returns `attempts`) + POST report. The GET result flips
+// to `ok` after a successful report so the panel re-renders the save button.
+function installTryStackStub(modelId: string) {
+  const calls: Captured[] = [];
+  let attempts: StackAttempt[] = [PENDING];
+  const listUrl = `/api/models/${modelId}/try-stack`;
+  const mock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === "string" ? input : input.toString();
+    const method = init?.method ?? "GET";
+    const body = init?.body ? JSON.parse(init.body as string) : null;
+    calls.push({ url, method, body });
+    if (url === "/api/auth/refresh") return json({ access_token: "test-jwt-refreshed" });
+    if (url === "/api/csrf") return json({ csrf: "test-csrf" });
+    // #177: driver capability — docker driver honors the pin, so the version
+    // selector is enabled (the default for these existing round-trip tests).
+    if (url === "/api/system/engine") {
+      return json({ driver: "docker", supports_version_select: true, vllm_version: "0.21.0" });
+    }
+    // #177: the version field is now a combobox backed by this endpoint.
+    if (url.startsWith("/api/templates/engine-versions")) {
+      return json({
+        channel: "cuda-stable",
+        family: "vllm/vllm-openai",
+        versions: ["0.21.0", "0.20.0"],
+        error: null,
+      });
+    }
+    if (url === listUrl && method === "GET") return json({ attempts });
+    if (url === `${listUrl}/att-1` && method === "POST") {
+      attempts = [{ ...PENDING, result: body?.result === "ok" ? "ok" : "failed", error: body?.error ?? null }];
+      return json({ ok: true });
+    }
+    if (url === "/api/models/templates" && method === "POST") return json({ id: "saved" }, 201);
+    throw new Error(`Unmocked fetch: ${method} ${url}`);
+  });
+  vi.stubGlobal("fetch", mock);
+  return { calls };
+}
+
+function renderPanel(modelId: string) {
+  return render(
+    <SWRConfig value={{ provider: () => new Map(), dedupingInterval: 0 }}>
+      <TryStackPanel modelId={modelId} hfRepo="openai/gpt-oss-20b" maxModelLen={4096} tensorParallelSize={2} />
+    </SWRConfig>,
+  );
+}
+
+describe("TryStackPanel report round-trip", () => {
+  beforeEach(() => {
+    setAccessToken("test-jwt");
+    setCsrfToken("test-csrf");
+  });
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it("offers a report control while the latest attempt is pending", async () => {
+    installTryStackStub("m1");
+    renderPanel("m1");
+    await waitFor(() => expect(screen.getByTestId("try-stack-report")).toBeInTheDocument());
+    expect(screen.getByTestId("try-stack-report-ok")).toBeInTheDocument();
+    expect(screen.getByTestId("try-stack-report-failed")).toBeInTheDocument();
+    // Save-as-template is NOT offered yet (attempt is still pending).
+    expect(screen.queryByTestId("try-stack-save-template")).toBeNull();
+  });
+
+  it("POSTs result=ok to the attempt endpoint and then reveals save-as-template", async () => {
+    const stub = installTryStackStub("m2");
+    renderPanel("m2");
+    await waitFor(() => expect(screen.getByTestId("try-stack-report-ok")).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId("try-stack-report-ok"));
+
+    await waitFor(() => {
+      const post = stub.calls.find(
+        (c) => c.url === "/api/models/m2/try-stack/att-1" && c.method === "POST",
+      );
+      expect(post).toBeTruthy();
+      expect(post?.body).toEqual({ result: "ok" });
+    });
+    // Once the attempt is ok, the save-as-template control appears and the
+    // pending report control is gone.
+    await waitFor(() => expect(screen.getByTestId("try-stack-save-template")).toBeInTheDocument());
+    expect(screen.queryByTestId("try-stack-report")).toBeNull();
+  });
+
+  it("includes the failure detail when reporting result=failed", async () => {
+    const stub = installTryStackStub("m3");
+    renderPanel("m3");
+    await waitFor(() => expect(screen.getByTestId("try-stack-report-error")).toBeInTheDocument());
+    fireEvent.change(screen.getByTestId("try-stack-report-error"), {
+      target: { value: "CUDA OOM at load" },
+    });
+    fireEvent.click(screen.getByTestId("try-stack-report-failed"));
+
+    await waitFor(() => {
+      const post = stub.calls.find(
+        (c) => c.url === "/api/models/m3/try-stack/att-1" && c.method === "POST",
+      );
+      expect(post?.body).toEqual({ result: "failed", error: "CUDA OOM at load" });
+    });
+  });
+});
+
+// #177: the vLLM-version field is a typeable dropdown populated from the
+// published image-resolving versions (GET /api/templates/engine-versions),
+// but it MUST remain free-text — an operator may need an unpublished version
+// or a pinned digest the catalog won't list. This pins both halves: the
+// fetched options surface AND a typed value still drives the Try button.
+describe("TryStackPanel vLLM-version combobox (#177)", () => {
+  beforeEach(() => {
+    setAccessToken("test-jwt");
+    setCsrfToken("test-csrf");
+  });
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it("offers fetched versions as suggestions yet accepts a typed value", async () => {
+    installTryStackStub("mv");
+    renderPanel("mv");
+
+    const field = await screen.findByTestId("try-stack-version");
+    // Try is disabled until a non-empty version is present.
+    expect(screen.getByTestId("try-stack-submit")).toBeDisabled();
+
+    // Focusing surfaces the fetched options (0.21.0 / 0.20.0).
+    fireEvent.focus(field);
+    await waitFor(() => expect(screen.getByText("0.21.0")).toBeInTheDocument());
+    expect(screen.getByText("0.20.0")).toBeInTheDocument();
+
+    // Picking a suggestion commits it and enables Try.
+    fireEvent.mouseDown(screen.getByText("0.20.0"));
+    await waitFor(() =>
+      expect(screen.getByTestId("try-stack-submit")).not.toBeDisabled(),
+    );
+    expect((field as HTMLInputElement).value).toBe("0.20.0");
+
+    // The field is still free-text: a version NOT in the fetched list is
+    // accepted verbatim and keeps Try enabled (escape hatch).
+    fireEvent.change(field, { target: { value: "0.99.0-unpublished" } });
+    expect((field as HTMLInputElement).value).toBe("0.99.0-unpublished");
+    expect(screen.getByTestId("try-stack-submit")).not.toBeDisabled();
+  });
+
+  it("works as plain free-text when no versions are available", async () => {
+    // Override the engine-versions stub to an empty list (non-resolvable
+    // channel / Docker Hub hiccup): the field still drives the Try button.
+    const modelId = "mv2";
+    const listUrl = `/api/models/${modelId}/try-stack`;
+    const mock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const method = init?.method ?? "GET";
+      if (url === "/api/auth/refresh") return json({ access_token: "test-jwt-refreshed" });
+      if (url === "/api/csrf") return json({ csrf: "test-csrf" });
+      if (url === "/api/system/engine") {
+        return json({ driver: "docker", supports_version_select: true, vllm_version: null });
+      }
+      if (url.startsWith("/api/templates/engine-versions")) {
+        return json({ channel: "cuda-stable", family: null, versions: [], error: null });
+      }
+      if (url === listUrl && method === "GET") return json({ attempts: [] });
+      throw new Error(`Unmocked fetch: ${method} ${url}`);
+    });
+    vi.stubGlobal("fetch", mock);
+
+    renderPanel(modelId);
+    const field = await screen.findByTestId("try-stack-version");
+    expect(screen.getByTestId("try-stack-submit")).toBeDisabled();
+    fireEvent.change(field, { target: { value: "0.20.0" } });
+    expect((field as HTMLInputElement).value).toBe("0.20.0");
+    await waitFor(() =>
+      expect(screen.getByTestId("try-stack-submit")).not.toBeDisabled(),
+    );
+  });
+});
+
+// #177 driver-capability guard: when the deployment runs the in-container
+// subprocess engine (GET /api/system/engine -> supports_version_select:false),
+// the version selector is meaningless — the pin would be silently discarded.
+// The panel must DISABLE the controls and show an explanatory note instead of
+// letting the operator pin a version that won't take effect.
+describe("TryStackPanel driver-capability guard (#177)", () => {
+  beforeEach(() => {
+    setAccessToken("test-jwt");
+    setCsrfToken("test-csrf");
+  });
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  function installEngineStub(opts: {
+    supports: boolean;
+    vllmVersion: string | null;
+    withEngine?: boolean; // false => never answer /api/system/engine (loading)
+  }) {
+    const mock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const method = init?.method ?? "GET";
+      if (url === "/api/auth/refresh") return json({ access_token: "test-jwt-refreshed" });
+      if (url === "/api/csrf") return json({ csrf: "test-csrf" });
+      if (url === "/api/system/engine") {
+        if (opts.withEngine === false) return new Promise<Response>(() => {}); // never resolves
+        return json({
+          driver: opts.supports ? "docker" : "subprocess",
+          supports_version_select: opts.supports,
+          vllm_version: opts.vllmVersion,
+        });
+      }
+      if (url.startsWith("/api/templates/engine-versions")) {
+        return json({ channel: "cuda-stable", family: "vllm/vllm-openai", versions: ["0.20.0"], error: null });
+      }
+      if (url.startsWith("/api/models/") && method === "GET") return json({ attempts: [] });
+      throw new Error(`Unmocked fetch: ${method} ${url}`);
+    });
+    vi.stubGlobal("fetch", mock);
+  }
+
+  it("disables the version selector and shows a note when version-select is unsupported", async () => {
+    installEngineStub({ supports: false, vllmVersion: "0.20.0" });
+    renderPanel("ms");
+
+    await waitFor(() =>
+      expect(screen.getByTestId("try-stack-driver-note")).toBeInTheDocument(),
+    );
+    // The note names the baked vLLM version.
+    expect(screen.getByTestId("try-stack-driver-note").textContent).toMatch(/0\.20\.0/);
+    // Controls are disabled.
+    expect(screen.getByTestId("try-stack-version")).toBeDisabled();
+    expect(screen.getByTestId("try-stack-channel")).toBeDisabled();
+    expect(screen.getByTestId("try-stack-submit")).toBeDisabled();
+  });
+
+  it("keeps controls enabled and hides the note when version-select is supported", async () => {
+    installEngineStub({ supports: true, vllmVersion: "0.21.0" });
+    renderPanel("md");
+
+    // Wait until we know the driver is capable, then assert the note is absent.
+    await waitFor(() => expect(screen.getByTestId("try-stack-channel")).not.toBeDisabled());
+    expect(screen.queryByTestId("try-stack-driver-note")).toBeNull();
+    expect(screen.getByTestId("try-stack-channel")).not.toBeDisabled();
+    // (Try stays disabled only because no version is typed yet — not the guard.)
+    expect(screen.getByTestId("try-stack-version")).not.toBeDisabled();
+  });
+
+  it("does not disable while engine info is still loading (no flash)", async () => {
+    installEngineStub({ supports: false, vllmVersion: null, withEngine: false });
+    renderPanel("ml");
+
+    // The channel select renders immediately; while engine info is undefined we
+    // must NOT disable it (avoids a disabled flash for the common capable case).
+    const channel = await screen.findByTestId("try-stack-channel");
+    expect(channel).not.toBeDisabled();
+    expect(screen.queryByTestId("try-stack-driver-note")).toBeNull();
+  });
+});
