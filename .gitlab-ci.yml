@@ -1,0 +1,202 @@
+stages:
+  - cleanup
+  - lint
+  - test
+  - build
+  - publish
+
+variables:
+  PYTHON_IMAGE: python:3.11-slim
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_NO_CACHE_DIR: "1"
+
+# Project runners are shell executors; `image:` directives are ignored. Wrap
+# Python commands in `docker run` so the host shell does not need a Python
+# toolchain installed.
+.docker-python:
+  before_script:
+    - docker pull "$PYTHON_IMAGE"
+
+# One-shot cleanup of root-owned cache files left in the runner build dir by
+# earlier docker-as-root pipelines. GIT_STRATEGY=none skips get_sources, which
+# would otherwise fail on those same root-owned files.
+cleanup-stale-caches:
+  stage: cleanup
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - docker run --rm -v "$PWD":/work -w /work "$PYTHON_IMAGE" sh -c 'find . -maxdepth 6 -type d \( -name __pycache__ -o -name .pytest_cache -o -name .ruff_cache -o -name .mypy_cache \) -exec rm -rf {} + 2>/dev/null || true'
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+lint:
+  stage: lint
+  extends: .docker-python
+  script:
+    - |
+      docker run --rm \
+        --user "$(id -u):$(id -g)" \
+        -e HOME=/tmp \
+        -v "$PWD":/app -w /app "$PYTHON_IMAGE" sh -c '
+        pip install --user -r requirements.txt -r requirements-dev.txt &&
+        export PATH=/tmp/.local/bin:$PATH &&
+        ruff check app tests
+      '
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+unit-tests:
+  stage: test
+  extends: .docker-python
+  script:
+    - |
+      docker run --rm \
+        --user "$(id -u):$(id -g)" \
+        -e HOME=/tmp \
+        -v "$PWD":/app -w /app "$PYTHON_IMAGE" sh -c '
+        pip install --user -r requirements.txt -r requirements-dev.txt &&
+        export PATH=/tmp/.local/bin:$PATH &&
+        pytest tests/unit -v --tb=short --junitxml=pytest-unit.xml
+      '
+  artifacts:
+    when: always
+    reports:
+      junit: pytest-unit.xml
+    paths:
+      - pytest-unit.xml
+    expire_in: 1 week
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+build-image:
+  stage: build
+  script:
+    # VW_BUILD_VERSION = CI tag for releases, else short SHA for branch builds.
+    # VW_BUILD_SHA always = short SHA. Both are surfaced through GET /api/version
+    # for the nav footer (spec 2026-05-13 §Version surfacing, P1-9).
+    - VW_BUILD_VERSION="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
+    - |
+      docker build \
+        --build-arg "VW_BUILD_VERSION=$VW_BUILD_VERSION" \
+        --build-arg "VW_BUILD_SHA=$CI_COMMIT_SHORT_SHA" \
+        -t vllm-warden:$CI_COMMIT_SHORT_SHA .
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+lint:frontend:
+  stage: lint
+  script:
+    - |
+      docker run --rm \
+        --user "$(id -u):$(id -g)" \
+        -e HOME=/tmp \
+        -v "$PWD":/app -w /app node:20-alpine sh -c '
+        cd frontend && npm ci && npm run lint && npm run typecheck
+      '
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+build:ui:
+  stage: build
+  script:
+    # #67 fix — plumb the same VW_BUILD_VERSION / VW_BUILD_SHA build-args
+    # into the UI image as the backend image. Without these the
+    # NEXT_PUBLIC_VW_BUILD_VERSION / NEXT_PUBLIC_VW_BUILD_SHA envs
+    # inlined into the Next bundle fall back to the Dockerfile defaults
+    # ("dev" / "unknown"), producing a confusing footer banner on CI
+    # builds. Matches the backend's pattern exactly so the two images
+    # always carry the same identity for a given commit.
+    - VW_BUILD_VERSION="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
+    - |
+      docker build \
+        --build-arg "VW_BUILD_VERSION=$VW_BUILD_VERSION" \
+        --build-arg "VW_BUILD_SHA=$CI_COMMIT_SHORT_SHA" \
+        -t vllm-warden-ui:$CI_COMMIT_SHORT_SHA frontend/
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+typecheck:api-types:
+  stage: lint
+  extends: .docker-python
+  script:
+    - |
+      docker run --rm \
+        --user "$(id -u):$(id -g)" \
+        -e HOME=/tmp \
+        -v "$PWD":/app -w /app "$PYTHON_IMAGE" sh -c '
+        pip install --user -q -r requirements.txt -r requirements-dev.txt &&
+        export PATH=/tmp/.local/bin:$PATH &&
+        python -c "import json, sys; from app.main import app; sys.stdout.write(json.dumps(app.openapi()))" > /app/openapi.json
+      '
+    - |
+      docker run --rm \
+        --user "$(id -u):$(id -g)" \
+        -e HOME=/tmp \
+        -v "$PWD":/app -w /app node:20-alpine sh -c '
+        cd /app/frontend && npm ci &&
+        npx -y openapi-typescript@7 /app/openapi.json -o /tmp/api-types.generated.ts &&
+        diff -u src/lib/api-types.generated.ts /tmp/api-types.generated.ts
+      '
+    - rm -f openapi.json
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+# Vitest unit + component suite — covers the NavBar, header-metrics
+# widget, header-metrics-stream singleton, auth-fetch + login flows,
+# SSE hook regressions, and the smaller table/modal pieces. Runs in
+# the same node:20-alpine image as `lint:frontend` so the install
+# cache primes once per pipeline.
+vitest:frontend:
+  stage: test
+  script:
+    - |
+      docker run --rm \
+        --user "$(id -u):$(id -g)" \
+        -e HOME=/tmp \
+        -v "$PWD":/app -w /app node:20-alpine sh -c '
+        cd frontend && npm ci && npm test
+      '
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+# Manual mirror of `main` to the public GitHub repo as a single squashed
+# commit. Runs only on `main` push pipelines so the maintainer can pull
+# the trigger after a release lands. Logic lives in
+# scripts/publish-github.sh (versioned + auditable) rather than inline.
+publish:github:
+  stage: publish
+  rules:
+    - if: '$CI_COMMIT_REF_NAME == "main" && $CI_PIPELINE_SOURCE == "push"'
+      when: manual
+      allow_failure: false
+  variables:
+    GIT_DEPTH: "0"
+    GIT_STRATEGY: clone
+  # Runners are shell executors (`image:` is ignored), so run the publish
+  # tooling inside a container. Stage dir lives in /tmp inside the container
+  # (see publish-github.sh), so the mounted checkout can be read-only and no
+  # root-owned files leak back into the runner build dir.
+  # GITHUB_PUBLISH_SSH_KEY is a protected File variable; $GITHUB_PUBLISH_SSH_KEY
+  # is its path on the runner — mount it read-only and tell the script via
+  # GITHUB_PUBLISH_SSH_KEY_FILE.
+  script:
+    - |
+      docker run --rm \
+        -e CI_COMMIT_REF_NAME \
+        -e CI_PROJECT_DIR=/app \
+        -e GITHUB_PUBLISH_SSH_KEY_FILE=/tmp/gh_deploy_key \
+        -v "$GITHUB_PUBLISH_SSH_KEY":/tmp/gh_deploy_key:ro \
+        -v "$PWD":/app:ro -w /app alpine:latest sh -c '
+        apk add --no-cache git bash rsync openssh-client &&
+        bash scripts/publish-github.sh
+      '
