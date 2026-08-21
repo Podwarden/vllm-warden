@@ -7,6 +7,39 @@ release ships.
 
 ## [Unreleased]
 
+## [v2026.08.21.2] — 2026-08-21
+
+### Fixed
+- **The GitHub publish shipped CI's test report.** `v2026.08.21.1` put
+  `pytest-unit.xml` on GitHub. The publish job declared no `dependencies:`,
+  and a GitLab job without that key downloads the artifacts of **every** job
+  in every earlier stage into its build dir — `unit-tests` publishes
+  `pytest-unit.xml` as a `paths:` artifact, not merely a `reports:` one.
+  `GIT_STRATEGY: clone` does not help: the artifact download happens *after*
+  the clone. The publish then rsyncs the build directory, so the report was
+  staged as if it were repository content. The RFC1918 sanitation warning
+  counting 5 files on CI against 4 locally was the tell — the report embeds
+  test fixture strings — and it was read as noise rather than as evidence.
+
+  `publish:github` now declares `dependencies: []`, which downloads nothing
+  and keeps holding for artifacts added later by someone who never thinks
+  about this job. `publish/exclude.txt` also names the report and the common
+  coverage outputs, but that only covers the artifact we already know about;
+  the empty dependency list is what covers the next one.
+
+- **`publish/exclude.txt` now excludes untracked local build products**
+  (`openapi.json`, `docker-compose.uitest.yml`). The publish stages the
+  *working directory* with rsync and knows nothing about `.gitignore`, so a
+  local dry run staged two gitignored files that CI's fresh clone never had.
+  Harmless here — and the direction of the discrepancy meant CI published
+  *less* than the local run, not more — but it means a workstation publish and
+  a CI publish did not produce the same tree, which defeats the purpose of
+  dry-running it.
+
+  Verified by planting `pytest-unit.xml` in the build dir inside
+  `alpine:latest` to reproduce the artifact download, then confirming it does
+  not reach the stage and the RFC1918 warn count drops back to 4.
+
 ## [v2026.08.21.1] — 2026-08-21
 
 ### Fixed
