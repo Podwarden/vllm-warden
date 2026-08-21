@@ -14,7 +14,7 @@
     "app_family": "vllm-warden",
     "publisher": "PodWarden",
     "author": "PodWarden",
-    "author_url": "https://git.mediablade.net/podwarden/apps/vllm-warden",
+    "author_url": "https://github.com/Podwarden/vllm-warden",
     "documentation": "https://www.podwarden.com/docs/apps/vllm-warden",
     "is_public": true,
     "is_approved": true,

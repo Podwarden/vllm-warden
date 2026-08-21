@@ -203,7 +203,16 @@ def test_proxy_nonstream_wallclock_reaper_returns_504(tmp_data_dir, client):
     """Reaper (non-stream) — a ``resp.aread()`` that outlives
     ``request_max_wall_s`` is bounded by ``asyncio.wait_for``: the proxy tears
     down the upstream response + httpx client (vLLM aborts + frees KV), releases
-    the slot, and returns a clean 504 instead of pinning the slot forever."""
+    the slot, and returns a clean 504 instead of pinning the slot forever.
+
+    This models real httpx semantics ONLY if the upstream is sent with
+    ``stream=True``: with ``stream=False`` httpx reads the whole body *inside*
+    ``send()`` (which runs under ``timeout=None``), and ``resp.aread()`` then
+    returns the buffered body instantly — so ``asyncio.wait_for`` would bound
+    nothing and the reaper would be dead. The explicit ``stream=True`` assertion
+    below is the regression guard for that (a runaway non-stream generation
+    pinned the slot for 94 min in prod when this had regressed to
+    ``stream=is_stream``)."""
     client.get("/healthz")
     plaintext = _seed(tmp_data_dir / "vllm-warden.db")
     client.app.state.supervisor._ports["qwen"] = 19099
@@ -214,7 +223,7 @@ def test_proxy_nonstream_wallclock_reaper_returns_504(tmp_data_dir, client):
 
     fake_resp = _HangingResp(delay=5.0)  # would hang 5s without the backstop
 
-    with patch("httpx.AsyncClient.send", new=AsyncMock(return_value=fake_resp)), \
+    with patch("httpx.AsyncClient.send", new=AsyncMock(return_value=fake_resp)) as send_mock, \
          patch("httpx.AsyncClient.aclose", new=AsyncMock()) as client_aclose, \
          patch("app.proxy.routes._record_counters", new=AsyncMock()):
         r = client.post(
@@ -226,6 +235,10 @@ def test_proxy_nonstream_wallclock_reaper_returns_504(tmp_data_dir, client):
     assert r.status_code == 504
     fake_resp.aclose.assert_awaited()
     client_aclose.assert_awaited()
+    # The reaper is only real if the body read is deferred to aread(); that
+    # requires the upstream to be sent with stream=True even for a non-stream
+    # client. Lock it in so a revert to stream=is_stream fails here, not in prod.
+    assert send_mock.await_args.kwargs.get("stream") is True
 
 
 def _set_priority(db_path, priority):

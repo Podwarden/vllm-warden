@@ -33,8 +33,16 @@ export const RUNTIME_HINTS: Record<string, FieldHint> = {
     restart: 'none',
   },
   rotation_grace_hours: {
+    // #185 — this value is stored and validated but nothing reads it: the
+    // rotate route's default is a Pydantic literal and the dialog's is its
+    // own useState. The old hint described a behaviour the product does not
+    // have. Not wired up here deliberately — a 0 saved in settings would
+    // PRE-SELECT immediate revoke in the rotate dialog, which is the footgun
+    // #185 exists to close, arriving through the settings door. Tracked
+    // separately alongside `default_token_expiration_days`, which is inert
+    // in exactly the same way.
     label: 'Rotation grace window',
-    hint: 'When you rotate a token, the old one stays valid for this many hours. Lets you swap creds in your clients without downtime.',
+    hint: 'Not yet wired up — rotation currently defaults to 24h and the rotate dialog is where you choose the grace window (or revoke the old token immediately).',
     restart: 'none',
   },
   session_access_ttl_minutes: {
@@ -65,6 +73,31 @@ export const RUNTIME_HINTS: Record<string, FieldHint> = {
   landing_page_enabled: {
     label: 'Public landing page',
     hint: 'When enabled, the unified-port root (`https://your-warden/`) serves a public HTML landing page with links to /ui, the source repo, and podwarden.com. Disable for a private deployment that should 404 at the root.',
+    restart: 'none',
+  },
+  watchdog_enabled: {
+    label: 'Engine watchdog',
+    hint: 'Probes each loaded engine\'s own /health and restarts it when it stops answering. The warden\'s exit watcher only sees the `vllm serve` wrapper, which can outlive a dead EngineCore — when that happens the model still reads "loaded", /v1/models still returns 200, and every generation fails until someone notices. Leave on unless you are debugging a live crash and want the scene preserved.',
+    restart: 'none',
+  },
+  watchdog_restore_on_boot: {
+    label: 'Reload model after warden restart',
+    hint: 'The engine is a child of the warden process, so restarting the warden takes the engine down with it. When enabled, any model that was serving at that moment is loaded again with its stored settings. Models that were mid-pull, deliberately unloaded, or failed on their own merits are left alone.',
+    restart: 'none',
+  },
+  watchdog_interval_s: {
+    label: 'Watchdog probe interval (seconds)',
+    hint: 'How often each loaded engine is probed. 5–3600.',
+    restart: 'none',
+  },
+  watchdog_failure_threshold: {
+    label: 'Failures before restart',
+    hint: 'Consecutive failed probes before the engine is declared dead. 2–20. With the default 30s interval, 3 means roughly 90 seconds — long enough that a GC pause or a momentary hang does not trigger a restart.',
+    restart: 'none',
+  },
+  watchdog_max_restarts: {
+    label: 'Max automatic restarts per hour',
+    hint: 'Crash-loop guard. After this many automatic restarts within an hour the model is left failed so the evidence survives and a human can look. Set to 0 to detect and record crashes without ever restarting automatically.',
     restart: 'none',
   },
   public_url: {
@@ -123,6 +156,12 @@ export const RUNTIME_MAINTENANCE_KEYS = [
   'vllm_version',
   // Logs
   'log_retention_lines',
+  // Engine watchdog
+  'watchdog_enabled',
+  'watchdog_restore_on_boot',
+  'watchdog_interval_s',
+  'watchdog_failure_threshold',
+  'watchdog_max_restarts',
 ] as const;
 
 export const MODEL_HINTS: Record<string, FieldHint> = {

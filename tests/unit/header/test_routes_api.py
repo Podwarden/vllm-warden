@@ -181,7 +181,7 @@ async def test_active_model_returns_none_when_no_loaded_row(
     _seed_done(db_path)
     settings = client.app.state.settings
     out = await _active_model(settings.db_path)
-    assert out == (None, None)
+    assert out == (None, None, None)
 
 
 async def test_active_model_returns_tuple_when_loaded_row_present(
@@ -210,7 +210,7 @@ async def test_active_model_returns_tuple_when_loaded_row_present(
 
     settings = client.app.state.settings
     out = await _active_model(settings.db_path)
-    assert out == ("m-loaded", "gpt-oss-20b")
+    assert out == ("m-loaded", "gpt-oss-20b", "loaded")
 
 
 async def test_active_model_skips_loaded_row_without_runtime(
@@ -234,7 +234,7 @@ async def test_active_model_skips_loaded_row_without_runtime(
 
     settings = client.app.state.settings
     out = await _active_model(settings.db_path)
-    assert out == (None, None)
+    assert out == (None, None, None)
 
 
 async def test_get_cache_reuses_system_gpus_cache(client):
@@ -301,3 +301,175 @@ def test_header_metrics_interval_clamps_to_floor():
             os.environ.pop("VW_HEADER_METRICS_INTERVAL_S", None)
         else:
             os.environ["VW_HEADER_METRICS_INTERVAL_S"] = saved
+
+
+async def test_active_model_surfaces_loading_row_without_runtime(
+    tmp_data_dir, client
+):
+    """A row still in 'loading' must surface so the header badge can say
+    "loading" rather than falling through to "idle".
+
+    A loading row has NO ``model_runtime`` sibling — the supervisor writes
+    that only once the engine answers — so this case is exactly the one the
+    strict JOIN used to drop. A 27B load takes minutes; reading "idle" for
+    that whole window told the operator the opposite of the truth.
+    """
+    client.get("/healthz")
+    db_path = tmp_data_dir / "vllm-warden.db"
+    _seed_done(db_path)
+    with sqlite3.connect(db_path) as db:
+        db.execute(
+            "INSERT INTO models(id, served_model_name, hf_repo, hf_revision, "
+            "gpu_indices, tensor_parallel_size, dtype, max_model_len, "
+            "gpu_memory_utilization, trust_remote_code, extra_args, status) "
+            "VALUES ('m-loading', 'qwen3.8-27b', 'o/r', 'main', '[0]', 1, "
+            "NULL, NULL, 0.9, 0, '[]', 'loading')"
+        )
+        db.commit()
+
+    settings = client.app.state.settings
+    out = await _active_model(settings.db_path)
+    assert out == ("m-loading", "qwen3.8-27b", "loading")
+
+
+async def test_active_model_prefers_loaded_over_loading(tmp_data_dir, client):
+    """With both a serving row and a loading row present, the serving one
+    wins the identity slot — the badge must not demote a live engine to
+    "loading" because a second model started loading beside it."""
+    client.get("/healthz")
+    db_path = tmp_data_dir / "vllm-warden.db"
+    _seed_done(db_path)
+    with sqlite3.connect(db_path) as db:
+        db.execute(
+            "INSERT INTO models(id, served_model_name, hf_repo, hf_revision, "
+            "gpu_indices, tensor_parallel_size, dtype, max_model_len, "
+            "gpu_memory_utilization, trust_remote_code, extra_args, status) "
+            "VALUES ('m-loading', 'incoming', 'o/r', 'main', '[0]', 1, "
+            "NULL, NULL, 0.9, 0, '[]', 'loading')"
+        )
+        db.execute(
+            "INSERT INTO models(id, served_model_name, hf_repo, hf_revision, "
+            "gpu_indices, tensor_parallel_size, dtype, max_model_len, "
+            "gpu_memory_utilization, trust_remote_code, extra_args, status) "
+            "VALUES ('m-loaded', 'serving', 'o/r', 'main', '[1]', 1, "
+            "NULL, NULL, 0.9, 0, '[]', 'loaded')"
+        )
+        db.execute(
+            "INSERT INTO model_runtime(model_id, pid, port) "
+            "VALUES ('m-loaded', 99999, 11000)"
+        )
+        db.commit()
+
+    settings = client.app.state.settings
+    out = await _active_model(settings.db_path)
+    assert out == ("m-loaded", "serving", "loaded")
+
+
+def test_payload_surfaces_active_model_status():
+    """``_payload`` echoes the status so the frontend can pick the label
+    and dot colour without re-deriving state from the name alone."""
+    out = _payload(
+        SNAP_TWO_GPUS,
+        active_id="m-loading",
+        active_name="qwen3.8-27b",
+        active_status="loading",
+    )
+    assert out["active_model"] == "qwen3.8-27b"
+    assert out["active_model_id"] == "m-loading"
+    assert out["active_model_status"] == "loading"
+
+
+def test_payload_active_model_status_is_null_when_idle():
+    """No model at all → the status field is present but null, so the
+    frontend never has to distinguish "absent key" from "nothing loaded"."""
+    out = _payload(
+        SNAP_TWO_GPUS, active_id=None, active_name=None, active_status=None
+    )
+    assert out["active_model"] is None
+    assert out["active_model_status"] is None
+
+
+async def test_active_model_surfaces_failed_row(tmp_data_dir, client):
+    """A crashed model must surface as 'failed' so the badge can go red.
+
+    This is the state that matters most operationally and was the most
+    invisible: after an engine death the row sits in 'failed' indefinitely
+    (nothing auto-restores it), while the header cheerfully read "idle" —
+    indistinguishable from a clean box with nothing loaded.
+    """
+    client.get("/healthz")
+    db_path = tmp_data_dir / "vllm-warden.db"
+    _seed_done(db_path)
+    with sqlite3.connect(db_path) as db:
+        db.execute(
+            "INSERT INTO models(id, served_model_name, hf_repo, hf_revision, "
+            "gpu_indices, tensor_parallel_size, dtype, max_model_len, "
+            "gpu_memory_utilization, trust_remote_code, extra_args, status) "
+            "VALUES ('m-failed', 'crashed-model', 'o/r', 'main', '[0]', 1, "
+            "NULL, NULL, 0.9, 0, '[]', 'failed')"
+        )
+        db.commit()
+
+    settings = client.app.state.settings
+    out = await _active_model(settings.db_path)
+    assert out == ("m-failed", "crashed-model", "failed")
+
+
+async def test_active_model_prefers_loading_over_failed(tmp_data_dir, client):
+    """Retrying a crashed model must flip the badge to 'loading', not leave
+    it red — the operator's retry has to be visibly acknowledged."""
+    client.get("/healthz")
+    db_path = tmp_data_dir / "vllm-warden.db"
+    _seed_done(db_path)
+    with sqlite3.connect(db_path) as db:
+        db.execute(
+            "INSERT INTO models(id, served_model_name, hf_repo, hf_revision, "
+            "gpu_indices, tensor_parallel_size, dtype, max_model_len, "
+            "gpu_memory_utilization, trust_remote_code, extra_args, status) "
+            "VALUES ('m-failed', 'crashed-model', 'o/r', 'main', '[0]', 1, "
+            "NULL, NULL, 0.9, 0, '[]', 'failed')"
+        )
+        db.execute(
+            "INSERT INTO models(id, served_model_name, hf_repo, hf_revision, "
+            "gpu_indices, tensor_parallel_size, dtype, max_model_len, "
+            "gpu_memory_utilization, trust_remote_code, extra_args, status) "
+            "VALUES ('m-loading', 'incoming', 'o/r', 'main', '[1]', 1, "
+            "NULL, NULL, 0.9, 0, '[]', 'loading')"
+        )
+        db.commit()
+
+    settings = client.app.state.settings
+    out = await _active_model(settings.db_path)
+    assert out == ("m-loading", "incoming", "loading")
+
+
+async def test_active_model_prefers_loaded_over_failed(tmp_data_dir, client):
+    """A live engine outranks an unrelated stale 'failed' row — one bad row
+    must never paint a serving box red."""
+    client.get("/healthz")
+    db_path = tmp_data_dir / "vllm-warden.db"
+    _seed_done(db_path)
+    with sqlite3.connect(db_path) as db:
+        db.execute(
+            "INSERT INTO models(id, served_model_name, hf_repo, hf_revision, "
+            "gpu_indices, tensor_parallel_size, dtype, max_model_len, "
+            "gpu_memory_utilization, trust_remote_code, extra_args, status) "
+            "VALUES ('m-failed', 'crashed-model', 'o/r', 'main', '[0]', 1, "
+            "NULL, NULL, 0.9, 0, '[]', 'failed')"
+        )
+        db.execute(
+            "INSERT INTO models(id, served_model_name, hf_repo, hf_revision, "
+            "gpu_indices, tensor_parallel_size, dtype, max_model_len, "
+            "gpu_memory_utilization, trust_remote_code, extra_args, status) "
+            "VALUES ('m-loaded', 'serving', 'o/r', 'main', '[1]', 1, "
+            "NULL, NULL, 0.9, 0, '[]', 'loaded')"
+        )
+        db.execute(
+            "INSERT INTO model_runtime(model_id, pid, port) "
+            "VALUES ('m-loaded', 99999, 11000)"
+        )
+        db.commit()
+
+    settings = client.app.state.settings
+    out = await _active_model(settings.db_path)
+    assert out == ("m-loaded", "serving", "loaded")

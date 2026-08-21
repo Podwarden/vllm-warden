@@ -2,7 +2,7 @@
 #
 # Caddy listens on :8080 (the sole host-published port) and fans out to
 # the internal api + ui containers. External reverse proxies (e.g.
-# vllm.protrener.com) point at this listener — no need to expose api:8080
+# vllm.example.com) point at this listener — no need to expose api:8080
 # and ui:3000 separately to the host.
 #
 # Routing map (see docs/superpowers/specs/2026-05-23-unified-port-architecture-design.md):

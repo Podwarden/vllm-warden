@@ -48,27 +48,47 @@ export function HeaderMetrics() {
   const reconnecting = status === 'reconnecting';
   const probeError = frame?.probe_error ?? null;
 
-  // Choose an accent color: emerald (healthy + loaded), slate (healthy
-  // + idle), amber (reconnecting / probe-error), red (terminal). We
-  // deliberately desaturate the idle state so the widget doesn't
-  // demand attention when nothing is happening.
+  // The engine's own state, independent of the stream's health. Older API
+  // builds omit the field entirely, in which case a non-null active_model
+  // means exactly one thing — loaded — which is the pre-status contract.
+  const modelStatus =
+    frame?.active_model_status ?? (frame?.active_model ? 'loaded' : null);
+  const failed = !terminal && modelStatus === 'failed';
+  const loading = !terminal && modelStatus === 'loading';
+  const loaded = !terminal && modelStatus === 'loaded';
+
+  // Accent: red (terminal / failed), amber (reconnecting / probe-error),
+  // sky (loading), emerald (loaded), slate (idle). We deliberately
+  // desaturate the idle state so the widget doesn't demand attention when
+  // nothing is happening.
+  //
+  // Order matters: a *failed* engine outranks the amber "instruments are
+  // unreliable" hint. A degraded nvidia-smi probe must never mask a dead
+  // engine — that inversion is how a crash stays invisible.
   const accent =
-    terminal ? 'text-red-400' :
+    terminal || failed ? 'text-red-400' :
     reconnecting || probeError ? 'text-amber-400' :
-    frame?.active_model ? 'text-emerald-400' :
+    loading ? 'text-sky-400' :
+    loaded ? 'text-emerald-400' :
     'text-slate-400';
 
   const dot =
-    terminal ? 'bg-red-400/80' :
+    terminal || failed ? 'bg-red-400/80' :
     reconnecting || probeError ? 'bg-amber-400/80' :
-    frame?.active_model ? 'bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.6)]' :
+    loading ? 'bg-sky-400 animate-pulse' :
+    loaded ? 'bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.6)]' :
     'bg-slate-500/70';
 
   const vramPct = terminal ? null : frame?.vram_pct ?? null;
   const gpuPct = terminal ? null : frame?.gpu_util_pct ?? null;
-  const modelLabel = terminal
-    ? 'offline'
-    : frame?.active_model ?? 'idle';
+  // 'offline' = the stream is gone (we know nothing). 'error' = the stream
+  // is fine and is telling us the engine died — two different failures that
+  // must not share a word.
+  const modelLabel =
+    terminal ? 'offline' :
+    failed ? 'error' :
+    loading ? 'loading' :
+    frame?.active_model ?? 'idle';
 
   // Build a single-line tooltip that surfaces the data the badge omits:
   // per-GPU breakdown, probe error, status hint.
@@ -83,8 +103,11 @@ export function HeaderMetrics() {
         `  ${name}: ${gib(g.memory_used_mib)}/${gib(g.memory_total_mib)} GiB · util ${g.utilization_pct}%`,
       );
     }
+    // The badge collapses 'loading'/'failed' to a bare word, so the model's
+    // name would otherwise be unreachable exactly when you most want it.
     if (frame.active_model) {
-      tooltipLines.push(`Loaded: ${frame.active_model}`);
+      const verb = failed ? 'Failed' : loading ? 'Loading' : 'Loaded';
+      tooltipLines.push(`${verb}: ${frame.active_model}`);
     }
   }
   if (probeError) tooltipLines.push(`Probe error: ${probeError}`);
@@ -109,6 +132,7 @@ export function HeaderMetrics() {
       title={tooltip}
       data-testid="header-metrics"
       data-status={status}
+      data-model-status={modelStatus ?? 'idle'}
       className={[
         'hidden md:inline-flex items-center gap-2',
         'h-8 px-2.5 rounded-md',

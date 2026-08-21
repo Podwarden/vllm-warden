@@ -1,5 +1,7 @@
 import sqlite3
+from datetime import timedelta
 
+from app.db.repos.tokens import sqlite_utc_in, sqlite_utc_now
 from tests.conftest import csrf_header, jwt_login, seed_admin_user
 
 
@@ -196,10 +198,12 @@ def test_list_includes_status_fields(tmp_data_dir, client):
         "rotated_from",
         "successor_id",
         "revoked_at",
+        "is_revoked",
     ):
         assert key in item, f"missing key {key} in list item"
     assert item["is_expired"] is False
     assert item["is_near_expiry"] is False
+    assert item["is_revoked"] is False
 
 
 def test_rotate_inherits_predecessor_expiry(tmp_data_dir, client):
@@ -292,6 +296,137 @@ def test_rotate_rejects_grace_hours_above_max(tmp_data_dir, client):
         headers={**auth, **h},
     )
     assert r.status_code == 422, r.text
+
+
+def test_rotate_rejects_negative_grace_hours(tmp_data_dir, client):
+    """#185 acceptance 3 — the route validates ``grace_hours >= 0``.
+
+    ``ge=0`` on TokenRotate has always covered this; nothing pinned it, so a
+    future widening of the bound (e.g. to allow "revoke N hours ago") would
+    have shipped unnoticed. -1 would write a revoked_at in the PAST, which is
+    indistinguishable from an immediate revoke but arrives without anyone
+    having chosen it.
+    """
+    client.get("/healthz")
+    _seed_done(tmp_data_dir / "vllm-warden.db")
+    auth = _jwt_login(client)
+    h = csrf_header(client)
+    create = client.post("/api/tokens", json={"name": "ci-bot"}, headers={**auth, **h})
+    old_id = create.json()["id"]
+    r = client.post(
+        f"/api/tokens/{old_id}/rotate",
+        json={"grace_hours": -1},
+        headers={**auth, **h},
+    )
+    assert r.status_code == 422, r.text
+
+
+def test_rotate_grace_zero_revokes_predecessor_now(tmp_data_dir, client):
+    """#185 — grace_hours=0 writes revoked_at = now (not now + 24h).
+
+    Asserts the persisted column against the same clock format
+    ``require_bearer`` compares with, so a regression that ignored
+    ``grace_hours`` and always applied the 24h default would fail here.
+    The 401 itself is pinned end-to-end in
+    tests/integration/test_token_rotate_grace.py.
+    """
+    client.get("/healthz")
+    db_path = tmp_data_dir / "vllm-warden.db"
+    _seed_done(db_path)
+    auth = _jwt_login(client)
+    h = csrf_header(client)
+    create = client.post("/api/tokens", json={"name": "leaked"}, headers={**auth, **h})
+    old_id = create.json()["id"]
+
+    r = client.post(
+        f"/api/tokens/{old_id}/rotate",
+        json={"grace_hours": 0},
+        headers={**auth, **h},
+    )
+    assert r.status_code == 201, r.text
+    # The response echoes the grace the server applied — the success modal
+    # narrates the hard cut from this rather than from client-side intent.
+    assert r.json()["grace_hours"] == 0
+
+    with sqlite3.connect(db_path) as db:
+        (revoked_at,) = db.execute(
+            "SELECT revoked_at FROM api_tokens WHERE id = ?", (old_id,),
+        ).fetchone()
+    assert revoked_at is not None, "grace_hours=0 must set revoked_at"
+    assert revoked_at <= sqlite_utc_now(), (
+        f"grace_hours=0 must revoke NOW, not in the future; got {revoked_at!r}"
+    )
+
+    # And the list marks it so the UI badge can say "Rotated (revoked)".
+    items = {it["id"]: it for it in client.get("/api/tokens", headers=auth).json()["items"]}
+    assert items[old_id]["is_revoked"] is True
+    assert items[old_id]["rotated_at"] is not None
+
+
+def test_rotate_default_grace_echoes_24_and_leaves_predecessor_live(
+    tmp_data_dir, client,
+):
+    """#185 acceptance 2 — omitting grace_hours preserves the 24h behaviour."""
+    client.get("/healthz")
+    db_path = tmp_data_dir / "vllm-warden.db"
+    _seed_done(db_path)
+    auth = _jwt_login(client)
+    h = csrf_header(client)
+    create = client.post("/api/tokens", json={"name": "ci-bot"}, headers={**auth, **h})
+    old_id = create.json()["id"]
+
+    r = client.post(f"/api/tokens/{old_id}/rotate", json={}, headers={**auth, **h})
+    assert r.status_code == 201, r.text
+    assert r.json()["grace_hours"] == 24
+
+    with sqlite3.connect(db_path) as db:
+        (revoked_at,) = db.execute(
+            "SELECT revoked_at FROM api_tokens WHERE id = ?", (old_id,),
+        ).fetchone()
+    assert revoked_at > sqlite_utc_now(), (
+        f"default rotation must leave a FUTURE revoked_at; got {revoked_at!r}"
+    )
+    items = {it["id"]: it for it in client.get("/api/tokens", headers=auth).json()["items"]}
+    assert items[old_id]["is_revoked"] is False
+
+
+def test_test_endpoint_reports_revoked_the_way_auth_decides_it(tmp_data_dir, client):
+    """#185 — ``/test`` must not call a token inside its grace window revoked.
+
+    ``revoked_at`` is a FUTURE timestamp for the whole grace window, so the
+    old ``is not None`` check reported "token is revoked" about a token that
+    authenticates fine — and said exactly the same thing after a hard cut,
+    making the Test button useless for confirming a revocation landed.
+    """
+    client.get("/healthz")
+    db_path = tmp_data_dir / "vllm-warden.db"
+    _seed_done(db_path)
+    auth = _jwt_login(client)
+    h = csrf_header(client)
+    create = client.post("/api/tokens", json={"name": "probe"}, headers={**auth, **h})
+    tid = create.json()["id"]
+
+    # Grace window still open → future revoked_at → NOT revoked.
+    with sqlite3.connect(db_path) as db:
+        db.execute(
+            "UPDATE api_tokens SET revoked_at = ? WHERE id = ?",
+            (sqlite_utc_in(timedelta(hours=24)), tid),
+        )
+        db.commit()
+    r = client.post(f"/api/tokens/{tid}/test", headers={**auth, **h})
+    assert r.status_code == 200, r.text
+    assert r.json()["revoked"] is False, "a token inside its grace window is not revoked"
+
+    # Grace window elapsed → past revoked_at → revoked.
+    with sqlite3.connect(db_path) as db:
+        db.execute(
+            "UPDATE api_tokens SET revoked_at = ? WHERE id = ?",
+            (sqlite_utc_in(timedelta(seconds=-1)), tid),
+        )
+        db.commit()
+    r = client.post(f"/api/tokens/{tid}/test", headers={**auth, **h})
+    assert r.status_code == 200, r.text
+    assert r.json()["revoked"] is True
 
 
 def test_list_includes_rotated_predecessor_during_grace(tmp_data_dir, client):

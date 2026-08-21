@@ -27,6 +27,9 @@ function fakeItem(overrides: Partial<TokenItem> = {}): TokenItem {
     is_expired: false,
     is_near_expiry: false,
     revoked_at: null,
+    // #185 — server-computed `revoked_at <= now`; false for a token whose
+    // grace window is still open as well as for one that was never revoked.
+    is_revoked: false,
     // S5 (#104) defaults — matches the backend's "unlimited / mid-priority /
     // no usage" defaults for a freshly minted token.
     rate_limit_tps: null,
@@ -122,6 +125,97 @@ describe('RotateTokenDialog', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: /copied/i })).toBeInTheDocument());
     expect(execSpy).toHaveBeenCalledWith('copy');
     expect(screen.queryByText(/select and copy the token manually/i)).not.toBeInTheDocument();
+  });
+
+  // ---- #185: grace vs immediate revoke -------------------------------------
+
+  function rotateOk(extra = '') {
+    return vi.fn().mockResolvedValue(new Response(
+      '{"plaintext":"vw_rotated","rotated_from":"old","id":"new","name":"ci-bot",' +
+      `"renamed_to":"ci-bot (old 1)"${extra}}`,
+      { status: 201 },
+    ));
+  }
+
+  function bodyOf(fetchMock: ReturnType<typeof vi.fn>) {
+    return JSON.parse(String(fetchMock.mock.calls[0][1].body));
+  }
+
+  it('defaults to the grace mode and submits grace_hours: 24 (#185 AC2)', async () => {
+    const f = rotateOk();
+    vi.stubGlobal('fetch', f);
+    render(<RotateTokenDialog open tokenId="old" onClose={() => {}} />);
+    expect((screen.getByTestId('rotate-mode-grace') as HTMLInputElement).checked).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: /^rotate$/i }));
+    await waitFor(() => expect(f).toHaveBeenCalled());
+    expect(bodyOf(f).grace_hours).toBe(24);
+  });
+
+  it('submits grace_hours: 0 when "revoke immediately" is chosen (#185 AC1)', async () => {
+    const f = rotateOk();
+    vi.stubGlobal('fetch', f);
+    render(<RotateTokenDialog open tokenId="old" onClose={() => {}} />);
+    fireEvent.click(screen.getByTestId('rotate-mode-immediate'));
+    // The hours input is gone in immediate mode — the mode IS the value.
+    expect(screen.queryByLabelText(/grace period \(hours\)/i)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /^rotate$/i }));
+    await waitFor(() => expect(f).toHaveBeenCalled());
+    expect(bodyOf(f).grace_hours).toBe(0);
+  });
+
+  it('warns that in-flight requests are not cancelled (#185)', () => {
+    render(<RotateTokenDialog open tokenId="old" onClose={() => {}} />);
+    expect(screen.getByText(/finish or hit the read timeout/i)).toBeInTheDocument();
+  });
+
+  it('rejects a blank grace field instead of silently hard-revoking (#185)', async () => {
+    // Regression guard: `Number("") === 0`, so before #185 clearing the box —
+    // the natural "never mind, leave the default" gesture — passed validation
+    // and POSTed grace_hours: 0, hard-revoking a token nobody meant to cut.
+    const f = rotateOk();
+    vi.stubGlobal('fetch', f);
+    render(<RotateTokenDialog open tokenId="old" onClose={() => {}} />);
+    fireEvent.change(screen.getByLabelText(/grace period \(hours\)/i), { target: { value: '' } });
+    fireEvent.click(screen.getByRole('button', { name: /^rotate$/i }));
+    await waitFor(() =>
+      expect(screen.getByText(/enter a grace period in hours/i)).toBeInTheDocument(),
+    );
+    expect(f).not.toHaveBeenCalled();
+  });
+
+  it('resets to grace mode after close so the next token is not hard-cut (#185)', async () => {
+    const f = rotateOk();
+    vi.stubGlobal('fetch', f);
+    render(<RotateTokenDialog open tokenId="old" onClose={() => {}} />);
+    fireEvent.click(screen.getByTestId('rotate-mode-immediate'));
+    expect((screen.getByTestId('rotate-mode-immediate') as HTMLInputElement).checked).toBe(true);
+
+    // Cancel calls handleClose() → reset(). The parent in this test keeps the
+    // dialog mounted, which is exactly how we can observe the reset.
+    fireEvent.click(screen.getByRole('button', { name: /cancel/i }));
+    expect((screen.getByTestId('rotate-mode-grace') as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByTestId('rotate-mode-immediate') as HTMLInputElement).checked).toBe(false);
+  });
+
+  it('narrates the hard cut from the grace_hours the server echoed (#185)', async () => {
+    vi.stubGlobal('fetch', rotateOk(',"grace_hours":0'));
+    render(<RotateTokenDialog open tokenId="old" onClose={() => {}} />);
+    fireEvent.click(screen.getByTestId('rotate-mode-immediate'));
+    fireEvent.click(screen.getByRole('button', { name: /^rotate$/i }));
+    await waitFor(() => expect(screen.getByText('vw_rotated')).toBeInTheDocument());
+    const outcome = screen.getByTestId('rotate-outcome').textContent ?? '';
+    expect(outcome).toMatch(/revoked now/i);
+    expect(outcome).not.toMatch(/keep working through the grace period/i);
+  });
+
+  it('narrates the grace window when the server echoed a non-zero grace (#185)', async () => {
+    vi.stubGlobal('fetch', rotateOk(',"grace_hours":24'));
+    render(<RotateTokenDialog open tokenId="old" onClose={() => {}} />);
+    fireEvent.click(screen.getByRole('button', { name: /^rotate$/i }));
+    await waitFor(() => expect(screen.getByText('vw_rotated')).toBeInTheDocument());
+    const outcome = screen.getByTestId('rotate-outcome').textContent ?? '';
+    expect(outcome).toMatch(/keep working through the grace period/i);
+    expect(outcome).not.toMatch(/revoked now/i);
   });
 
   it('shows "select manually" only when BOTH copy paths fail (#149)', async () => {
@@ -253,6 +347,42 @@ describe('TokenRow', () => {
       </tbody></table>,
     );
     expect(screen.getByText(/orphan/i)).toBeInTheDocument();
+  });
+
+  it('shows "Rotated (grace)" while the predecessor still authenticates (#185)', () => {
+    render(
+      <table><tbody>
+        <TokenRow
+          item={fakeItem({
+            rotated_at: '2026-02-01 00:00:00',
+            revoked_at: '2026-02-02 00:00:00',
+            is_revoked: false,
+          })}
+          onChange={() => {}}
+        />
+      </tbody></table>,
+    );
+    expect(screen.getByText(/rotated \(grace\)/i)).toBeInTheDocument();
+  });
+
+  it('shows "Rotated (revoked)" once the predecessor is cut off (#185)', () => {
+    // Before #185 this row read amber "Rotated (grace)" forever, because the
+    // only revoked branch was gated on `rotated_at == null`. An operator who
+    // had just hard-revoked a leaked key was told a grace window was open.
+    render(
+      <table><tbody>
+        <TokenRow
+          item={fakeItem({
+            rotated_at: '2026-02-01 00:00:00',
+            revoked_at: '2026-02-01 00:00:00',
+            is_revoked: true,
+          })}
+          onChange={() => {}}
+        />
+      </tbody></table>,
+    );
+    expect(screen.getByText(/rotated \(revoked\)/i)).toBeInTheDocument();
+    expect(screen.queryByText(/rotated \(grace\)/i)).not.toBeInTheDocument();
   });
 
   it('surfaces delete error to the operator', async () => {

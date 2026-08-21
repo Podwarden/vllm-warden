@@ -51,6 +51,11 @@ export interface HeaderMetricsFrame {
   gpu_util_pct: number;
   active_model: string | null;
   active_model_id: string | null;
+  // Optional at the type level on purpose: the UI and API ship as separate
+  // images and can skew, so a UI newer than its API must still render. When
+  // the key is absent the widget falls back to deriving 'loaded' from a
+  // non-null active_model — the old contract's only meaning.
+  active_model_status?: 'loaded' | 'loading' | 'failed' | null;
   probe_error: string | null;
 }
 

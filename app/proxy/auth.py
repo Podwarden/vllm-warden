@@ -26,6 +26,11 @@ async def require_bearer(request: Request) -> TokenRow:
         # `revoked_at` is set to a FUTURE timestamp by rotate() to implement
         # a grace window during which the predecessor must keep working.
         # Reject only once the grace window has elapsed (revoked_at <= now).
+        # The `<=` is load-bearing for immediate revoke (#185): rotate with
+        # grace_hours=0 writes revoked_at = now, and both sides are
+        # second-granularity strings, so a request landing in the same second
+        # compares EQUAL. Tightening this to `<` would silently give a
+        # hard-revoked token an up-to-1s admission window.
         if row.revoked_at is not None and row.revoked_at <= sqlite_utc_now():
             raise HTTPException(401, "token revoked")
         await repo.touch_last_used(row.id)

@@ -3,7 +3,7 @@
 Lives behind Caddy's `handle /` block, which rewrites the request to
 `/_landing` before forwarding to the warden. The route is intentionally
 unauthenticated: it exists so an operator who points a browser at
-`https://vllm.protrener.com/` sees a useful entry-point instead of a 404.
+`https://vllm.example.com/` sees a useful entry-point instead of a 404.
 
 The landing page can be disabled per-deployment via the
 `landing_page_enabled` setting (default `'true'`, seeded by migration

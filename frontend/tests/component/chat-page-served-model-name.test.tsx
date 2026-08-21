@@ -11,7 +11,7 @@
 // because all prior models on the test fleet had served_model_name == id.
 // Qwen3.6-27B was deployed 2026-05-22 with served_model_name="qwen3.6-27b"
 // distinct from its id, and every chat send started 404'ing on
-// https://vllm.protrener.com/ui/chat.
+// https://vllm.example.com/ui/chat.
 //
 // Fix: resolve modelId -> served_model_name via the already-loaded
 // `loadedModels` list before placing it on the wire. The picker key

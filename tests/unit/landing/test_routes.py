@@ -16,7 +16,7 @@ root behind Caddy. The 4 cases below pin the contract called out in
      silently strip the entry-points.
 
 No JWT is involved — these tests exercise the same anonymous request
-shape a browser hitting `https://vllm.protrener.com/` would make after
+shape a browser hitting `https://vllm.example.com/` would make after
 Caddy's rewrite.
 """
 

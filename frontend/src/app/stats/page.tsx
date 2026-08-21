@@ -21,8 +21,8 @@
 //
 // Range persistence: usePersistedRange('vw.stats.range') — reload-safe.
 
-import { useMemo, useState } from "react";
 import Link from "next/link";
+import { useMemo, useState } from "react";
 import useSWR from "swr";
 import { authFetchJSON } from "@/lib/auth-fetch";
 import {
@@ -153,6 +153,15 @@ export default function StatsPage() {
             </p>
           )}
         </div>
+        <div className="flex items-center gap-3">
+        <Link
+          href="/godmode"
+          data-testid="godmode-link"
+          className="inline-flex h-9 items-center gap-1.5 rounded-md border border-slate-700 bg-slate-900/50 px-3 text-xs text-slate-300 transition-colors hover:bg-slate-800 hover:text-slate-100"
+        >
+          <span aria-hidden className="text-emerald-400">◉</span>
+          God Mode
+        </Link>
         <div
           role="group"
           aria-label="Time range"
@@ -179,6 +188,7 @@ export default function StatsPage() {
               </button>
             );
           })}
+        </div>
         </div>
       </div>
 

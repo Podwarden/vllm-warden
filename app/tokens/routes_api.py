@@ -182,6 +182,12 @@ async def rotate_token(
         # UI surfaces this in the success modal: "old token renamed to <name>"
         # so the operator immediately knows where their previous bearer landed.
         "renamed_to": renamed_to,
+        # #185 — echo the grace the server actually applied. 0 means the
+        # predecessor's revoked_at is now, i.e. it is rejected on its very
+        # next request. The success modal narrates from this rather than from
+        # what the client remembers asking for, and scripted callers get a
+        # confirmation of the hard cut.
+        "grace_hours": body.grace_hours,
     }
 
 
@@ -209,6 +215,13 @@ async def list_tokens(request: Request, _user: str = Depends(require_jwt)):
 
     def _enrich(r):
         is_expired = r.expires_at is not None and r.expires_at <= now_str
+        # #185 — `revoked_at` alone cannot distinguish "grace window still
+        # open" from "already cut off"; both are non-null. Compute the same
+        # comparison require_bearer makes (app/proxy/auth.py) server-side so
+        # the status badge doesn't depend on the operator's workstation clock.
+        # Same staleness characteristics as is_expired: `now_str` is captured
+        # once per list call, i.e. up to one 10s UI poll behind.
+        is_revoked = r.revoked_at is not None and r.revoked_at <= now_str
         is_near = (
             r.expires_at is not None
             and not is_expired
@@ -233,6 +246,7 @@ async def list_tokens(request: Request, _user: str = Depends(require_jwt)):
             "is_expired": is_expired,
             "is_near_expiry": is_near,
             "revoked_at": r.revoked_at,
+            "is_revoked": is_revoked,
             # S5 (#104) — surface rate/priority + 24h usage rollup so the
             # UI can paint the new "Rate / Priority / Last 24h" columns
             # without an extra round-trip per row.
@@ -376,7 +390,16 @@ async def test_token(
         "rate_limit_tps": token_row.rate_limit_tps,
         "priority": token_row.priority,
         "proxy_reachable": proxy_reachable,
-        "revoked": token_row.revoked_at is not None,
+        # Mirror app/proxy/auth.py::require_bearer — `revoked_at` is a FUTURE
+        # timestamp for the whole of a rotation grace window, so a non-null
+        # value on its own does NOT mean "this token is being rejected".
+        # Reporting it as revoked made Test lie in both directions: about a
+        # predecessor still inside a healthy grace window, and about one that
+        # was hard-cut with grace_hours=0 (#185).
+        "revoked": (
+            token_row.revoked_at is not None
+            and token_row.revoked_at <= sqlite_utc_now()
+        ),
         "expired": token_row.expires_at is not None and token_row.expires_at <= sqlite_utc_now(),
     }
 

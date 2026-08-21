@@ -1110,6 +1110,138 @@ def _diagnose_or(settings, model_id: str, fallback: str) -> str:
     return diag.message if diag is not None else fallback
 
 
+async def start_engine(settings, sup, port_alloc, model, port, overrides=None):
+    """Spawn an engine and drive it to `loaded`: health wait, warmup, status.
+
+    Extracted from the load route so the engine watchdog restarts a crashed model
+    through the EXACT same path a manual load takes. A copy would drift, and the
+    watchdog would silently restore a model differently from how an operator
+    loads it -- the two-implementations-one-fix bug this codebase keeps hitting.
+    """
+    model_id = model.id
+    load_overrides = overrides
+
+    async def on_exit(rc: int) -> None:
+        async with open_db(settings.db_path) as db:
+            row = await ModelRepo(db).get(model_id)
+            if row is not None and row.status in ("loaded", "loading"):
+                was = row.status
+                last_error = _diagnose_or(
+                    settings,
+                    model_id,
+                    f"vllm subprocess exited unexpectedly (rc={rc})",
+                )
+                # Always carry the rc so operators can correlate with the log.
+                if not last_error.endswith(f"(rc={rc})"):
+                    last_error = f"{last_error} (rc={rc})"
+                await ModelRepo(db).update_status(
+                    model_id,
+                    "failed",
+                    last_error=last_error,
+                )
+                # Hand the watchdog a machine-readable reason to restart this.
+                # Only a row that was actually SERVING earns an automatic
+                # restart: a 'loading' row that never came up is usually a bad
+                # config, and retrying that is a crash loop with a nicer name.
+                #
+                # This write is what makes recovery survive a diagnosis. The
+                # 2026-08-18 outage was exactly this path: the engine died
+                # seconds before the warden, on_exit wrote a diagnosed
+                # last_error, and boot reconciliation then skipped the
+                # already-'failed' row -- so the old string sentinel was never
+                # written and nothing ever restarted it.
+                if was == "loaded":
+                    await ModelRepo(db).set_prior_status(model_id, "loaded")
+                await RuntimeRepo(db).clear(model_id)
+        port_alloc.release(port)
+
+    async def _run_load():
+        try:
+            await sup.load(model, port=port, on_exit=on_exit, overrides=load_overrides)
+        except Exception as e:
+            async with open_db(settings.db_path) as db:
+                await ModelRepo(db).update_status(model_id, "failed", last_error=str(e))
+            port_alloc.release(port)
+            return
+        # The driver owns where the engine actually listens — loopback for
+        # the in-container subprocess, the engine container's DNS name for
+        # the docker driver. ``get_host`` returns None only if the engine
+        # vanished between spawn and here; loopback is the safe fallback.
+        host = sup.get_host(model_id) or "127.0.0.1"
+        ok = await wait_for_health(
+            port=port, host=host, timeout_s=settings.load_timeout_s
+        )
+        if not ok:
+            # Subprocess is left running; operator must force-unload to
+            # release GPUs. This is intentional (spec §"Load-route changes")
+            # — auto-SIGTERM here was the original race trigger.
+            # If the engine log reveals WHY it never came up (KV overflow, OOM,
+            # trust_remote_code), surface that instead of the bare timeout.
+            generic = "health timeout; subprocess still holding GPUs — force-unload to release"
+            diagnosed = _diagnose_or(settings, model_id, generic)
+            last_error = (
+                generic
+                if diagnosed == generic
+                else f"{diagnosed} (subprocess still holding GPUs — force-unload to release)"
+            )
+            async with open_db(settings.db_path) as db:
+                await ModelRepo(db).update_status(
+                    model_id,
+                    "failed",
+                    last_error=last_error,
+                )
+            return
+        await sup.mark_warming(model_id)
+        probe_result = await warmup_probe(
+            port=port,
+            host=host,
+            served_model_name=model.served_model_name,
+            timeout_s=settings.warmup_probe_timeout_s,
+        )
+        if not probe_result.ok:
+            # The probe failed — but the engine log may explain it crashed
+            # mid-warmup (e.g. a deferred KV-cache allocation OOM). Prefer the
+            # log diagnosis; fall back to the probe detail.
+            generic = (
+                f"{probe_result.detail}; subprocess still holding "
+                f"GPUs — force-unload to release"
+            )
+            diagnosed = _diagnose_or(settings, model_id, generic)
+            last_error = (
+                generic
+                if diagnosed == generic
+                else f"{diagnosed} (subprocess still holding GPUs — force-unload to release)"
+            )
+            async with open_db(settings.db_path) as db:
+                await ModelRepo(db).update_status(
+                    model_id,
+                    "failed",
+                    last_error=last_error,
+                )
+            return
+        await sup.mark_ready(model_id)
+        # #29 — persist health_ok=True now that the warmup probe has
+        # actually served a request. Stats/status badges and any future
+        # telemetry need to distinguish 'process up but never proved
+        # serving' from 'process up and served at least one request'.
+        # Both the upsert (creates the row with pid/port/started_at) and
+        # the update_health (writes the health columns) MUST happen in
+        # this success branch; the legacy code wrote only the upsert and
+        # left health_ok stuck at its default 0.
+        now_iso = datetime.now(UTC).isoformat()
+        async with open_db(settings.db_path) as db:
+            await ModelRepo(db).update_status(model_id, "loaded")
+            await RuntimeRepo(db).upsert(
+                model_id,
+                pid=sup.get_pid(model_id),
+                port=port,
+                started_at=now_iso,
+            )
+            await RuntimeRepo(db).update_health(model_id, True, now_iso)
+
+    await _run_load()
+
+
 @router.post("/{model_id}/load", status_code=202)
 async def load_model(model_id: str, request: Request, _user: str = Depends(require_jwt)):
     settings = request.app.state.settings
@@ -1219,111 +1351,9 @@ async def load_model(model_id: str, request: Request, _user: str = Depends(requi
 
     port = port_alloc.allocate()
 
-    async def on_exit(rc: int) -> None:
-        async with open_db(settings.db_path) as db:
-            row = await ModelRepo(db).get(model_id)
-            if row is not None and row.status in ("loaded", "loading"):
-                last_error = _diagnose_or(
-                    settings,
-                    model_id,
-                    f"vllm subprocess exited unexpectedly (rc={rc})",
-                )
-                # Always carry the rc so operators can correlate with the log.
-                if not last_error.endswith(f"(rc={rc})"):
-                    last_error = f"{last_error} (rc={rc})"
-                await ModelRepo(db).update_status(
-                    model_id,
-                    "failed",
-                    last_error=last_error,
-                )
-                await RuntimeRepo(db).clear(model_id)
-        port_alloc.release(port)
-
-    async def runner():
-        try:
-            await sup.load(model, port=port, on_exit=on_exit, overrides=load_overrides)
-        except Exception as e:
-            async with open_db(settings.db_path) as db:
-                await ModelRepo(db).update_status(model_id, "failed", last_error=str(e))
-            port_alloc.release(port)
-            return
-        # The driver owns where the engine actually listens — loopback for
-        # the in-container subprocess, the engine container's DNS name for
-        # the docker driver. ``get_host`` returns None only if the engine
-        # vanished between spawn and here; loopback is the safe fallback.
-        host = sup.get_host(model_id) or "127.0.0.1"
-        ok = await wait_for_health(
-            port=port, host=host, timeout_s=settings.load_timeout_s
-        )
-        if not ok:
-            # Subprocess is left running; operator must force-unload to
-            # release GPUs. This is intentional (spec §"Load-route changes")
-            # — auto-SIGTERM here was the original race trigger.
-            # If the engine log reveals WHY it never came up (KV overflow, OOM,
-            # trust_remote_code), surface that instead of the bare timeout.
-            generic = "health timeout; subprocess still holding GPUs — force-unload to release"
-            diagnosed = _diagnose_or(settings, model_id, generic)
-            last_error = (
-                generic
-                if diagnosed == generic
-                else f"{diagnosed} (subprocess still holding GPUs — force-unload to release)"
-            )
-            async with open_db(settings.db_path) as db:
-                await ModelRepo(db).update_status(
-                    model_id,
-                    "failed",
-                    last_error=last_error,
-                )
-            return
-        await sup.mark_warming(model_id)
-        probe_result = await warmup_probe(
-            port=port,
-            host=host,
-            served_model_name=model.served_model_name,
-            timeout_s=settings.warmup_probe_timeout_s,
-        )
-        if not probe_result.ok:
-            # The probe failed — but the engine log may explain it crashed
-            # mid-warmup (e.g. a deferred KV-cache allocation OOM). Prefer the
-            # log diagnosis; fall back to the probe detail.
-            generic = (
-                f"{probe_result.detail}; subprocess still holding "
-                f"GPUs — force-unload to release"
-            )
-            diagnosed = _diagnose_or(settings, model_id, generic)
-            last_error = (
-                generic
-                if diagnosed == generic
-                else f"{diagnosed} (subprocess still holding GPUs — force-unload to release)"
-            )
-            async with open_db(settings.db_path) as db:
-                await ModelRepo(db).update_status(
-                    model_id,
-                    "failed",
-                    last_error=last_error,
-                )
-            return
-        await sup.mark_ready(model_id)
-        # #29 — persist health_ok=True now that the warmup probe has
-        # actually served a request. Stats/status badges and any future
-        # telemetry need to distinguish 'process up but never proved
-        # serving' from 'process up and served at least one request'.
-        # Both the upsert (creates the row with pid/port/started_at) and
-        # the update_health (writes the health columns) MUST happen in
-        # this success branch; the legacy code wrote only the upsert and
-        # left health_ok stuck at its default 0.
-        now_iso = datetime.now(UTC).isoformat()
-        async with open_db(settings.db_path) as db:
-            await ModelRepo(db).update_status(model_id, "loaded")
-            await RuntimeRepo(db).upsert(
-                model_id,
-                pid=sup.get_pid(model_id),
-                port=port,
-                started_at=now_iso,
-            )
-            await RuntimeRepo(db).update_health(model_id, True, now_iso)
-
-    asyncio.create_task(runner())
+    asyncio.create_task(
+        start_engine(settings, sup, port_alloc, model, port, load_overrides)
+    )
     body: dict[str, Any] = {"status": "loading", "port": port}
     if context_capped is not None:
         body["context_capped"] = context_capped

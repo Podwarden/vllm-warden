@@ -13,11 +13,14 @@ existing ``test_supervisor_load`` assertions.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import signal
 from pathlib import Path
 
 from app.runtime.engine import EngineSpec
+
+log = logging.getLogger(__name__)
 
 
 class LocalHandle:
@@ -43,13 +46,36 @@ class LocalSubprocessDriver:
     # refuse an engine-version pin instead of launching the wrong version.
     supports_engine_image = False
 
-    def __init__(self, *, binary: str = "vllm", log_dir: str) -> None:
+    def __init__(
+        self, *, binary: str = "vllm", log_dir: str, log_max_bytes: int = 0
+    ) -> None:
         self._binary = binary
         self._log_dir = Path(log_dir)
+        self._log_max_bytes = log_max_bytes
+
+    def _rotate(self, log_path: Path) -> None:
+        """Keep one previous generation, then start fresh.
+
+        The log is opened O_APPEND and reused by every load, so without this it
+        only ever grows. It shares /data with the SQLite DB, and filling that
+        volume takes the database down with it (the 2026-06-15 ENOSPC
+        incident). Rotation happens at spawn, never mid-run, so no writer holds
+        the file we are replacing.
+        """
+        if self._log_max_bytes <= 0:
+            return
+        try:
+            if log_path.stat().st_size < self._log_max_bytes:
+                return
+            log_path.replace(log_path.with_suffix(".log.1"))
+        except OSError:
+            # Rotation is housekeeping; never let it stop an engine starting.
+            log.warning("could not rotate %s", log_path, exc_info=True)
 
     async def spawn(self, spec: EngineSpec) -> LocalHandle:
         self._log_dir.mkdir(parents=True, exist_ok=True)
         log_path = self._log_dir / f"{spec.model_id}.log"
+        self._rotate(log_path)
         log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         try:
             # `vllm serve` for the real binary; tests inject /bin/sh and pass

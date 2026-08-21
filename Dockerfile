@@ -1,6 +1,21 @@
-# TODO(release): replace digest below by running `docker pull vllm/vllm-openai:v0.25.1`
-# and copying the sha256 from `docker images --digests vllm/vllm-openai`.
-FROM vllm/vllm-openai@sha256:e4f88a835143cd22aee2397a26ec6bb80b3a4a6fe0c882bcbc63822904766089
+# TODO(release): replace the digest in VW_BASE_DIGEST below by running
+# `docker pull vllm/vllm-openai:v0.26.0` and copying the sha256 from
+# `docker images --digests vllm/vllm-openai`.
+#
+# v0.26.0 (was v0.25.1, sha256:e4f88a83...). Upgraded 2026-08-17 to diagnose an
+# EngineCore that dies mid-serving with NO traceback, NO CUDA error and no OOM
+# kill (node-wide /proc/vmstat oom_kill stayed 0 across nine deaths). v0.26.0
+# adds "log worker exit code when a process dies unexpectedly" (#38641), which
+# names the fatal signal instead of leaving us to infer it. Also carries a
+# DSv3.2 + MTP sequence-parallel accuracy fix; this deployment runs MTP.
+#
+# Declared as an ARG, not inlined into FROM, so this line is the SINGLE place
+# the base digest lives. CI's post-build cleanup greps it out of this file to
+# decide which vllm/vllm-openai layer sets are superseded and safe to evict
+# (vllm-warden#208). Inlining it would let the Dockerfile and the cleanup drift,
+# and a cleanup that reads a stale digest deletes the base you are still using.
+ARG VW_BASE_DIGEST=sha256:ffb2d59b1c059a5bd8d781320c9f5189de8293693b7d95da54befddaa54abf52
+FROM vllm/vllm-openai@${VW_BASE_DIGEST}
 
 WORKDIR /app
 
@@ -65,6 +80,35 @@ RUN python3 -c "import inspect; from vllm_gguf_plugin.quantization.config import
 # (no import-time UCX dlopen) is intentionally left in place.
 RUN rm -rf /usr/local/lib/python3.12/dist-packages/nixl_ep* && \
     python3 -c "import importlib.util as u; assert u.find_spec('nixl_ep') is None, 'nixl_ep still importable after removal'"
+
+# Bump NCCL 2.28.9 -> 2.30.4 (the base image ships 2.28.9).
+#
+# NCCL 2.28.9 deadlocks on CUDA-graph replay containing NCCL collectives:
+# the collective never returns, the TP worker stops answering, and vLLM's
+# watchdog eventually fires `TimeoutError: RPC call to sample_tokens timed
+# out` -> EngineDeadError. Workers stay ALIVE with no traceback, no CUDA
+# error and oom_kill=0, so every memory theory reads clean. Upstream
+# vllm#52504 verified deadlock on 2.28.9 and clean on 2.30.4 with nothing
+# else changed; `--enforce-eager` also avoids it, which is what isolated the
+# hang to captured-graph collectives rather than the collectives themselves.
+#
+# pw_prod ran exactly 2.28.9 with cudagraph_mode=FULL_AND_PIECEWISE and TP=4,
+# and died with that signature three times (2026-08-02, and twice on
+# 2026-08-18). Note the `sample_tokens` in the message is a red herring — the
+# sampler is innocent; the hang is upstream of it in the collective.
+#
+# torch 2.11.0+cu130 hard-pins nvidia-nccl-cu13==2.28.9, so pip prints an
+# incompatibility warning. It is metadata-only: NCCL keeps ABI compatibility
+# within major 2, and torch dlopens libnccl.so.2 from THIS package directory
+# (confirmed via /proc/self/maps) rather than the apt-installed
+# /usr/lib/x86_64-linux-gnu copy, which is left untouched.
+#
+# The assertion checks the wheel version AND that torch still loads the lib
+# from this package -- do NOT "verify" with torch.cuda.nccl.version(), which
+# reports the version torch was COMPILED against (still 2.28.9) and happily
+# reports success on a machine where nothing was upgraded.
+RUN pip install --no-cache-dir "nvidia-nccl-cu13==2.30.4" && \
+    python3 -c "import importlib.metadata as m, torch; v = m.version('nvidia-nccl-cu13'); assert v == '2.30.4', 'nccl wheel is ' + v; libs = [l.split()[-1] for l in open('/proc/self/maps') if 'libnccl.so' in l]; assert libs, 'torch mapped no libnccl'; assert 'dist-packages/nvidia/nccl' in libs[0], 'torch loads libnccl from ' + libs[0] + ' -- the upgraded wheel is NOT the runtime library'; print('nccl runtime lib:', libs[0], v)"
 
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt

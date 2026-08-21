@@ -25,7 +25,7 @@ import httpx
 import pytest
 from httpx import ASGITransport
 
-from app.db.repos.tokens import sqlite_utc_in
+from app.db.repos.tokens import sqlite_utc_in, sqlite_utc_now
 
 
 def _seed_admin(db_path):
@@ -132,18 +132,27 @@ async def test_grace_zero_immediately_rejects_old_token(app_and_client):
 
     await _rotate_token(client, mut, old_id, grace_hours=0)
 
-    # rotate(grace_hours=0) sets revoked_at = now-at-write-time, but
-    # require_bearer compares against now-at-read-time. On a loaded host the
-    # two `now()`s can land in the same clock tick → false-pass. Pin
-    # revoked_at one second into the past for determinism; the test narrative
-    # ("grace=0 → immediately rejected") is unchanged.
+    # NO fixup of revoked_at here — that is the whole point of the test (#185).
+    # An earlier version pinned revoked_at one second into the past "for
+    # determinism", which overwrote the value under assertion: the test then
+    # passed even if grace_hours had been ignored entirely and revoked_at set
+    # to now+24h, making it a duplicate of the grace-window test below.
+    #
+    # No fixup is needed. rotate(grace_hours=0) writes
+    # `sqlite_utc_in(timedelta(hours=0))`, i.e. now, and require_bearer
+    # compares `revoked_at <= sqlite_utc_now()` (app/proxy/auth.py) — `<=`,
+    # over second-granularity "%Y-%m-%d %H:%M:%S" strings. A request landing
+    # in the same second as the rotate therefore compares EQUAL and is
+    # rejected. The same-clock-tick case is the safe one, not the racy one.
     db_path = tmp_path / "vllm-warden.db"
     with sqlite3.connect(db_path) as conn:
-        conn.execute(
-            "UPDATE api_tokens SET revoked_at = ? WHERE id = ?",
-            (sqlite_utc_in(timedelta(seconds=-1)), old_id),
-        )
-        conn.commit()
+        (revoked_at,) = conn.execute(
+            "SELECT revoked_at FROM api_tokens WHERE id = ?", (old_id,),
+        ).fetchone()
+    assert revoked_at is not None, "grace_hours=0 must set revoked_at"
+    assert revoked_at <= sqlite_utc_now(), (
+        f"grace_hours=0 must revoke NOW, not schedule it; got {revoked_at!r}"
+    )
 
     # After rotate with grace=0, revoked_at <= now → require_bearer must reject.
     r = await _hit_bearer_route(client, old_plaintext)

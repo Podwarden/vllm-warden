@@ -27,16 +27,16 @@ class TestUrlCoercerHappyPath:
     @pytest.mark.parametrize(
         "raw, canonical",
         [
-            ("https://vllm.protrener.com", "https://vllm.protrener.com"),
+            ("https://vllm.example.com", "https://vllm.example.com"),
             # Trailing slash gets stripped so duplicates collapse.
-            ("https://vllm.protrener.com/", "https://vllm.protrener.com"),
+            ("https://vllm.example.com/", "https://vllm.example.com"),
             # http is allowed for LAN deployments.
             ("http://vllm.local", "http://vllm.local"),
             # Port is preserved.
-            ("https://vllm.protrener.com:8443", "https://vllm.protrener.com:8443"),
+            ("https://vllm.example.com:8443", "https://vllm.example.com:8443"),
             ("http://10.10.0.187:10000", "http://10.10.0.187:10000"),
             # Surrounding whitespace gets stripped before parse.
-            ("  https://vllm.protrener.com  ", "https://vllm.protrener.com"),
+            ("  https://vllm.example.com  ", "https://vllm.example.com"),
             # Path is preserved (only the trailing slash on the whole URL
             # is normalised, not slashes inside the path).
             ("https://x.example.com/api/v1", "https://x.example.com/api/v1"),

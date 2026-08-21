@@ -27,8 +27,9 @@ async def test_migrations_idempotent(tmp_data_dir):
         # S5/#104) + 0019 (power_samples, S7/#124) + 0020 (landing_page_enabled
         # seed, #155) + 0021 (public_url doc-only no-op, #154) + 0022
         # (engine_templates + stack_attempts, #162) + 0023 (drop ghost
-        # hf_cache_dir setting, 2026-06-15 ENOSPC follow-up).
-        assert count == 22
+        # hf_cache_dir setting, 2026-06-15 ENOSPC follow-up) + 0024
+        # (models.prior_status, so recovery stops keying on an error string).
+        assert count == 23
 
 
 async def test_migrations_create_all_v2_tables(tmp_data_dir):

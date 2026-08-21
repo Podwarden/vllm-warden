@@ -65,7 +65,12 @@ export type RuntimeKey =
   | "vllm_version"
   | "log_retention_lines"
   | "landing_page_enabled"
-  | "public_url";
+  | "public_url"
+  | "watchdog_enabled"
+  | "watchdog_restore_on_boot"
+  | "watchdog_interval_s"
+  | "watchdog_failure_threshold"
+  | "watchdog_max_restarts";
 
 // Sentinel the backend echoes for secret fields when a value exists.
 // We never round-trip this to the server (PATCH body strips keys whose
@@ -92,6 +97,11 @@ export interface Draft {
   log_retention_lines: number | null;
   landing_page_enabled: boolean;
   public_url: string;
+  watchdog_enabled: boolean;
+  watchdog_restore_on_boot: boolean;
+  watchdog_interval_s: number | null;
+  watchdog_failure_threshold: number | null;
+  watchdog_max_restarts: number | null;
 }
 
 function parseNumber(raw: string | null | undefined): number | null {
@@ -149,6 +159,13 @@ function snapshotToDraft(s: RuntimeResponse): Draft {
     log_retention_lines: parseNumber(s.log_retention_lines),
     landing_page_enabled: parseBool(s.landing_page_enabled, true),
     public_url: s.public_url ?? "",
+    // Absent rows fall back to the backend defaults so the toggles reflect
+    // actual behaviour on a warden that has never had these written.
+    watchdog_enabled: parseBool(s.watchdog_enabled, true),
+    watchdog_restore_on_boot: parseBool(s.watchdog_restore_on_boot, true),
+    watchdog_interval_s: parseNumber(s.watchdog_interval_s) ?? 30,
+    watchdog_failure_threshold: parseNumber(s.watchdog_failure_threshold) ?? 3,
+    watchdog_max_restarts: parseNumber(s.watchdog_max_restarts) ?? 3,
   };
 }
 

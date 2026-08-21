@@ -64,6 +64,36 @@ def test_cuda_module_loading_exact_accepted():
     assert env["CUDA_MODULE_LOADING"] == "LAZY"
 
 
+def test_faulthandler_on_by_default():
+    """A fatal signal must never kill the engine silently.
+
+    2026-08-18: EngineCore died 20 times in a night with no traceback, no exit
+    code and no core file. faulthandler is the cheapest thing that turns that
+    into a printed stack, so it is a default rather than an opt-in.
+    """
+    env = build_subprocess_env(_model({}), hf_token="tok", hf_cache_dir="/d")
+    assert env["PYTHONFAULTHANDLER"] == "1"
+
+
+def test_faulthandler_exact_accepted():
+    env = build_subprocess_env(
+        _model({"PYTHONFAULTHANDLER": "0"}),
+        hf_token="tok", hf_cache_dir="/d",
+    )
+    assert env["PYTHONFAULTHANDLER"] == "0"
+
+
+def test_pythonunbuffered_still_unreachable_via_the_faulthandler_hatch():
+    """Adding PYTHONFAULTHANDLER by NAME (not by a "PYTHON" prefix) is what
+    keeps PYTHONUNBUFFERED locked — the exact failure the hard-lock comment
+    warns a future hand about."""
+    with pytest.raises(ValueError, match="PYTHONUNBUFFERED"):
+        build_subprocess_env(
+            _model({"PYTHONUNBUFFERED": "0"}),
+            hf_token="tok", hf_cache_dir="/d",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Allowlist rejection (silent drop)
 # ---------------------------------------------------------------------------

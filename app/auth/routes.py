@@ -87,4 +87,21 @@ class TicketBody(BaseModel):
 async def mint_sse_ticket(
     body: TicketBody, request: Request, user: str = Depends(require_jwt)
 ):
+    # God mode is the one stream that can be switched off at runtime. The
+    # browser's EventSource can never read the stream endpoint's own 409
+    # (`onerror` exposes no HTTP status), so the viewer classifies the
+    # disabled state from THIS mint response. Refuse a god-mode ticket up
+    # front when the feature is off. Scoped to the god-mode path only — every
+    # other stream (e.g. model logs) mints unconditionally as before.
+    from app.proxy.routes_godmode import STREAM_PATH as GODMODE_STREAM_PATH
+
+    if body.path == GODMODE_STREAM_PATH:
+        settings = request.app.state.settings
+        hub = getattr(request.app.state, "godmode_hub", None)
+        if hub is None or not settings.godmode_enabled:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "god mode is disabled (VW_GODMODE_ENABLED)",
+            )
+
     return {"ticket": request.app.state.sse_tickets.mint(user, body.path)}

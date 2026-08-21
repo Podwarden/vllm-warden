@@ -166,6 +166,56 @@ export function RuntimeField({
           disabled={disabled}
         />
       );
+    case "watchdog_enabled":
+      return (
+        <SettingField
+          kind="boolean"
+          field={hint}
+          value={draft.watchdog_enabled}
+          onChange={(v) => setField("watchdog_enabled", v)}
+          disabled={disabled}
+        />
+      );
+    case "watchdog_restore_on_boot":
+      return (
+        <SettingField
+          kind="boolean"
+          field={hint}
+          value={draft.watchdog_restore_on_boot}
+          onChange={(v) => setField("watchdog_restore_on_boot", v)}
+          disabled={disabled}
+        />
+      );
+    case "watchdog_interval_s":
+      return (
+        <SettingField
+          kind="number"
+          field={hint}
+          value={draft.watchdog_interval_s}
+          onChange={(v) => setField("watchdog_interval_s", v)}
+          disabled={disabled}
+        />
+      );
+    case "watchdog_failure_threshold":
+      return (
+        <SettingField
+          kind="number"
+          field={hint}
+          value={draft.watchdog_failure_threshold}
+          onChange={(v) => setField("watchdog_failure_threshold", v)}
+          disabled={disabled}
+        />
+      );
+    case "watchdog_max_restarts":
+      return (
+        <SettingField
+          kind="number"
+          field={hint}
+          value={draft.watchdog_max_restarts}
+          onChange={(v) => setField("watchdog_max_restarts", v)}
+          disabled={disabled}
+        />
+      );
   }
   // Exhaustive — TypeScript narrows fieldKey to `never` here. Returning
   // null lets a future RUNTIME_HINTS addition fail visibly (missing

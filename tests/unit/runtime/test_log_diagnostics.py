@@ -141,3 +141,57 @@ def test_oom_via_outofmemoryerror_token():
     diag = diagnose_engine_log(text)
     assert diag is not None
     assert "out of memory" in diag.message.lower()
+
+
+# --- regression: the config echo is not a diagnosis --------------------------
+
+# A trimmed but faithful slice of what vLLM writes on EVERY startup and on
+# every dump_input.py ERROR line. Note `trust_remote_code=False` in the middle:
+# the old matcher was a bare substring, so this text alone was enough to make
+# the warden tell an operator to enable remote code execution.
+_CONFIG_ECHO = (
+    "INFO 08-18 11:09:32 [core.py:116] Initializing a V1 LLM engine (v0.26.0) "
+    "with config: model='Qwen/Qwen3.8-27B-FP8', tokenizer_mode=auto, "
+    "revision=main, trust_remote_code=False, dtype=torch.bfloat16, "
+    "max_seq_len=262144, tensor_parallel_size=4, enforce_eager=False\n"
+)
+
+_TP_HANG = (
+    "ERROR 08-18 13:11:56 [dump_input.py:72] Dumping input data for V1 LLM "
+    "engine (v0.26.0) with config: model='Qwen/Qwen3.8-27B-FP8', "
+    "trust_remote_code=False, tensor_parallel_size=4\n"
+    "ERROR 08-18 13:11:56 [core.py:1332] EngineCore encountered a fatal error.\n"
+    "ERROR 08-18 13:11:56 [core.py:1332] TimeoutError: RPC call to sample_tokens "
+    "timed out.\n"
+)
+
+
+def test_config_echo_alone_is_not_a_trust_remote_code_diagnosis():
+    """`trust_remote_code=False` appears in every vLLM startup banner."""
+    assert diagnose_engine_log(_CONFIG_ECHO) is None
+
+
+def test_a_tp_hang_is_not_reported_as_trust_remote_code():
+    """The 2026-08-18 outage. A worker stopped answering and the engine timed
+    out; the warden reported "This model requires trust_remote_code to load"
+    for 1h43m because the crash dump echoed the config. Anything is better
+    than advice to execute untrusted code for an unrelated fault."""
+    diag = diagnose_engine_log(_TP_HANG)
+    assert diag is None or "trust_remote_code" not in diag.message
+
+
+def test_operator_enabled_flag_does_not_false_positive():
+    """Matching `trust_remote_code=True` would reintroduce the bug the moment
+    an operator legitimately turns the flag on, because the echo then says
+    True on every single startup."""
+    enabled_echo = _CONFIG_ECHO.replace(
+        "trust_remote_code=False", "trust_remote_code=True"
+    )
+    assert diagnose_engine_log(enabled_echo) is None
+
+
+def test_real_requirement_still_detected_among_noise():
+    """The true error must still be found when the log also carries the echo."""
+    diag = diagnose_engine_log(_CONFIG_ECHO + _TRUST_REMOTE_CODE_LOG)
+    assert diag is not None
+    assert "trust_remote_code" in diag.message

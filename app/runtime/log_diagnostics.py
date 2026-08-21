@@ -84,7 +84,27 @@ _KV_AVAIL_GIB_RE = re.compile(
 _CUDA_OOM_RE = re.compile(r"(cuda out of memory|outofmemoryerror)", re.IGNORECASE)
 
 # --- trust_remote_code required prompt. --------------------------------------
-_TRUST_REMOTE_CODE_RE = re.compile(r"trust_remote_code", re.IGNORECASE)
+# Match the SENTENCE transformers/vLLM emit when the flag is genuinely
+# required -- never the flag name on its own.
+#
+# The bare substring `trust_remote_code` was a false positive on essentially
+# every crash: vLLM's startup banner and every `dump_input.py` ERROR line echo
+# the full engine config, which always contains `trust_remote_code=False`.
+# Because this rule sits last, it became the default diagnosis for any
+# unrecognised failure, and it told operators to enable arbitrary remote code
+# execution to fix unrelated faults. On 2026-08-18 a TP worker hang was
+# reported as "This model requires trust_remote_code to load" for 1h43m.
+#
+# Matching `trust_remote_code=True` would reintroduce the bug the moment an
+# operator legitimately enables the flag, because then the config echo says
+# True. Anchor on prose only.
+_TRUST_REMOTE_CODE_RE = re.compile(
+    r"requires you to execute"           # transformers: "...the configuration file"
+    r"|requires you to load"             # transformers variant
+    r"|set the option\s+`?trust_remote_code`?\s*=\s*True"
+    r"|--trust-remote-code",             # the CLI flag as advice, not as config echo
+    re.IGNORECASE,
+)
 
 
 def diagnose_engine_log(text: str) -> EngineDiagnosis | None:

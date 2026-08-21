@@ -71,6 +71,13 @@ RUNTIME_KEYS: dict[str, str] = {
     # base URL. Read on every snippet render in the FE — no restart needed.
     # Absent row = "use window.location.origin" (FE-side fallback).
     "public_url": "none",
+    # Engine watchdog (2026-08-17). Read from the KV on every tick, so a change
+    # takes effect on the next pass -- no restart kind.
+    "watchdog_enabled": "none",
+    "watchdog_restore_on_boot": "none",
+    "watchdog_interval_s": "none",
+    "watchdog_failure_threshold": "none",
+    "watchdog_max_restarts": "none",
 }
 
 # Keys that should never be returned to the client in plaintext.
@@ -235,6 +242,13 @@ _COERCERS = {
     # #154 settings redesign (subsumes #151): canonical externally-reachable
     # base URL for user-facing snippets.
     "public_url": _url,
+    # Engine watchdog. Bounds are deliberately tight: an interval under 5s would
+    # hammer the engine, and a threshold of 1 would restart on a single GC pause.
+    "watchdog_enabled": _bool,
+    "watchdog_restore_on_boot": _bool,
+    "watchdog_interval_s": _bounded_int(5, 3600),
+    "watchdog_failure_threshold": _bounded_int(2, 20),
+    "watchdog_max_restarts": _bounded_int(0, 20),
     # hf_token, admin_username, admin_password are handled out-of-band below.
 }
 

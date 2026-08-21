@@ -48,6 +48,11 @@ class ModelRow:
     engine_channel: str | None = None
     engine_vllm_version: str | None = None
     engine_image: str | None = None
+    # New for migration 0024. The status that was interrupted when a serving
+    # engine died -- the machine-readable half of what last_error used to
+    # carry alone. Set on the crash path, cleared once the model is serving
+    # again or an operator unloads it. The restart sweep keys on this.
+    prior_status: str | None = None
 
 
 # Column list shared by insert + every SELECT so we can't drift them.
@@ -60,7 +65,7 @@ _MODEL_COLS = (
     "trust_remote_code, extra_args, status, pulled_bytes, pulled_total, last_error, "
     "extra_env, filename, parallelism_strategy, max_batch_size, "
     "hf_config_repo, tokenizer_repo, updated_at, "
-    "engine_channel, engine_vllm_version, engine_image"
+    "engine_channel, engine_vllm_version, engine_image, prior_status"
 )
 
 
@@ -81,6 +86,7 @@ def _decode_row(row: tuple) -> ModelRow:
         engine_channel=row[22],
         engine_vllm_version=row[23],
         engine_image=row[24],
+        prior_status=row[25],
     )
 
 
@@ -167,10 +173,42 @@ class ModelRepo:
     async def update_status(
         self, model_id: str, status: str, last_error: str | None = None
     ) -> None:
+        """Set status/last_error, and retire ``prior_status`` once it is spent.
+
+        ``prior_status`` is the machine-readable "was serving when it died"
+        flag recovery keys on. It must be cleared the moment it stops being
+        true, or a model an operator deliberately unloaded would be
+        resurrected on the next watchdog pass. Anything that is not a
+        failure clears it: reaching ``loaded`` means recovery succeeded,
+        and ``pulled``/``idle`` means a human took it down on purpose.
+        ``failed`` deliberately preserves it — that is the state the
+        restart sweep is looking for.
+        """
+        if status == "failed":
+            await self.db.execute(
+                "UPDATE models SET status = ?, last_error = ?, "
+                "updated_at = datetime('now') WHERE id = ?",
+                (status, last_error, model_id),
+            )
+        else:
+            await self.db.execute(
+                "UPDATE models SET status = ?, last_error = ?, prior_status = NULL, "
+                "updated_at = datetime('now') WHERE id = ?",
+                (status, last_error, model_id),
+            )
+        await self.db.commit()
+
+    async def set_prior_status(self, model_id: str, prior: str | None) -> None:
+        """Record which status was interrupted, independent of ``last_error``.
+
+        Kept separate from ``update_status`` because the crash path writes the
+        two at different moments and for different audiences: ``last_error`` is
+        for a human reading the UI, ``prior_status`` is for the watchdog
+        deciding whether to restart. Coupling them is the bug this column
+        exists to remove.
+        """
         await self.db.execute(
-            "UPDATE models SET status = ?, last_error = ?, updated_at = datetime('now') "
-            "WHERE id = ?",
-            (status, last_error, model_id),
+            "UPDATE models SET prior_status = ? WHERE id = ?", (prior, model_id)
         )
         await self.db.commit()
 
@@ -210,7 +248,18 @@ class ModelRepo:
         """
         cur = await self.db.execute(
             "UPDATE models SET status = 'failed', "
-            "last_error = 'process not running after restart', "
+            # Record WHICH prior status was interrupted. Without it the watchdog
+            # cannot tell a model that was serving (restore it) from one that was
+            # merely mid-pull (do not).
+            #
+            # This now goes in its OWN column. It used to be encoded into
+            # last_error and matched back as an exact string, which meant any
+            # diagnosis written on the crash path displaced it and silently
+            # disabled recovery -- see migration 0024. last_error keeps the
+            # human-readable sentence; prior_status is what the watchdog reads.
+            "prior_status = status, "
+            "last_error = 'process not running after restart (was ' "
+            "              || status || ')', "
             "pulled_bytes = CASE WHEN status = 'pulling' THEN 0 "
             "                    ELSE pulled_bytes END, "
             "pulled_total = CASE WHEN status = 'pulling' THEN 0 "

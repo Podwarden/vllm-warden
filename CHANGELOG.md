@@ -7,6 +7,347 @@ release ships.
 
 ## [Unreleased]
 
+## [v2026.08.21.1] — 2026-08-21
+
+### Fixed
+- **The GitHub publish could never have succeeded on CI.** The changelog
+  preflight in `publish/publish-github.sh` read
+  `${CI_PROJECT_DIR}/CHANGELOG.md`, but the file in this repo is
+  `changelog.md` — lowercase. macOS resolves both spellings, so every local
+  dry run passed; the GitLab runner's filesystem is case-sensitive, so the
+  `grep` matched nothing and the job aborted with "CHANGELOG.md has no
+  '## [v...]' release heading" before touching the network. The read is now
+  spelled to match the file on disk, and a missing/empty changelog fails with
+  a message that names the path it actually looked at instead of a heading
+  complaint. Verified by running the whole script inside a Debian container
+  with the tree copied onto the container's own (case-sensitive) overlayfs —
+  the old path is `No such file or directory` there, the new one is not.
+
+### Changed
+- **Screenshots moved `docs/img/` -> `assets/screenshots/`.** `publish/exclude.txt`
+  strips all of `/docs/` from the public snapshot, so every image the README
+  embedded would have 404'd on GitHub the moment the sanitizing publish ran.
+  `assets/` is not excluded. Every relative link and image target in the
+  staged README is now checked to resolve inside the stage.
+- **README rewritten for the GitHub audience.** It no longer links to six
+  `docs/*.md` files that the publish excludes, it leads with what vLLM Warden
+  adds on top of vLLM rather than with internal topology, and its claims are
+  checked against the code: the first run is the `/setup` wizard
+  (welcome -> gpus -> hf_token -> admin), not credentials in `.env`; the
+  installer flags (`--dir`, `--gpus`, `--origin`, `--no-generate-secrets`) and
+  the generated Makefile targets match `podwarden-hub`'s generator; the base
+  image is v0.26.0, not the stale v0.25.1 the old text named.
+- **`deploy/hub/README-hub.md` no longer links to `docs/operating.md`** on
+  GitHub. `deploy/` is published but `docs/` is not, so that link was the same
+  404 in a second published file. It now points at the public docs site.
+- **`publish/denylist-warn.txt` is no longer empty.** It watches `pw_prod` and
+  RFC1918 `10.10.x.x` addresses, both of which survive in code comments and
+  changelog narrative. The node codename `d5` is deliberately not listed: the
+  scan is case-insensitive and covers PNGs, so it reports ~23 files against
+  ~13 real prose hits, and a warn nobody trusts is worse than no warn.
+
+### Notes
+- The public snapshot now stages the changelog as `CHANGELOG.md` (uppercase),
+  the spelling GitHub surfaces in its repo and release UI. `rsync --delete`
+  against the release repo retires the lowercase path left by earlier
+  publishes.
+
+## [v2026.08.19.1] — 2026-08-19
+
+### Added
+- **`PYTHONFAULTHANDLER=1` in the engine subprocess env.** On 2026-08-18
+  `EngineCore` died 20 times in one night and left nothing behind: no Python
+  traceback, no exit code, no core file. The only trace was the TP workers
+  logging `Parent process exited` — they outlive the engine, so the death is
+  invisible from the process the driver spawned. Cores were being discarded
+  silently too: the host's `core_pattern` pipes to `/usr/share/apport/apport`,
+  which does not exist in the engine image. faulthandler turns a fatal signal
+  (SIGSEGV, SIGBUS, SIGILL, SIGABRT, SIGFPE) into a printed C-level Python
+  stack on stderr, which the supervisor already captures into the engine log.
+  It costs one signal-handler installation, so it is a default rather than an
+  opt-in — a production engine should never be able to die silently.
+
+  `PYTHONFAULTHANDLER` is added to `ALLOWED_ENV_EXACT` **by name** rather than
+  via a `PYTHON` prefix, so an operator can set it to `0` without
+  `PYTHONUNBUFFERED=0` also becoming reachable — the exact regression the
+  hard-lock comment warns a future hand about.
+
+### Fixed
+- **A restart that fails to spawn no longer strands the model forever.** Two
+  gaps combined to keep prod down for 11.5 hours on 2026-08-18/19 even with
+  auto-restart working: `_restart` marks the row `loading` before calling
+  `start_engine`, and when that spawn produced nothing, no path ever reset it
+  — `on_exit` never fires (no process was supervised) and no recovery path
+  inspected `loading`. Hours later the pod restarted, boot reconciliation
+  stamped `prior_status='loading'`, and the restart predicate excluded it by
+  design, making the row permanently unrecoverable.
+
+  `_restart` now returns the row to `failed` and restores its restart flag if
+  the spawn throws (releasing the port too), and `wants_restart` accepts
+  `prior_status='loading'`. The latter is safe because the only writer of that
+  value is boot reconciliation — "the warden restarted mid-load". `on_exit`
+  sets the flag exclusively for rows that were `loaded`, so a model that failed
+  on its own merits during a user-initiated load still carries no flag and is
+  still left for a human. `pulling` and `unloading` remain excluded.
+
+- **NCCL bumped 2.28.9 -> 2.30.4 to stop the TP worker hang.** This targets the
+  crash itself rather than recovery from it. NCCL 2.28.9 deadlocks on CUDA-graph
+  replay containing NCCL collectives: the collective never returns, the TP
+  worker stops answering, and vLLM's watchdog fires `TimeoutError: RPC call to
+  sample_tokens timed out` -> `EngineDeadError`. Workers stay alive with no
+  traceback, no CUDA error and node-wide `oom_kill` at 0, which is why every
+  memory theory read clean for three separate incidents (2026-08-02, and twice
+  on 2026-08-18).
+
+  Upstream vllm#52504 verified deadlock on 2.28.9 and clean on 2.30.4 with
+  nothing else changed, and `--enforce-eager` avoiding it isolated the hang to
+  captured-graph collectives. pw_prod ran exactly 2.28.9 with
+  `cudagraph_mode=FULL_AND_PIECEWISE` and TP=4. The `sample_tokens` in the
+  message is a red herring — the sampler is innocent.
+
+  torch hard-pins `nvidia-nccl-cu13==2.28.9`, so pip warns; that is
+  metadata-only (ABI-compatible within NCCL major 2, and torch dlopens the lib
+  from the pip package directory, not the apt copy). Verified by a build-time
+  assertion on the wheel version AND on the path torch actually maps —
+  deliberately NOT via `torch.cuda.nccl.version()`, which returns the
+  COMPILE-time version and reports 2.28.9 even after a successful upgrade.
+
+- **A crashed engine now restarts itself.** Recovery had two paths and neither
+  covered the common case. `check_once` only probes rows the DB believes are
+  `loaded`; when the engine's wrapper exits, the supervisor's `_watch_exit`
+  flips the row to `failed` first, after which the probe loop never looks at it
+  again. Boot restore did not catch it either, because it matched `last_error`
+  against an exact sentinel string — and the crash path writes a *diagnosis*
+  there instead, displacing the sentinel. Prod died twice this way on
+  2026-08-18 (09:15 and 13:11), the second time sitting dead for 1h43m while
+  advertising a completely unrelated "requires trust_remote_code" message.
+
+  Recovery now keys on a dedicated `prior_status` column (migration 0024)
+  instead of on prose, and a new `restart_crashed_models` sweep restarts
+  engines that died with their wrapper. Both paths share one `RestartBudget`,
+  so a model flapping between them still hits a single ceiling rather than
+  drawing a fresh allowance from each. Evidence is captured before the restart
+  overwrites the live engine log — the exit path never did this, which is why
+  `/data/crashes` was empty after a real crash. Only a row that was actually
+  *serving* is restarted: a model that died while `loading` is a config problem
+  for a human, not a retry loop.
+
+- **"This model requires trust_remote_code" is no longer the default
+  diagnosis for every crash.** The matcher was the bare substring
+  `trust_remote_code`, and vLLM echoes the full engine config — including
+  `trust_remote_code=False` — in its startup banner and in every
+  `dump_input.py` ERROR line. Sitting last in the chain, it caught essentially
+  any unrecognised failure and told the operator to enable arbitrary remote
+  code execution to fix it. It now matches only the prose transformers/vLLM
+  actually emit ("requires you to execute...", "set the option
+  trust_remote_code=True"). Matching `trust_remote_code=True` would have
+  reintroduced the bug for anyone who legitimately enables the flag.
+
+- **`VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS` is now settable per model.** This is
+  how long EngineCore waits for a TP worker before declaring the engine dead;
+  vLLM defaults to 300s, tuned for "a slow batch" rather than "a worker is
+  wedged". On 2026-08-18 a worker stopped answering and the engine served
+  nothing for the full five minutes before erroring out. With automatic
+  restart in place a *shorter* timeout is strictly better — it turns a silent
+  five-minute hang into a fast detect-and-restart. Deliberately left at vLLM's
+  default: lowering it globally would abort legitimately long batches on a slow
+  GPU, so it is an operator dial rather than a new default.
+
+### Changed
+- **Engine-log disk usage is now bounded.** Crash dirs copied the *whole*
+  engine log, making `/data` occupancy `watchdog_crash_keep x current log
+  size` — a moving target that grows with uptime rather than a ceiling.
+  Measured 2026-08-18: 20 crash dirs x a 6.8 MB log = 131 MB, all of the
+  volume's usage. Only the tail is copied now (`VW_WATCHDOG_CRASH_LOG_BYTES`,
+  4 MiB) since the crash is at the END of the file, and the live log rotates
+  once past `VW_ENGINE_LOG_MAX_BYTES` (32 MiB) keeping one `.1` alongside.
+  `/data` also holds the SQLite DB, so filling it takes the database down with
+  it — the 2026-06-15 ENOSPC incident.
+
+- **The header badge now distinguishes loading and failed from idle.** The
+  metrics stream only surfaced a model at `status='loaded'`, and required a
+  `model_runtime` sibling — which `loading` and `failed` rows never have. Both
+  therefore fell through to "idle": a 27B load showed "idle" for the several
+  minutes it took, and a crashed engine showed "idle" indefinitely,
+  indistinguishable from a clean box with nothing loaded. The frame carries a
+  new `active_model_status` (`loaded` | `loading` | `failed` | null) and the
+  badge reads "loading" (sky) or "error" (red) accordingly. A failed engine
+  deliberately outranks the amber probe-error tint — a degraded `nvidia-smi`
+  must never mask a dead engine. Precedence is `loaded` > `loading` >
+  `failed`, so a live engine is never repainted by an unrelated stale failure.
+  The field is optional client-side: the UI and API ship as separate images,
+  so a UI newer than its API still renders the old contract.
+
+## [v2026.08.17.1] — 2026-08-17
+
+### Added
+- **Engine watchdog with crash-evidence capture.** The exit watcher awaits
+  `handle.wait()` on the process the driver spawned — for the local driver that
+  is the `vllm serve` **wrapper**, not the engine. vLLM v1 runs `EngineCore` and
+  the TP workers underneath it, and on 2026-08-17 EngineCore died four times
+  while the wrapper stayed alive. `handle.wait()` never returned, so the model
+  row kept `status: loaded` with `last_error: None` while every generation
+  returned 500. `GET /v1/models` answered 200 from the DB and `/healthz`
+  reported on the warden, so every endpoint an operator would check said
+  healthy; only a real generation revealed it. Each occurrence needed a manual
+  force-unload and load.
+
+  The watchdog probes each loaded engine's **own** `/health` instead — the same
+  signal the load path already trusts — every 30s, acting after 3 consecutive
+  failures. It does not watch processes at all, because the wrapper is
+  unreliable in both directions: at 07:39 it exited, at 09:03 it was still alive
+  seven minutes later.
+- **Crash evidence, written before recovery.** A restart destroys the scene, so
+  `{data_dir}/crashes/{model_id}/{timestamp}/` is populated first: the engine
+  log copied out of the path the next load reuses, the process table, `/proc`
+  meminfo plus the node-wide `oom_kill` counter, `nvidia-smi`, and a
+  `report.json` carrying the wrapper return code — a negative value names the
+  fatal signal. Newest 20 kept per model. Every capture step is individually
+  guarded; collecting evidence must never block a restart.
+- **Orphaned-worker reaping.** `unload(force=True)` reaps only the wrapper; the
+  TP workers are its grandchildren and survive it, still holding all the VRAM.
+  Measured: four `VLLM::Worker_TP*` processes holding 10550 MiB each after both
+  EngineCore and the wrapper were gone, with the reload then failing on
+  `Free memory on device cuda:0 (4.98/15.6 GiB)`. Recovery now kills orphaned
+  GPU holders — only processes with no living engine ancestor, so a second
+  healthy model is never touched — and waits for the VRAM to actually come back
+  before reloading.
+- **Restore after a warden restart.** The engine is a child of the warden
+  process, so restarting the warden takes the engine with it and boot
+  reconciliation marks the row failed with nothing to bring it back. Models that
+  were serving are now reloaded with their stored settings; models that were
+  mid-pull, deliberately unloaded, or failed on their own merits are left alone.
+- **Watchdog settings under Settings → Maintenance.** `watchdog_enabled`,
+  `watchdog_restore_on_boot`, `watchdog_interval_s`,
+  `watchdog_failure_threshold`, `watchdog_max_restarts` (0 = detect and record,
+  never auto-restart). Re-read from the settings KV every tick, so a change
+  applies on the next pass with no restart.
+
+### Changed
+- `start_engine()` is extracted from the load route so the watchdog restarts a
+  model through the exact path an operator's load takes, rather than a copy that
+  would drift.
+- `mark_runtime_dead_on_startup` records which prior status was interrupted, so
+  a model that was serving can be told from one that was mid-pull.
+
+### Known issue
+- **Why EngineCore dies is still unexplained.** It vanishes mid-serving with no
+  traceback, no CUDA error and no OOM message. The node-wide `oom_kill` counter
+  read 0 across an uptime covering all four deaths, so the OOM hypothesis is
+  refuted and a memory limit would not have helped. The leading remaining
+  hypothesis is a native crash in CUDA/NCCL or the MTP speculative-decoding
+  path. `report.json` captures the exit signal so the next occurrence is
+  diagnosable rather than a guess.
+
+## [v2026.08.12.1] — 2026-08-12
+
+### Added
+- **Per-token content logging (diagnostic, off by default).** Writes one JSONL
+  record per request — prompt, completion, finish reason — to
+  `content_log_path`. Hard-scoped to an explicit token allowlist so it can run
+  on a shared server without ever logging all traffic: a request is logged only
+  when `VW_CONTENT_LOG_ENABLED` is set **and** its token id is in
+  `VW_CONTENT_LOG_TOKENS`. Prompt/completion fields are capped at
+  `VW_CONTENT_LOG_MAX_CHARS` (default 40000) so the file cannot grow unbounded
+  on very long generations. When disabled the proxy forward path is
+  byte-identical to a build without it.
+- **Runaway-generation detector (off by default).** Watches decoded tokens for
+  a pathological generation — an unclosed `<think>` block past
+  `VW_RUNAWAY_THINK_BUDGET`, a phrase repeating more than
+  `VW_RUNAWAY_REPEAT_MAX` times, or a hard ceiling at `VW_RUNAWAY_HARD_MAX`.
+  `VW_RUNAWAY_MODE=log` records a would-trip incident via the content-log sink
+  without interrupting; `enforce` tears the generation down and emits a clean
+  terminal SSE frame carrying a `runaway` finish reason. Reasoning-parser
+  models (`--reasoning-parser qwen3`) stream the chain as
+  `delta.reasoning_content`, so the detector synthesizes the think markers that
+  the parser strips — otherwise the budget signal would be dead on exactly the
+  models the pathology affects. When the mode is `off` no detector is built and
+  no upstream stream-forcing happens.
+  See `docs/superpowers/specs/2026-07-21-runaway-detector-design.md`.
+
+## [v2026.08.03.1] — 2026-08-03
+
+### Added
+- **God Mode — inline images from vision requests.** The viewer now captures
+  `image_url` parts from vision requests into a bounded in-memory media store
+  (never persisted, dies on restart) and renders them as thumbnails with
+  click-to-expand lightbox. Remote image URLs are hotlinked; stored images are
+  served lazily via `GET /api/admin/godmode/media/{media_id}` (JWT-gated).
+  New env knobs: `VW_GODMODE_MEDIA_STORE_CHARS` (default 64000000),
+  `VW_GODMODE_MAX_IMAGE_CHARS` (default 14000000),
+  `VW_GODMODE_MAX_IMAGES_PER_REQ` (default 16). Inert unless
+  `VW_GODMODE_ENABLED=true`.
+- **God Mode — live prompt/output stream (admin-only, off by default).** A new
+  `/godmode` page, reachable from the stats page, streams real-time prompts and
+  model output (both `content` and qwen3 `reasoning_content` channels) over SSE.
+  Reuses the model-log live/explore scroll pattern: auto-follows at the bottom,
+  scroll up to explore history, scroll back to the bottom to re-attach to live.
+  Each request/session is rendered in a deterministic distinct color for visual
+  filtering of interleaved streams. Backed by an in-memory `GodModeHub` ring
+  buffer (dual-bounded on event count + char budget; nothing persisted, lost on
+  restart). Gated by `VW_GODMODE_ENABLED` (default off) and the `require_jwt` UI
+  session; when disabled, the `POST /api/auth/sse-ticket` mint returns 409 for
+  the god-mode path so the viewer renders a clear "disabled" placeholder rather
+  than spinning (EventSource `onerror` carries no HTTP status, so the disabled
+  signal must come from the ticket mint the browser can read). Captures **all**
+  tokens for the privileged admin view — a deliberate, scoped choice for this
+  operator-only diagnostic surface.
+- **Model-log fast-load scroll fix** verified and regression-tested: a model
+  that finishes loading quickly no longer auto-scrolls up into exploration mode
+  (the stick/free latch is decoupled from `followOutput`).
+- **God Mode — collapse repeated system prompts.** When a token replays the same
+  long system-prompt head request after request, the god-mode viewer now folds
+  the unchanged head behind a small `(system prompt [+])` toggle and shows only
+  the new turn by default; the head is always one click away (`aria-expanded`).
+  The diff is line-aware and per-token (a prompt is only compared against the
+  previous prompt from the **same** token), guarded by minimum length/ratio
+  thresholds so short or genuinely-divergent prompts render in full. Backend:
+  the god-mode capture window is now head **+ tail** (`VW_GODMODE_PROMPT_TAIL_CHARS`,
+  default `4000`) instead of a pure head slice, so a huge repeated head no longer
+  clips the genuinely-new tail turn; the elision marker keeps the collapse honest
+  (it never diffs across an elided gap). Display-only — the proxied request body
+  is still forwarded byte-identical.
+- **Token rotation can now revoke the old token immediately (#185).** The rotate
+  dialog asks what should happen to the predecessor: keep it working for a grace
+  period (default, still 24h) or **revoke it immediately**, which sends
+  `grace_hours: 0` and sets the old row's `revoked_at` to *now* so it is rejected
+  with `401 token revoked` on its very next request — bearer auth reads the DB
+  per request, so there is no cache to wait out. This is for the case rotation is
+  most often reached for: a leaked or abused key, where the old 24h window kept
+  the very secret you were trying to kill alive and admitting traffic for a full
+  day. `grace_hours: 0` has always been accepted by the API (`0..720`, outside is
+  422) — what was missing was any way to choose it, or to see that you had. The
+  dialog states plainly that a hard cut stops **future** admissions only: a
+  generation already running on the engine is not cancelled (vLLM has no concept
+  of warden tokens) and runs to completion or to the read timeout.
+  `POST /api/tokens/{id}/rotate` now echoes the applied `grace_hours` in its
+  response, so scripted callers get a confirmation and the success modal
+  describes what the server did rather than what the client asked for.
+
+### Fixed
+- **The "Test" button reported revocation wrongly in both directions (#185).**
+  `POST /api/tokens/{id}/test` derived `revoked` from `revoked_at is not None`,
+  but `revoked_at` is a *future* timestamp for the whole of a rotation grace
+  window. A predecessor that authenticated fine was reported as revoked, and a
+  hard-revoked one produced the identical message — so pressing Test proved
+  nothing either way. It now makes the same `revoked_at <= now` comparison
+  `require_bearer` makes. Note this flips the answer for tokens inside a healthy
+  grace window from "revoked" to "not revoked"; that is the correct answer.
+- **A rotated token's status badge never lapsed (#185).** `deriveStatus` gated
+  its only revoked branch on `rotated_at == null`, so a rotated row was painted
+  amber "Rotated (grace)" forever — including after the window closed, and
+  including immediately after a hard revoke. Rotated rows whose `revoked_at` has
+  passed now show a red **"Rotated (revoked)"**; both rotated badges carry the
+  exact timestamp as a tooltip. The list payload gained a server-computed
+  `is_revoked` (beside the existing `is_expired`) so the badge does not depend on
+  the operator's workstation clock.
+- **Clearing the rotate dialog's grace field silently hard-revoked the token
+  (#185).** `Number("") === 0` passed the `>= 0` validation, so blanking the box
+  — the natural gesture for "never mind, leave the default" — POSTed
+  `grace_hours: 0` and cut the predecessor off immediately, with nothing on
+  screen saying so. The field now only exists in grace mode, and a blank value
+  there is a validation error instead of a zero.
+
 ## [v2026.07.19.3] — 2026-07-19
 
 ### Added
@@ -486,7 +827,7 @@ release ships.
 - **chat: send `served_model_name` in completion requests instead of
   internal model id.** Fixes `model '<hash>' is not loaded` 404 surfaced
   2026-05-22 by Qwen3.6-27B's distinct served name on
-  `https://vllm.protrener.com/ui/chat`. The bug was latent for the
+  `https://vllm.example.com/ui/chat`. The bug was latent for the
   entire history of the chat playground because every prior model on
   the fleet had `served_model_name == id`; Qwen3.6-27B is the first
   deployment whose served name differs from its internal id, and every
@@ -1858,7 +2199,7 @@ v2026.05.20.1.
   though Python printed the error. Defence-in-depth alongside the
   open-or-create fix above.
 - **`/setup` root URL no longer 404s.** Added a server-side redirect
-  page so `https://vllm.protrener.com/setup` lands on
+  page so `https://vllm.example.com/setup` lands on
   `/setup/welcome` instead of returning a Next.js 404. The /setup
   segment had a layout.tsx and five child pages but was missing the
   root `page.tsx`. Closes #41.

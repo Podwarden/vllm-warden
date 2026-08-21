@@ -451,7 +451,7 @@ async def test_public_url_patch_round_trip_strips_trailing_slash(app_and_client)
 
     r = await client.patch(
         "/api/settings/runtime",
-        json={"public_url": "https://vllm.protrener.com/"},
+        json={"public_url": "https://vllm.example.com/"},
         headers=mut,
     )
     assert r.status_code == 200, r.text
@@ -465,7 +465,7 @@ async def test_public_url_patch_round_trip_strips_trailing_slash(app_and_client)
     # GET observes the trailing-slash-stripped canonical value.
     r = await client.get("/api/settings/runtime", headers=mut)
     assert r.status_code == 200, r.text
-    assert r.json()["public_url"] == "https://vllm.protrener.com"
+    assert r.json()["public_url"] == "https://vllm.example.com"
 
 
 @pytest.mark.integration

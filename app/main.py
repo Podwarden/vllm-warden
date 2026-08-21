@@ -46,7 +46,10 @@ def _build_engine_driver(settings):
         )
     from app.runtime.engine.local_subprocess import LocalSubprocessDriver
 
-    return LocalSubprocessDriver(log_dir=str(Path(settings.data_dir) / "logs"))
+    return LocalSubprocessDriver(
+        log_dir=str(Path(settings.data_dir) / "logs"),
+        log_max_bytes=settings.engine_log_max_bytes,
+    )
 
 
 @asynccontextmanager
@@ -107,6 +110,27 @@ async def lifespan(app: FastAPI):
     app.state.playground_store = PlaygroundStore()
     app.state.chat_active_requests = ActiveRequestCounter()
 
+    # God mode (live prompt/output viewer) — in-memory broadcast hub. Always
+    # instantiated (cheap); the proxy taps only publish when
+    # settings.godmode_enabled is true, so when off the hot path never touches
+    # it. Bounds are read once here from settings.
+    from app.proxy.godmode import GodModeHub
+
+    app.state.godmode_hub = GodModeHub(
+        ring_events=settings.godmode_ring_events,
+        ring_chars=settings.godmode_ring_chars,
+    )
+
+    # God-mode media store (inline images) — out-of-band blob store so image
+    # payloads never inflate the event ring. Always instantiated (cheap);
+    # only written when settings.godmode_enabled is true.
+    from app.proxy.godmode import GodModeMediaStore
+
+    app.state.godmode_media = GodModeMediaStore(
+        store_chars=settings.godmode_media_store_chars,
+        max_item_chars=settings.godmode_max_image_chars,
+    )
+
     # Live request registry (feature/live-stats-dashboard, Plane B). In-process,
     # single-worker, lock-light — tracks every in-flight /v1 request with token
     # name + client IP + context tokens for GET /api/stats/requests. dev-2 hooks
@@ -117,18 +141,22 @@ async def lifespan(app: FastAPI):
 
     from app.runtime.stats_pruner import run_pruner_forever
     from app.runtime.stats_sampler import run_sampler_forever
+    from app.runtime.watchdog import run_watchdog_forever
 
     sampler_task = asyncio.create_task(run_sampler_forever(settings))
     pruner_task = asyncio.create_task(run_pruner_forever(settings))
+    watchdog_task = asyncio.create_task(run_watchdog_forever(settings, app.state))
 
     try:
         yield
     finally:
         sampler_task.cancel()
         pruner_task.cancel()
+        watchdog_task.cancel()
         await asyncio.gather(
             sampler_task,
             pruner_task,
+            watchdog_task,
             return_exceptions=True,
         )
 
@@ -194,6 +222,10 @@ def build_app() -> FastAPI:
     from app.proxy import routes as proxy_routes
 
     app.include_router(proxy_routes.router)
+
+    from app.proxy import routes_godmode as proxy_routes_godmode
+
+    app.include_router(proxy_routes_godmode.router)
 
     from app.system import routes_version as system_routes_version
 

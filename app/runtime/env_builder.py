@@ -50,7 +50,27 @@ ALLOWED_ENV_PREFIXES: tuple[str, ...] = (
     "TORCH_",
     "OMP_",
 )
-ALLOWED_ENV_EXACT: frozenset[str] = frozenset({"CUDA_MODULE_LOADING"})
+ALLOWED_ENV_EXACT: frozenset[str] = frozenset({
+    "CUDA_MODULE_LOADING",
+    # The escape hatch the HARD_LOCKED comment above anticipated, added by
+    # name rather than by a "PYTHON" prefix so PYTHONUNBUFFERED stays
+    # unreachable. Defaulted to "1" below; an operator can set "0" to opt out.
+    "PYTHONFAULTHANDLER",
+    # How long EngineCore waits for a TP worker to answer execute_model /
+    # sample_tokens before declaring the engine dead. vLLM's default is 300s.
+    #
+    # That default is tuned for "a slow batch", not for "a worker is wedged".
+    # On 2026-08-18 a TP worker stopped answering mid-request and the engine
+    # sat there for the full five minutes -- serving nothing, returning
+    # nothing -- before finally erroring out. With automatic restart in place
+    # (watchdog.restart_crashed_models) a SHORTER timeout is strictly better:
+    # it converts a five-minute silent hang into a fast detect-and-restart.
+    #
+    # Deliberately NOT defaulted here. Lowering it globally would abort
+    # legitimately long batches on a slow GPU, so it stays an operator dial
+    # per deployment.
+    "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",
+})
 
 
 def _filter_extra_env(extra_env: dict[str, str]) -> dict[str, str]:
@@ -128,6 +148,16 @@ def build_subprocess_env(model, *, hf_token: str, hf_cache_dir: str) -> dict[str
         # line-buffered stdio and guarantees flush on exit — defence in
         # depth alongside the routes_logs open-or-create fix.
         "PYTHONUNBUFFERED": "1",
+        # 2026-08-18 — EngineCore died 20 times in one night leaving NOTHING:
+        # no traceback, no exit code, no core file (the host's core_pattern
+        # pipes to apport, which does not exist in this image, so every core
+        # is discarded). The only trace was the TP workers noticing "Parent
+        # process exited". faulthandler turns a fatal signal (SIGSEGV, SIGBUS,
+        # SIGILL, SIGABRT, SIGFPE) into a printed C-level Python stack on
+        # stderr, which the supervisor already captures into the engine log.
+        # Cost is one-time signal-handler installation; there is no reason a
+        # production engine should ever die silently.
+        "PYTHONFAULTHANDLER": "1",
     }
     # Apply allowed extra_env first so hard-locked keys below always win.
     env.update(filtered)

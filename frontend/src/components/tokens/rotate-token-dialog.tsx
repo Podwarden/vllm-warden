@@ -28,9 +28,21 @@ interface RotateResponse {
   prefix?: string;
   rotated_from: string;
   renamed_to: string;
+  // #185 — the grace the SERVER applied. The success copy narrates from this
+  // rather than from what this component remembers submitting, so a future
+  // server-side clamp cannot make the modal lie about a hard cut.
+  grace_hours?: number;
 }
 
+// #185 — rotate is two distinct acts wearing one button. "grace" swaps creds
+// without downtime; "immediate" (grace_hours=0) cuts a leaked key off on its
+// very next request. Modelling it as a mode rather than a number means the
+// hard revoke cannot happen without someone choosing it — see the blank-field
+// trap in submit().
+type RotateMode = "grace" | "immediate";
+
 export function RotateTokenDialog({ open, tokenId, onClose }: RotateTokenDialogProps) {
+  const [mode, setMode] = useState<RotateMode>("grace");
   const [graceHours, setGraceHours] = useState("24");
   const [expiresInDays, setExpiresInDays] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -47,8 +59,13 @@ export function RotateTokenDialog({ open, tokenId, onClose }: RotateTokenDialogP
 
   const graceId = useId();
   const daysId = useId();
+  const modeName = useId();
 
   function reset() {
+    // `mode` MUST be reset here. Leaving it behind would arm immediate
+    // revoke for the NEXT token the operator rotates — the exact incident
+    // #185 was filed about, arriving from the opposite direction.
+    setMode("grace");
     setGraceHours("24");
     setExpiresInDays("");
     setError(null);
@@ -65,10 +82,24 @@ export function RotateTokenDialog({ open, tokenId, onClose }: RotateTokenDialogP
   async function submit() {
     setError(null);
 
-    const grace = Number(graceHours);
-    if (!Number.isInteger(grace) || grace < GRACE_MIN || grace > GRACE_MAX) {
-      setError(`Grace hours must be an integer between ${GRACE_MIN} and ${GRACE_MAX}`);
-      return;
+    let grace: number;
+    if (mode === "immediate") {
+      grace = 0;
+    } else {
+      // Blank is NOT zero. `Number("") === 0` and `Number.isInteger(0)` is
+      // true, so before #185 clearing this field — the natural gesture for
+      // "never mind, leave the default" — silently POSTed grace_hours: 0 and
+      // hard-revoked the predecessor. The radio above makes that path
+      // near-unreachable; this guard is what keeps it that way.
+      if (!graceHours.trim()) {
+        setError("Enter a grace period in hours, or choose “Revoke the old token immediately”.");
+        return;
+      }
+      grace = Number(graceHours);
+      if (!Number.isInteger(grace) || grace < GRACE_MIN || grace > GRACE_MAX) {
+        setError(`Grace hours must be an integer between ${GRACE_MIN} and ${GRACE_MAX}`);
+        return;
+      }
     }
 
     const body: Record<string, unknown> = { grace_hours: grace };
@@ -138,11 +169,23 @@ export function RotateTokenDialog({ open, tokenId, onClose }: RotateTokenDialogP
               Copy failed — select and copy the token manually.
             </p>
           )}
-          <p className="text-xs text-slate-500">
+          <p className="text-xs text-slate-500" data-testid="rotate-outcome">
             New active token: <span className="font-mono">{rotated.name}</span>.
-            The previous token was renamed to{" "}
-            <span className="font-mono">{rotated.renamed_to}</span> and will keep
-            working through the grace period, then expire.
+            {rotated.grace_hours === 0 ? (
+              <>
+                {" "}The previous token was renamed to{" "}
+                <span className="font-mono">{rotated.renamed_to}</span> and is{" "}
+                <span className="font-medium text-red-400">revoked now</span> — it
+                will be rejected on its next request. Requests already running on
+                the engine are not cancelled.
+              </>
+            ) : (
+              <>
+                {" "}The previous token was renamed to{" "}
+                <span className="font-mono">{rotated.renamed_to}</span> and will
+                keep working through the grace period, then expire.
+              </>
+            )}
           </p>
           <div className="flex justify-end gap-2 pt-2">
             <Button type="button" variant="outline" size="sm" onClick={handleCopy}>
@@ -154,25 +197,82 @@ export function RotateTokenDialog({ open, tokenId, onClose }: RotateTokenDialogP
       ) : (
         <div className="space-y-4">
           <p className="text-sm text-slate-300">
-            Issue a new token to replace this one. The existing token keeps
-            working for the grace period below, then expires.
+            Issue a new token to replace this one. Choose what happens to the
+            existing token.
           </p>
 
-          <label htmlFor={graceId} className="block space-y-1">
-            <span className="text-sm">Grace period (hours)</span>
-            <Input
-              id={graceId}
-              type="number"
-              value={graceHours}
-              onChange={(e) => setGraceHours(e.target.value)}
-              min={GRACE_MIN}
-              max={GRACE_MAX}
-              inputMode="numeric"
-            />
-            <span className="text-xs text-slate-500">
-              How long the old token keeps working. Default 24h, max 720h (30 days).
-            </span>
-          </label>
+          <fieldset className="space-y-2">
+            <legend className="sr-only">What happens to the old token</legend>
+
+            <label className="flex items-start gap-3 rounded-md border border-slate-700 bg-slate-900/40 p-3">
+              <input
+                type="radio"
+                name={modeName}
+                value="grace"
+                checked={mode === "grace"}
+                onChange={() => setMode("grace")}
+                disabled={busy}
+                className="mt-0.5 h-4 w-4 cursor-pointer border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-400"
+                data-testid="rotate-mode-grace"
+              />
+              <span className="flex-1">
+                <span className="block font-medium text-slate-100">
+                  Keep the old token working for a grace period
+                </span>
+                <span className="mt-1 block text-xs text-slate-400">
+                  Swap credentials in your clients without downtime. The old
+                  token stops working when the window closes.
+                </span>
+              </span>
+            </label>
+
+            {mode === "grace" && (
+              // Rendered only in grace mode so "clear the box" can no longer
+              // be read as grace_hours: 0 (#185) — there is no box to clear
+              // in immediate mode, and a blank one here is a validation error.
+              <label htmlFor={graceId} className="block space-y-1 pl-7">
+                <span className="text-sm">Grace period (hours)</span>
+                <Input
+                  id={graceId}
+                  type="number"
+                  value={graceHours}
+                  onChange={(e) => setGraceHours(e.target.value)}
+                  min={GRACE_MIN}
+                  max={GRACE_MAX}
+                  inputMode="numeric"
+                  disabled={busy}
+                />
+                <span className="text-xs text-slate-500">
+                  How long the old token keeps working. Default 24h, max 720h
+                  (30 days).
+                </span>
+              </label>
+            )}
+
+            <label className="flex items-start gap-3 rounded-md border border-slate-700 bg-slate-900/40 p-3">
+              <input
+                type="radio"
+                name={modeName}
+                value="immediate"
+                checked={mode === "immediate"}
+                onChange={() => setMode("immediate")}
+                disabled={busy}
+                className="mt-0.5 h-4 w-4 cursor-pointer border-slate-600 bg-slate-800 text-red-500 focus:ring-red-400"
+                data-testid="rotate-mode-immediate"
+              />
+              <span className="flex-1">
+                <span className="block font-medium text-slate-100">
+                  Revoke the old token immediately
+                </span>
+                <span className="mt-1 block text-xs text-slate-400">
+                  For a leaked or abused key. The old token is rejected on its
+                  very next request. Requests already running on the engine are{" "}
+                  <span className="font-medium text-slate-300">not</span>{" "}
+                  cancelled — they finish or hit the read timeout.
+                </span>
+              </span>
+            </label>
+          </fieldset>
 
           <label htmlFor={daysId} className="block space-y-1">
             <span className="text-sm">New token expires in days (optional)</span>

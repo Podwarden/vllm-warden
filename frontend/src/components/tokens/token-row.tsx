@@ -38,6 +38,11 @@ export interface TokenItem {
   is_expired: boolean;
   is_near_expiry: boolean;
   revoked_at: string | null;
+  // #185 — server-computed `revoked_at <= now`. `revoked_at` alone cannot
+  // tell an open grace window from a completed cut (both non-null), and
+  // comparing in the browser would make the badge depend on the operator's
+  // workstation clock.
+  is_revoked: boolean;
   rate_limit_tps: number | null;
   priority: number;
   usage_24h: TokenUsage24h;
@@ -46,6 +51,9 @@ export interface TokenItem {
 interface StatusInfo {
   label: string;
   variant: "default" | "success" | "warning" | "error" | "info";
+  // Optional native tooltip — used by the rotated branches to answer
+  // "grace until when?" / "cut off when?" without opening the API.
+  title?: string;
 }
 
 // Status precedence is defined in the §11.6 spec — encoded here as a
@@ -63,8 +71,23 @@ function deriveStatus(item: TokenItem): StatusInfo {
   if (item.rotated_at != null && item.successor_deleted) {
     return { label: "Rotated (orphan)", variant: "error" };
   }
+  // #185 — a rotated row whose grace window has closed (including the
+  // grace_hours=0 hard cut) is REJECTED by auth. Without this branch it kept
+  // reading amber "Rotated (grace)" forever, telling an operator who had just
+  // hard-revoked a leaked token that a grace window was still open.
+  if (item.rotated_at != null && item.is_revoked) {
+    return {
+      label: "Rotated (revoked)",
+      variant: "error",
+      title: `Rejected since ${formatTs(item.revoked_at)}. Requests already running on the engine were not cancelled.`,
+    };
+  }
   if (item.rotated_at != null) {
-    return { label: "Rotated (grace)", variant: "warning" };
+    return {
+      label: "Rotated (grace)",
+      variant: "warning",
+      title: `Old token keeps working until ${formatTs(item.revoked_at)}.`,
+    };
   }
   if (item.is_near_expiry) {
     return { label: "Expiring soon", variant: "warning" };
@@ -304,7 +327,9 @@ export function TokenRow({ item, onChange }: TokenRowProps) {
           )}
         </td>
         <td className="px-2 py-2">
-          <Badge variant={status.variant}>{status.label}</Badge>
+          <Badge variant={status.variant} title={status.title}>
+            {status.label}
+          </Badge>
         </td>
         <td className="px-2 py-2 text-right">
           <div className="flex justify-end gap-2">

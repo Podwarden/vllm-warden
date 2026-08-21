@@ -17,8 +17,9 @@ need a new endpoint::
       "vram_total_mib": 16376,
       "vram_pct": 76,                   # int 0-100, derived
       "gpu_util_pct": 87,               # max across GPUs, derived
-      "active_model": "gpt-oss-20b",    # served_model_name of loaded row, or null
+      "active_model": "gpt-oss-20b",    # served_model_name of the badge row, or null
       "active_model_id": "61c82bbc...", # or null
+      "active_model_status": "loading",  # 'loaded'|'failed'|'loading'|null
       "probe_error": null               # passthrough from nvidia-smi probe
     }
 
@@ -29,9 +30,11 @@ unauthenticated callers.
 
 Data source: shares ``app.state.gpu_probe_cache`` with
 ``/api/system/gpus`` (2s TTL absorbs burst polling so multiple tabs
-collapse to one ``nvidia-smi`` invocation). Active-model lookup goes
-through ``model_runtime`` joined to ``models`` — only ``status='loaded'``
-rows surface in the badge.
+collapse to one ``nvidia-smi`` invocation). Active-model lookup joins
+``models`` to ``model_runtime``: a ``status='loaded'`` row surfaces only
+with a runtime sibling, while ``loading`` and ``failed`` rows surface
+without one (they have none yet) so the badge can read "loading" or go
+red on a crash instead of claiming "idle". See ``_active_model``.
 """
 
 from __future__ import annotations
@@ -88,27 +91,60 @@ def _get_cache(request: Request) -> _ProbeCache:
     return cache
 
 
-async def _active_model(db_path: str) -> tuple[str | None, str | None]:
-    """Return ``(model_id, served_model_name)`` of the currently-loaded model.
+async def _active_model(
+    db_path: str,
+) -> tuple[str | None, str | None, str | None]:
+    """Return ``(model_id, served_model_name, status)`` for the badge's
+    identity slot.
 
-    "Loaded" = ``models.status='loaded'`` AND ``model_runtime`` row exists.
-    Returns the first match — the supervisor enforces single-model loading,
-    so multiple rows would be a defect we don't paper over here.
+    Three states qualify, and they are NOT symmetric:
+
+    - ``loaded`` — requires a ``model_runtime`` sibling. That row is what
+      proves the supervisor actually owns a live engine; a ``loaded`` row
+      without one is stale state we must not advertise as serving.
+    - ``loading`` — has NO ``model_runtime`` sibling yet, because the
+      supervisor writes that only once the engine answers. Surfacing it is
+      the whole point: a 27B load takes minutes, and reporting "idle" for
+      that window tells the operator the opposite of what is happening.
+    - ``failed`` — also has no sibling. This is the state that matters most
+      and used to be the most invisible: after an engine death the row sits
+      in ``failed`` indefinitely (nothing auto-restores it), and a header
+      reading "idle" was indistinguishable from a clean, healthy box.
+
+    Hence the LEFT JOIN plus an explicit per-status predicate rather than a
+    plain INNER JOIN — the strictness is kept exactly where it matters.
+
+    Precedence is ``loaded`` > ``loading`` > ``failed``, so a live engine is
+    never repainted by an unrelated stale failure, and an operator's retry
+    (``failed`` -> ``loading``) is visibly acknowledged. Returns the first
+    match; the supervisor enforces single-model loading, so multiple
+    ``loaded`` rows would be a defect we don't paper over here.
     """
     async with open_db(db_path) as db:
         cur = await db.execute(
-            "SELECT m.id, m.served_model_name "
-            "FROM models m JOIN model_runtime r ON r.model_id = m.id "
-            "WHERE m.status = 'loaded' "
+            "SELECT m.id, m.served_model_name, m.status "
+            "FROM models m LEFT JOIN model_runtime r ON r.model_id = m.id "
+            "WHERE (m.status = 'loaded' AND r.model_id IS NOT NULL) "
+            "   OR m.status IN ('loading', 'failed') "
+            "ORDER BY CASE m.status "
+            "         WHEN 'loaded' THEN 0 "
+            "         WHEN 'loading' THEN 1 "
+            "         ELSE 2 END, "
+            "         m.updated_at DESC "
             "LIMIT 1"
         )
         row = await cur.fetchone()
     if row is None:
-        return (None, None)
-    return (row[0], row[1])
+        return (None, None, None)
+    return (row[0], row[1], row[2])
 
 
-def _payload(snap, active_id: str | None, active_name: str | None) -> dict:
+def _payload(
+    snap,
+    active_id: str | None,
+    active_name: str | None,
+    active_status: str | None = None,
+) -> dict:
     gpus = [
         {
             "index": g.index,
@@ -132,6 +168,9 @@ def _payload(snap, active_id: str | None, active_name: str | None) -> dict:
         "gpu_util_pct": util,
         "active_model": active_name,
         "active_model_id": active_id,
+        # 'loaded' | 'loading' | 'failed' | null. Always present so the
+        # frontend never has to tell "key absent" (old build) from "idle".
+        "active_model_status": active_status,
         "probe_error": snap.probe_error,
     }
 
@@ -151,8 +190,8 @@ async def stream_metrics(
         # ``interval`` seconds waiting on the first tick.
         try:
             snap = await cache.get()
-            active_id, active_name = await _active_model(settings.db_path)
-            yield f"data: {json.dumps(_payload(snap, active_id, active_name))}\n\n"
+            active = await _active_model(settings.db_path)
+            yield f"data: {json.dumps(_payload(snap, *active))}\n\n"
             last_yield_at = time.monotonic()
         except Exception:  # noqa: BLE001
             # If the very first probe errors, fall through to the loop
@@ -170,8 +209,8 @@ async def stream_metrics(
                 return
             try:
                 snap = await cache.get()
-                active_id, active_name = await _active_model(settings.db_path)
-                yield f"data: {json.dumps(_payload(snap, active_id, active_name))}\n\n"
+                active = await _active_model(settings.db_path)
+                yield f"data: {json.dumps(_payload(snap, *active))}\n\n"
                 last_yield_at = time.monotonic()
             except Exception as exc:  # noqa: BLE001
                 # A probe / DB failure shouldn't kill the stream — emit a

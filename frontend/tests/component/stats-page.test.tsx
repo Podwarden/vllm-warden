@@ -144,6 +144,17 @@ describe("StatsPage", () => {
     vi.unstubAllGlobals();
   });
 
+  it("links to the god-mode viewer at /godmode", async () => {
+    // The god-mode entry point is a static header link — present regardless
+    // of whether the stats payloads have loaded yet.
+    installFetchStub({ overview: FIXTURE_OVERVIEW, tokensPerKey: FIXTURE_TPK });
+    renderPage();
+
+    const link = screen.getByTestId("godmode-link");
+    expect(link).toHaveTextContent(/god mode/i);
+    expect(link).toHaveAttribute("href", "/godmode");
+  });
+
   it("renders the four current-row tiles populated from the overview payload", async () => {
     installFetchStub({
       overview: FIXTURE_OVERVIEW,

@@ -13,7 +13,7 @@ v2 splits this into two services:
 
 ### Steps to migrate an existing v1 install
 
-1. **(Optional) Set `VW_FRONTEND_ORIGIN`** — set this env var to your public UI origin (e.g. `https://vllm.protrener.com`) to harden CSRF/Origin enforcement on auth endpoints. It is **optional**: if left blank the API falls back to the localhost default so a fresh install boots without it — set it once you front the UI with a public origin.
+1. **(Optional) Set `VW_FRONTEND_ORIGIN`** — set this env var to your public UI origin (e.g. `https://vllm.example.com`) to harden CSRF/Origin enforcement on auth endpoints. It is **optional**: if left blank the API falls back to the localhost default so a fresh install boots without it — set it once you front the UI with a public origin.
 
 2. **Rebind ingress** — point your PodWarden ingress rule from `service: vllm-warden, port: 8080` to `service: ui, port: 3000`. The API port (8080) is now internal-only and should not be published directly.
 
@@ -21,7 +21,7 @@ v2 splits this into two services:
 
 4. **Re-log-in once** — v2 replaces the old SessionMiddleware with JWT auth. All active browser sessions are invalidated on first boot. Existing API/MCP bearer tokens (`sk-...`) remain valid.
 
-Full operator runbook: [docs/operating.md](https://git.mediablade.net/podwarden/apps/vllm-warden/-/blob/main/docs/operating.md)
+Full operator runbook: [podwarden.com/docs/apps/vllm-warden](https://www.podwarden.com/docs/apps/vllm-warden)
 
 ## What you get
 
@@ -44,4 +44,4 @@ The default reservation (1 GPU, 24 GiB VRAM, 2 CPU, 16 GiB RAM) is sized for a 7
 ## Documentation
 
 Full docs: [podwarden.com/docs/apps/vllm-warden](https://www.podwarden.com/docs/apps/vllm-warden)
-Source: [git.mediablade.net/podwarden/apps/vllm-warden](https://git.mediablade.net/podwarden/apps/vllm-warden)
+Source: [github.com/Podwarden/vllm-warden](https://github.com/Podwarden/vllm-warden)

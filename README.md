@@ -1,191 +1,197 @@
 # vLLM Warden
 
-A self-hostable management companion for [vLLM](https://github.com/vllm-project/vllm) — turns a bare vLLM
-deployment into a self-service LLM appliance with a browser UI, OpenAI-compatible
-API gateway, model lifecycle controls, observability, and per-token rate-limiting.
+**Run your own OpenAI-compatible LLM API on your own GPUs — with a UI, not a config file.**
 
-![Models list](docs/img/01-models-list.png)
+[vLLM](https://github.com/vllm-project/vllm) is a fast inference engine, but it ships as a
+single-model Python process: no UI, no auth, no model switching, and no view of what your
+GPUs are doing. vLLM Warden wraps it in a control plane so you can pull a model from
+HuggingFace, load it, and hand your team an API key — from a browser, in minutes.
 
-## What it is
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Engine](https://img.shields.io/badge/engine-vLLM%20v0.26.0-4b8bbe.svg)](https://github.com/vllm-project/vllm)
+[![Deploy](https://img.shields.io/badge/deploy-Docker%20Compose-2496ed.svg)](#install)
 
-vLLM is a high-throughput LLM inference engine, but it ships as a single-model
-Python process with no UI, no authentication, no model switching, and no
-visibility into what's actually happening on your GPUs. vLLM Warden wraps a
-vanilla `vllm/vllm-openai` container with a control plane that adds:
+![Models list](assets/screenshots/01-models-list.png)
 
-- **Browser UI** — manage models, watch live logs, chat playground, stats dashboard
-- **OpenAI-compatible API gateway** at `/v1/*` — drop-in replacement for OpenAI in
-  any existing client (LangChain, OpenWebUI, agents, etc.)
-- **Model lifecycle** — pull from HuggingFace, hot-swap models without restarting
-  the container, persist settings per-model
-- **Multi-token auth** — per-key rate limits, priority lanes, rotation grace
-  windows, usage stats
+---
+
+## Quick start
+
+A Linux host with Docker Compose v2, an NVIDIA GPU, and the NVIDIA Container Toolkit:
+
+```bash
+curl -fsSL https://podwarden.com/api/v1/catalog/install/vllm-warden/script | bash
+cd /opt/vllm-warden
+make start
+```
+
+Open `http://YOUR-HOST:8080/ui/`. A first-run wizard walks you through picking
+which GPUs to use, adding a HuggingFace token, and creating your admin account.
+Then go to **Models → Add model** and pull your first model.
+
+Your OpenAI-compatible endpoint is live at:
+
+```
+http://YOUR-HOST:8080/v1/chat/completions
+```
+
+Point any OpenAI client at it — LangChain, OpenWebUI, the `openai` SDK, your agents.
+Only the `base_url` and the key change.
+
+## Why you might want it
+
+| Without | With vLLM Warden |
+|---|---|
+| One model per container, restart to switch | Hot-swap models from the browser |
+| A single shared API key, or none | Per-key tokens, rate limits, priority lanes, rotation |
+| `nvidia-smi` in a second terminal | VRAM, utilisation and power graphs, per-GPU |
+| No idea why a request is slow | Live per-request table, KV-cache pressure, TTFT/latency percentiles |
+| Hand-edited `--tensor-parallel-size` flags | Guided model setup with a config UI |
+| An abandoned request pins a GPU slot | Request reaper reclaims it automatically |
+
+## Features
+
+- **Browser UI** — model management, live vLLM logs, chat playground, stats dashboards
+- **OpenAI-compatible gateway** at `/v1/*` — drop-in for any existing client
+- **Model lifecycle** — pull from HuggingFace, hot-swap without restarting the container,
+  per-model settings, GGUF support via the out-of-tree
+  [`vllm-gguf-plugin`](https://pypi.org/project/vllm-gguf-plugin/)
+- **Multi-token auth** — per-key rate limits, priority lanes, rotation grace windows, usage stats
+- **Realtime dashboard** — per-second engine load, KV-cache pressure, throughput and latency
+  percentiles, live request table
 - **HuggingFace cache manager** — see what's on disk, garbage-collect orphans
-- **GPU observability** — VRAM / utilisation / power graphs, per-GPU breakdown,
-  vLLM process attribution via host-PID sharing
-- **Single-port topology** — Caddy front-door on `:8080` proxies UI + API + OpenAI
-  shim, so one reverse-proxy rule covers the whole stack
-
-## Why it was developed
-
-Built to fill the gap between "I have vLLM running" and "I have a production
-LLM service my team can actually use." Originally developed inside the
-[PodWarden](https://podwarden.com) infrastructure platform as a managed workload,
-then extracted as a standalone self-hostable app so people running vLLM on
-their own GPUs can get the same UX without adopting PodWarden.
+- **GPU observability** — per-GPU VRAM/utilisation/power, with vLLM process attribution
+- **Automatic crash recovery** — a dead engine is detected, evidence is captured, and the
+  model is reloaded without human intervention
+- **Single-port topology** — one Caddy front door on `:8080` serves UI, control API and the
+  OpenAI shim, so one reverse-proxy rule covers everything
 
 ## Screenshots
 
 <table>
   <tr>
-    <td><a href="docs/img/01-models-list.png"><img src="docs/img/01-models-list.png" width="220" alt="Models list"/></a><br/><sub>Models list</sub></td>
-    <td><a href="docs/img/02-chat-playground.png"><img src="docs/img/02-chat-playground.png" width="220" alt="Chat playground"/></a><br/><sub>Chat playground</sub></td>
-    <td><a href="docs/img/03-stats-dashboard.png"><img src="docs/img/03-stats-dashboard.png" width="220" alt="Stats dashboard"/></a><br/><sub>Stats dashboard</sub></td>
+    <td><a href="assets/screenshots/02-chat-playground.png"><img src="assets/screenshots/02-chat-playground.png" width="260" alt="Chat playground"/></a><br/><sub><b>Chat playground</b> — try a model without wiring up a client</sub></td>
+    <td><a href="assets/screenshots/03-stats-dashboard.png"><img src="assets/screenshots/03-stats-dashboard.png" width="260" alt="Stats dashboard"/></a><br/><sub><b>Stats</b> — throughput, latency, token usage per key</sub></td>
   </tr>
   <tr>
-    <td><a href="docs/img/04-cache-manager.png"><img src="docs/img/04-cache-manager.png" width="220" alt="Cache manager"/></a><br/><sub>HF cache manager</sub></td>
-    <td><a href="docs/img/05-api-tokens-list.png"><img src="docs/img/05-api-tokens-list.png" width="220" alt="API tokens"/></a><br/><sub>API tokens</sub></td>
-    <td><a href="docs/img/06-api-tokens-create.png"><img src="docs/img/06-api-tokens-create.png" width="220" alt="Create token"/></a><br/><sub>Create token</sub></td>
+    <td><a href="assets/screenshots/12-model-configuration-detail.png"><img src="assets/screenshots/12-model-configuration-detail.png" width="260" alt="Model configuration"/></a><br/><sub><b>Model config</b> — parallelism, quantization, context length</sub></td>
+    <td><a href="assets/screenshots/13-model-detail-live-logs.png"><img src="assets/screenshots/13-model-detail-live-logs.png" width="260" alt="Live logs"/></a><br/><sub><b>Live engine logs</b> — stream vLLM output while it loads</sub></td>
   </tr>
   <tr>
-    <td><a href="docs/img/12-model-configuration-detail.png"><img src="docs/img/12-model-configuration-detail.png" width="220" alt="Model config"/></a><br/><sub>Model configuration</sub></td>
-    <td><a href="docs/img/13-model-detail-live-logs.png"><img src="docs/img/13-model-detail-live-logs.png" width="220" alt="Live logs"/></a><br/><sub>Live vLLM logs</sub></td>
-    <td><a href="docs/img/07-settings-general.png"><img src="docs/img/07-settings-general.png" width="220" alt="Settings"/></a><br/><sub>Settings</sub></td>
+    <td><a href="assets/screenshots/05-api-tokens-list.png"><img src="assets/screenshots/05-api-tokens-list.png" width="260" alt="API tokens"/></a><br/><sub><b>API tokens</b> — per-key limits and usage</sub></td>
+    <td><a href="assets/screenshots/04-cache-manager.png"><img src="assets/screenshots/04-cache-manager.png" width="260" alt="Cache manager"/></a><br/><sub><b>HF cache</b> — reclaim disk from orphaned weights</sub></td>
   </tr>
 </table>
 
 <details>
-<summary>More screenshots (settings tabs)</summary>
+<summary>More screenshots — settings tabs</summary>
 
-| Networking | Sessions &amp; Tokens | Maintenance | Model |
+| General | Networking | Sessions &amp; Tokens | Maintenance |
 |---|---|---|---|
-| <a href="docs/img/08-settings-networking.png"><img src="docs/img/08-settings-networking.png" width="180"/></a> | <a href="docs/img/09-settings-sessions-tokens.png"><img src="docs/img/09-settings-sessions-tokens.png" width="180"/></a> | <a href="docs/img/10-settings-maintenance.png"><img src="docs/img/10-settings-maintenance.png" width="180"/></a> | <a href="docs/img/11-settings-model.png"><img src="docs/img/11-settings-model.png" width="180"/></a> |
+| <a href="assets/screenshots/07-settings-general.png"><img src="assets/screenshots/07-settings-general.png" width="180"/></a> | <a href="assets/screenshots/08-settings-networking.png"><img src="assets/screenshots/08-settings-networking.png" width="180"/></a> | <a href="assets/screenshots/09-settings-sessions-tokens.png"><img src="assets/screenshots/09-settings-sessions-tokens.png" width="180"/></a> | <a href="assets/screenshots/10-settings-maintenance.png"><img src="assets/screenshots/10-settings-maintenance.png" width="180"/></a> |
 
 </details>
 
-## How to install
+## Install
 
-The easiest way is to grab the prebuilt Docker installer from the PodWarden
-Hub catalog. PodWarden Hub is a free public catalog of curated self-hostable
-apps — no account needed to download an installer.
+The quickest path is the prebuilt installer from the PodWarden Hub catalog — a free public
+catalog of self-hostable apps. No account needed.
 
-**1. Open the catalog page:**
-
-<https://podwarden.com/catalog/vllm-warden>
-
-**2. Click "Download Docker Installer".** You can either:
-
-- **Copy-paste the install command** into a shell on your GPU host:
-
-  ```bash
-  curl -fsSL https://podwarden.com/api/v1/catalog/install/vllm-warden/script | bash
-  ```
-
-  The installer creates `/opt/vllm-warden/` (or `$HOME/vllm-warden/` if run
-  as a non-root user without sudo), drops `docker-compose.yml` + `.env` +
-  `Makefile`, auto-generates secrets, and pulls the prebuilt images.
-
-- **Or download the bundle as a tarball** for offline / air-gapped installs.
-
-**3. Start the stack:**
+**Catalog page:** <https://podwarden.com/catalog/vllm-warden>
 
 ```bash
-cd /opt/vllm-warden
-nano .env          # review configuration
-make start
-make logs
+curl -fsSL https://podwarden.com/api/v1/catalog/install/vllm-warden/script | bash
 ```
 
-Then open `http://YOUR-HOST:8080/ui/` in a browser.
+The installer creates `/opt/vllm-warden/` (or `$HOME/vllm-warden/` when run without sudo),
+writes `docker-compose.yml`, `.env` and a `Makefile`, generates secrets, and pulls the
+images. A tarball is available from the same page for offline or air-gapped installs.
 
-**Requirements:** a Linux host with Docker + Docker Compose v2 + at least one
-NVIDIA GPU + the NVIDIA Container Toolkit.
-
-### Install with custom directory or flags
+Custom directory or flags:
 
 ```bash
 curl -fsSL https://podwarden.com/api/v1/catalog/install/vllm-warden/script | \
-  bash -s -- --dir /srv/vllm --no-generate-secrets
+  bash -s -- --dir /srv/vllm --gpus 0,1 --origin https://vllm.example.com
 ```
 
-## How to use (after install)
+`--gpus` limits which GPUs the container sees (`none`, `all`, or an index list),
+and `--origin` sets `VW_FRONTEND_ORIGIN` — the public URL you will reach the UI
+on, which the CSRF check enforces. Set it once you put the warden behind a
+domain; the default localhost value is fine for a first look. Pass
+`--no-generate-secrets` to fill in `.env` yourself.
 
-The installer drops a `Makefile` that wraps `docker compose`:
+**Requirements:** Linux, Docker + Docker Compose v2, at least one NVIDIA GPU, and the
+NVIDIA Container Toolkit.
 
-| Command          | What it does                                        |
-|------------------|-----------------------------------------------------|
-| `make start`     | `docker compose up -d` — start all services         |
-| `make stop`      | `docker compose down` — stop all services           |
-| `make restart`   | stop + start                                        |
-| `make logs`      | `docker compose logs -f` — follow live logs         |
-| `make pull`      | pull latest images and restart                      |
-| `make build`     | pull images and build locally                       |
-| `make status`    | `docker compose ps` — show service status           |
-| `make uninstall` | stop + delete data volumes (asks for confirmation)  |
-| `make help`      | list all targets                                    |
+### Day-to-day
 
-After `make start`:
+| Command | What it does |
+|---|---|
+| `make start` | start all services |
+| `make stop` | stop all services |
+| `make restart` | stop + start |
+| `make logs` | follow live logs |
+| `make pull` | pull the latest images and restart |
+| `make status` | show service status |
+| `make uninstall` | stop and delete data volumes (asks first) |
+| `make help` | list every target |
 
-- **Browser UI:** `http://YOUR-HOST:8080/ui/`
-- **OpenAI-compatible API:** `http://YOUR-HOST:8080/v1/chat/completions` etc.
-- **Warden control API:** `http://YOUR-HOST:8080/api/` (JWT-gated)
-- **Health probe:** `http://YOUR-HOST:8080/healthz`
+Once running:
 
-First-run: open `/ui/`, log in with the admin credentials from `.env`, then
-**Models → Add model** to pull your first model from HuggingFace. For gated
-models (Llama, gpt-oss, Mistral), set your HuggingFace token under
-**Settings → General → Hugging Face token**.
+- **UI** — `http://YOUR-HOST:8080/ui/`
+- **OpenAI API** — `http://YOUR-HOST:8080/v1/chat/completions`
+- **Control API** — `http://YOUR-HOST:8080/api/` (JWT-gated)
+- **Health** — `http://YOUR-HOST:8080/healthz`
 
-## Build from source / contribute
+For gated models (Llama, Mistral, gpt-oss) you need a HuggingFace token. The
+first-run wizard asks for one, and you can change it later under
+**Settings → General**.
 
-Clone the repo and use the dev `Makefile`:
+## Architecture
+
+One published port. Caddy fans out to internal-only `api` and `ui` containers:
+
+| Path | Backend | Notes |
+|---|---|---|
+| `/` | FastAPI `/_landing` | Public landing page (can be disabled) |
+| `/ui/*` | Next.js | Browser UI |
+| `/api/*` | FastAPI | JWT-gated control plane |
+| `/v1/*` | FastAPI | OpenAI-compatible proxy (token-gated) |
+| `/healthz` | Next.js | Liveness probe |
+
+The `api` container shares the host PID namespace so GPU process attribution can map host
+PIDs back to supervisor-tracked vLLM workers. Routing lives in `deploy/caddy/Caddyfile`.
+
+## Build from source
 
 ```bash
 git clone https://github.com/Podwarden/vllm-warden.git
 cd vllm-warden
-
-# build the API + UI images locally
 docker compose build
-
-# run the stack against locally-built images
 docker compose up -d
-make smoke   # hits / /_landing /ui/ /api/csrf /healthz and asserts 200s
+make smoke      # asserts 200s across / /_landing /ui/ /api/csrf /healthz
 ```
 
-Dev targets (all run in Docker — no host-side Python/Node needed):
+Every dev target runs in Docker — no host Python or Node required:
 
-| Command                  | What it does                                                       |
-|--------------------------|--------------------------------------------------------------------|
-| `make test`              | run full pytest suite in a python:3.11-slim container              |
-| `make test-unit`         | unit tests only                                                    |
-| `make test-integration`  | integration tests only                                             |
-| `make lint`              | `ruff check app/ tests/` (pinned via `requirements-dev.txt`)       |
-| `make format`            | `ruff format app/ tests/`                                          |
-| `make typecheck`         | `mypy app/`                                                        |
-| `make docker-build`      | build the api image as `vllm-warden:dev`                           |
-| `make docker-run`        | run `vllm-warden:dev` with `--gpus all --pid=host` on :8080        |
-| `make smoke`             | end-to-end HTTP smoke against `docker compose up`                  |
-| `make generate-api-types`| regenerate `frontend/src/lib/api-types.generated.ts` from FastAPI OpenAPI schema |
+| Command | What it does |
+|---|---|
+| `make test` | full pytest suite in `python:3.11-slim` |
+| `make test-unit` / `make test-integration` | one suite only |
+| `make lint` / `make format` | `ruff check` / `ruff format` |
+| `make typecheck` | `mypy app/` |
+| `make docker-build` | build the api image as `vllm-warden:dev` |
+| `make generate-api-types` | regenerate frontend types from the FastAPI OpenAPI schema |
 
-The Dockerfile pins `vllm/vllm-openai:v0.20.0` and applies a few in-place
-patches for Qwen3.5 / Qwen3.6 GGUF loading — see the comments at the top of
-`Dockerfile` for the upstream tracker links.
+The image is built on a digest-pinned `vllm/vllm-openai` base (currently v0.26.0). GGUF
+support moved out of vLLM core in the 0.25.x line, so the build installs and patches
+`vllm-gguf-plugin`. The `Dockerfile` documents each patch and why it exists — worth reading
+before bumping the base image.
 
-## Architecture
+## Contributing
 
-Single host port `:8080` (Caddy) fans out to internal-only api + ui containers:
-
-| Path        | Backend             | Notes                                  |
-|-------------|---------------------|----------------------------------------|
-| `/`         | FastAPI `/_landing` | Public HTML landing page (opt-out)     |
-| `/ui/*`     | Next.js (ui)        | Browser-facing UI                      |
-| `/api/*`    | FastAPI (api)       | JWT-gated control plane                |
-| `/v1/*`     | FastAPI (api)       | OpenAI-compatible proxy (token-gated)  |
-| `/healthz`  | Next.js (ui)        | Liveness probe                         |
-
-The api container shares the host PID namespace so GPU process attribution
-works (`/api/system/gpus` can map host PIDs back to supervisor-tracked vLLM
-workers). See `deploy/caddy/Caddyfile` for the live routing map.
+Issues and pull requests are welcome. Please run `make lint` and `make test` before opening
+a PR; both run in containers, so a working Docker install is the only prerequisite.
 
 ## License
 
@@ -193,6 +199,5 @@ workers). See `deploy/caddy/Caddyfile` for the live routing map.
 
 ## Trademarks
 
-vLLM is a project of the [vLLM team](https://github.com/vllm-project/vllm).
-PodWarden is a trademark of its operators. vLLM Warden is not affiliated with
-or endorsed by either project.
+vLLM is a project of the [vLLM team](https://github.com/vllm-project/vllm). PodWarden is a
+trademark of its operators. vLLM Warden is not affiliated with or endorsed by either project.

@@ -104,6 +104,81 @@ describe('HeaderMetrics', () => {
     expect(root.className).toContain('text-emerald-400');
   });
 
+  it('shows "loading" while a model is still coming up', () => {
+    // Regression: a 27B load takes minutes, during which the row is
+    // 'loading' but the badge used to read "idle" — the opposite of true.
+    mockState = {
+      status: 'connected',
+      frame: frame({
+        active_model: 'qwen3.8-27b',
+        active_model_id: 'abc',
+        active_model_status: 'loading',
+      }),
+      errorCode: null,
+    };
+    render(<HeaderMetrics />);
+    expect(screen.getByTestId('header-metrics-model')).toHaveTextContent(
+      'loading',
+    );
+    const root = screen.getByTestId('header-metrics');
+    expect(root).toHaveAttribute('data-model-status', 'loading');
+    expect(root.className).toContain('text-sky-400');
+  });
+
+  it('goes red and reads "error" when the model has failed', () => {
+    mockState = {
+      status: 'connected',
+      frame: frame({
+        active_model: 'qwen3.8-27b',
+        active_model_id: 'abc',
+        active_model_status: 'failed',
+      }),
+      errorCode: null,
+    };
+    render(<HeaderMetrics />);
+    expect(screen.getByTestId('header-metrics-model')).toHaveTextContent(
+      'error',
+    );
+    const root = screen.getByTestId('header-metrics');
+    expect(root).toHaveAttribute('data-model-status', 'failed');
+    expect(root.className).toContain('text-red-400');
+  });
+
+  it('keeps the failed model red even when a probe error is present', () => {
+    // A dead engine outranks a degraded nvidia-smi probe: the amber
+    // "instruments are unreliable" hint must not mask a hard failure.
+    mockState = {
+      status: 'connected',
+      frame: frame({
+        active_model: 'qwen3.8-27b',
+        active_model_status: 'failed',
+        probe_error: 'nvidia-smi unavailable',
+      }),
+      errorCode: null,
+    };
+    render(<HeaderMetrics />);
+    const root = screen.getByTestId('header-metrics');
+    expect(root.className).toContain('text-red-400');
+    expect(root.className).not.toContain('text-amber-400');
+  });
+
+  it('treats a name with no status field as loaded (older API build)', () => {
+    // UI and API ship as separate images; a UI newer than its API sees no
+    // active_model_status at all and must still render the old meaning.
+    mockState = {
+      status: 'connected',
+      frame: frame({ active_model: 'gpt-oss-20b' }),
+      errorCode: null,
+    };
+    render(<HeaderMetrics />);
+    expect(screen.getByTestId('header-metrics-model')).toHaveTextContent(
+      'gpt-oss-20b',
+    );
+    const root = screen.getByTestId('header-metrics');
+    expect(root).toHaveAttribute('data-model-status', 'loaded');
+    expect(root.className).toContain('text-emerald-400');
+  });
+
   it('paints the cluster amber while reconnecting', () => {
     mockState = {
       status: 'reconnecting',
