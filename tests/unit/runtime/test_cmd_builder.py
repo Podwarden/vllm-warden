@@ -1,5 +1,9 @@
+import pytest
+
 from app.db.repos.models import ModelRow
 from app.runtime.cmd_builder import build_vllm_args
+from app.runtime.supervisor import Supervisor
+from tests.fakes.fake_engine import FakeDriver
 
 
 def _row(**overrides) -> ModelRow:
@@ -26,45 +30,93 @@ def _row(**overrides) -> ModelRow:
 
 
 def test_build_vllm_args_minimal(monkeypatch):
-    # Pre-#180 default was 127.0.0.1 (legacy in-process subprocess driver).
-    # The docker-socket driver — production default — needs 0.0.0.0 so the
-    # api container can reach the engine over the compose network. Pin the
-    # env explicitly here so this test stays a pure argv-shape regression
-    # guard and doesn't tangle with the bind-host default contract (covered
-    # by test_build_vllm_args_bind_host_defaults_to_zero).
+    # Pin the env explicitly so this stays a pure argv-shape regression guard
+    # and doesn't tangle with the bind-host contract (covered by the #211
+    # tests below).
     monkeypatch.delenv("VW_ENGINE_BIND_HOST", raising=False)
-    args = build_vllm_args(_row(), port=10001)
+    args = build_vllm_args(_row(), port=10001, driver="local")
     assert args[0] == "--model"
     assert args[1] == "Qwen/Qwen3.5-9B"
     assert args[args.index("--revision") + 1] == "main"
     assert args[args.index("--tensor-parallel-size") + 1] == "2"
     assert args[args.index("--port") + 1] == "10001"
     assert args[args.index("--served-model-name") + 1] == "qwen3.5-9b"
-    assert args[args.index("--host") + 1] == "0.0.0.0"
+    assert args[args.index("--host") + 1] == "127.0.0.1"
 
 
-def test_build_vllm_args_bind_host_defaults_to_zero(monkeypatch):
-    # Regression for #180: the docker-socket driver (production default)
-    # runs each engine as a SEPARATE container; binding to 127.0.0.1 inside
-    # the engine container makes /health / /v1/* unreachable from both the
-    # api container and docker-proxy, causing the supervisor health probe to
-    # time out and the row to flip to ``failed`` despite the engine actually
-    # starting up. The cmd_builder MUST emit --host 0.0.0.0 with the env var
-    # UNSET so a deployment that forgets to set VW_ENGINE_BIND_HOST still
-    # gets a working engine.
+def test_build_vllm_args_bind_host_local_driver_is_loopback(monkeypatch):
+    # #211: the local-subprocess driver is what production runs, and its
+    # engine is a child process in THIS netns — the control plane reaches it
+    # on loopback. Binding 0.0.0.0 there (the pre-#211 behaviour) published
+    # the engine's unauthenticated /v1/* on the pod IP, so anything that
+    # could route to the pod got a free LLM API with no bearer check, no
+    # rate limit and no token accounting. Loopback is both sufficient and
+    # the security boundary; this test is the regression guard.
+    monkeypatch.delenv("VW_ENGINE_BIND_HOST", raising=False)
+    args = build_vllm_args(_row(), port=10001, driver="local")
+    assert args[args.index("--host") + 1] == "127.0.0.1"
+
+
+def test_build_vllm_args_bind_host_defaults_to_loopback_when_driver_omitted(monkeypatch):
+    # The `driver` kwarg defaults to the NARROW bind on purpose (#211): a
+    # caller that never learned about the parameter (an out-of-tree script, a
+    # future call site) must fail towards "unreachable off-host", never
+    # towards "unauthenticated API on every interface". Asserting the default
+    # directly, because the whole point is the caller that forgets to pass it.
     monkeypatch.delenv("VW_ENGINE_BIND_HOST", raising=False)
     args = build_vllm_args(_row(), port=10001)
+    assert args[args.index("--host") + 1] == "127.0.0.1"
+
+
+def test_build_vllm_args_bind_host_unknown_driver_is_loopback(monkeypatch):
+    # Same fail-narrow rule for a driver name this function doesn't know
+    # (#211). A future out-of-netns driver that needs a wider bind must
+    # announce itself with a loud failure — health probe times out at first
+    # load — rather than silently inheriting 0.0.0.0.
+    monkeypatch.delenv("VW_ENGINE_BIND_HOST", raising=False)
+    args = build_vllm_args(_row(), port=10001, driver="podman")
+    assert args[args.index("--host") + 1] == "127.0.0.1"
+
+
+def test_build_vllm_args_bind_host_docker_driver_binds_all_interfaces(monkeypatch):
+    # Regression for #180, preserved through #211: the docker-socket driver
+    # runs each engine as a SEPARATE container. Loopback inside that netns is
+    # unreachable from both the api container and docker-proxy (which
+    # forwards to the container's eth0 and gets RST), so the supervisor
+    # health probe times out and the row flips to ``failed`` even though the
+    # engine logged ``Application startup complete.``. This driver must keep
+    # binding 0.0.0.0 with the env var UNSET.
+    monkeypatch.delenv("VW_ENGINE_BIND_HOST", raising=False)
+    args = build_vllm_args(_row(), port=10001, driver="docker")
     assert args[args.index("--host") + 1] == "0.0.0.0"
 
 
-def test_build_vllm_args_bind_host_overridable(monkeypatch):
-    # Operators on the legacy in-process subprocess driver (engine shares
-    # the api container netns) can opt back into loopback by exporting
-    # VW_ENGINE_BIND_HOST=127.0.0.1. VW_ENGINE_BIND_HOST MUST flow through
-    # to --host (read per-call, no module reimport).
+def test_build_vllm_args_bind_host_env_overrides_local_default(monkeypatch):
+    # VW_ENGINE_BIND_HOST stays the operator escape hatch (#211) — e.g.
+    # binding one specific pod IP that a sidecar needs. It just no longer
+    # decides the safe default. It MUST still win over the local driver's
+    # loopback, read per-call so no module reimport is needed.
+    monkeypatch.setenv("VW_ENGINE_BIND_HOST", "10.42.0.7")
+    args = build_vllm_args(_row(), port=10001, driver="local")
+    assert args[args.index("--host") + 1] == "10.42.0.7"
+
+
+def test_build_vllm_args_bind_host_env_overrides_docker_default(monkeypatch):
+    # The escape hatch cuts the other way too: an operator on the docker
+    # driver who fronts the engine differently can narrow it (#211).
     monkeypatch.setenv("VW_ENGINE_BIND_HOST", "127.0.0.1")
-    args = build_vllm_args(_row(), port=10001)
+    args = build_vllm_args(_row(), port=10001, driver="docker")
     assert args[args.index("--host") + 1] == "127.0.0.1"
+
+
+def test_build_vllm_args_bind_host_blank_env_is_treated_as_unset(monkeypatch):
+    # An exported-but-empty VW_ENGINE_BIND_HOST (trivially easy in a compose
+    # file or a k8s env block: ``VW_ENGINE_BIND_HOST=""``) would otherwise
+    # emit ``--host ''`` and kill the engine at argparse. Treat blank as
+    # unset and fall back to the driver default (#211).
+    monkeypatch.setenv("VW_ENGINE_BIND_HOST", "  ")
+    args = build_vllm_args(_row(), port=10001, driver="docker")
+    assert args[args.index("--host") + 1] == "0.0.0.0"
 
 
 def test_build_vllm_args_omits_revision_when_none():
@@ -395,3 +447,75 @@ def test_scheduling_policy_overridable_via_extra_args():
     idxs = [i for i, a in enumerate(args) if a == "--scheduling-policy"]
     assert len(idxs) == 2
     assert args[idxs[-1] + 1] == "fcfs"
+
+
+# --- Supervisor threads the driver into the builder (#211) -------------------
+#
+# The tests above pin the builder's contract in isolation; these two pin the
+# ONE production call site that has to honour it (Supervisor.load →
+# build_vllm_args). They live in this file rather than in
+# test_supervisor_driver.py because what they assert is the cmd_builder
+# contract — that the argv the engine actually launches with carries the bind
+# host the active driver requires — not the supervisor's driver dispatch.
+#
+# Without them, deleting the ``driver=`` kwarg from the supervisor's call
+# would leave every builder test above green while the docker driver silently
+# regressed to loopback (#180 all over again). It cannot regress the other way
+# — the builder's default is the narrow bind — but a green suite that doesn't
+# notice a driver-selection bug at all is worth closing.
+
+
+class _SupSettings:
+    """Minimal stand-in for the settings object Supervisor.load reads."""
+
+    def __init__(self, tmp_path, engine_driver: str):
+        self.data_dir = str(tmp_path)
+        self.hf_token_path = str(tmp_path / "tok")
+        self.hf_cache_dir = str(tmp_path / "hf-cache")
+        self.engine_driver = engine_driver
+
+
+class _SupModel:
+    id = "qwen"
+    hf_repo = "Qwen/Q"
+    hf_revision = "main"
+    served_model_name = "q"
+    gpu_indices = [0]
+    tensor_parallel_size = 1
+    max_model_len = 4096
+    dtype = "auto"
+    gpu_memory_utilization = 0.9
+    extra_env: dict = {}
+    extra_args: list = []
+
+
+@pytest.mark.asyncio
+async def test_supervisor_load_binds_loopback_under_local_driver(tmp_path, monkeypatch):
+    # The production default (app/config.py: VW_ENGINE_DRIVER defaults to
+    # "local", i.e. the in-pod subprocess engine). The spawned argv must carry
+    # 127.0.0.1 so the unauthenticated /v1/* never appears on the pod IP.
+    monkeypatch.delenv("VW_ENGINE_BIND_HOST", raising=False)
+    drv = FakeDriver()
+    sup = Supervisor(_SupSettings(tmp_path, "local"), driver=drv)
+    await sup.load(_SupModel(), port=8001)
+    args = drv.spawned[0].args
+    assert args[args.index("--host") + 1] == "127.0.0.1"
+    # Reap the exit-watcher task; a bare load() leaves it pending and pytest
+    # prints "Task was destroyed but it is pending!" at interpreter shutdown.
+    await sup.unload("qwen", force=True)
+
+
+@pytest.mark.asyncio
+async def test_supervisor_load_binds_all_interfaces_under_docker_driver(
+    tmp_path, monkeypatch
+):
+    # The docker driver's engine lives in its own netns, so 0.0.0.0 has to
+    # survive all the way into the spawned spec — a loopback bind there is the
+    # #180 "Application startup complete. …then health probe timeout" failure.
+    monkeypatch.delenv("VW_ENGINE_BIND_HOST", raising=False)
+    drv = FakeDriver()
+    sup = Supervisor(_SupSettings(tmp_path, "docker"), driver=drv)
+    await sup.load(_SupModel(), port=8001)
+    args = drv.spawned[0].args
+    assert args[args.index("--host") + 1] == "0.0.0.0"
+    await sup.unload("qwen", force=True)

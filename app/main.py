@@ -9,6 +9,7 @@ from app.db.database import open_db
 from app.db.migrations import apply_migrations
 from app.db.repos.models import ModelRepo
 from app.db.repos.runtime import RuntimeRepo
+from app.runtime.env_builder import warn_if_shm_undersized
 from app.runtime.port_alloc import PortAllocator
 from app.runtime.supervisor import Supervisor
 
@@ -79,6 +80,13 @@ async def lifespan(app: FastAPI):
         await apply_migrations(db)
         await ModelRepo(db).mark_runtime_dead_on_startup()
         await RuntimeRepo(db).clear_all()
+
+    # #210 — under the local-subprocess driver the vLLM engine inherits this
+    # process's /dev/shm. On Kubernetes that is 64 MiB unless the pod spec asks
+    # for more, which is far too little for tensor-parallel workers and shows
+    # up as an uncatchable SIGBUS minutes into serving rather than as a startup
+    # failure. Say so in the log while the operator is still reading it.
+    warn_if_shm_undersized(settings.engine_driver)
 
     app.state.supervisor = Supervisor(
         app.state.settings,

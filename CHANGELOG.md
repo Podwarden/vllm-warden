@@ -7,6 +7,181 @@ release ships.
 
 ## [Unreleased]
 
+## [v2026.08.22.2] — 2026-08-22
+
+### Security
+- **Engine processes no longer bind `0.0.0.0` under the local driver (#211).**
+  `_engine_bind_host()` returned `0.0.0.0` unconditionally and it was passed as
+  `--host` to every engine, so each loaded model listened on all interfaces on its
+  port (10000-10999). Anything that could route to the pod IP reached
+  `/v1/chat/completions` **directly** — bypassing `require_bearer`, the per-token
+  rate limiter, the priority scheduler and all token accounting. In Kubernetes that
+  is every other pod in the cluster.
+
+  The bind host is now driver-dependent: `0.0.0.0` only for the docker driver,
+  whose engine runs in its own network namespace and must be reachable across it,
+  and `127.0.0.1` for the local-subprocess driver, where the engine shares the
+  warden's netns. An unrecognised driver name also binds loopback — an out-of-tree
+  driver that genuinely needs a wider bind now fails loudly at the health probe
+  rather than silently republishing an unauthenticated API. `VW_ENGINE_BIND_HOST`
+  still overrides both, so the escape hatch survives; it is simply no longer the
+  thing that decides the safe default. `build_vllm_args(..., driver=...)` defaults
+  to the loopback bind, so a caller that forgets the kwarg gets an unreachable
+  engine rather than an exposed one.
+
+  The docstring that made this look intentional is also fixed. It described the
+  local-subprocess driver as "the legacy in-process subprocess driver" and framed
+  loopback as an opt-in — but `app/config.py:59` defaults `engine_driver` to
+  `"local"`, so the "legacy" path is the one production runs.
+
+  **Behaviour change worth reading before upgrading:** under the local driver the
+  engine ports are no longer reachable off-host. Anything that was dialling one
+  directly — an external Prometheus scrape of the engine, a debug `curl` from a
+  neighbouring pod, a sidecar — breaks at the next load, and will surface as "the
+  metrics stopped" rather than as a security fix. Set `VW_ENGINE_BIND_HOST=0.0.0.0`
+  to restore the old behaviour for a deployment that needs it. Related: a blank
+  `VW_ENGINE_BIND_HOST=""` used to produce `--host ''` and kill the engine at
+  argparse; it is now treated as unset.
+
+### Fixed
+- **The proxy scheduler leaked an admission slot when a queued request was
+  cancelled at the wrong moment (#217).** `_release` hands a slot to the next
+  waiter with `event.set()` and deliberately does *not* decrement `_inflight`, on
+  the assumption that the woken waiter releases in its turn. If the cancellation
+  arrived after `event.set()` but before that coroutine was rescheduled,
+  `event.wait()` raised `CancelledError` against an already-set event: the waiter
+  owned a slot it would never enter the `yield` for, nobody else could see it, and
+  `_inflight` stayed one too high forever.
+
+  Client disconnect while queued is routine under load, and `app/proxy/routes.py`
+  drives the context manager by hand around the whole upstream call, so the window
+  is fully reachable from the product path. After `VW_PROXY_MAX_INFLIGHT` (default
+  16) such disconnects on one `engine_key`, every later request for that model
+  blocked forever in an untimed `event.wait()` — clients hung rather than erroring,
+  and the model looked healthy from every angle except its proxy path.
+
+  The waiter is the only party that can tell the two cases apart at the moment of
+  cancellation, so the fix lives there: if the event is already set it owns a slot
+  and releases it exactly as a normal holder would. Both release sites now run
+  under `asyncio.shield`, because both can be entered while the task is already
+  unwinding a cancellation and `_release` awaits a process-wide lock — unshielded,
+  a second cancellation delivered while waiting on that lock would abandon the
+  release half-done and leak the very slot it was there to save. The class
+  docstring now states the invariant the whole scheduler rests on, and the untimed
+  wait carries a comment explaining that it is only safe because of it.
+
+- **The orphan GPU reaper attributed processes by a substring and killed other
+  tenants' work (#218).** `reap_orphan_gpu_holders` filtered candidates with
+  `"VLLM::" not in cmd and "vllm" not in cmd.lower()`, under a comment reading
+  "never touch a foreign GPU process". A substring is not an ownership signal: a
+  second vllm-warden on the same box, another team's vLLM container, and a
+  researcher's `python -m vllm.entrypoints.openai.api_server` all matched, and all
+  were `SIGKILL`ed the moment this warden recovered a crashed model.
+
+  Attribution is now by **session id** — the pid of the `vllm serve` wrapper that
+  fathered the process — read from the supervisor's handle table via the new
+  `engine_ownership()`. A process this warden did not fork is never a candidate,
+  whatever its cmdline says, and anything the reaper declines to kill is logged
+  with the reason so an operator staring at a failed reload can still see that
+  something else on the box is sitting on the VRAM. The comment and the code now
+  agree.
+
+  This was a prerequisite for #209: the natural fix there puts the reaper on the
+  unload path, which would have escalated a rare cross-tenant kill into one firing
+  on every operator-initiated unload. `engine_ownership(sup, also_sessions=...)`
+  exists for that caller — the wrapper pid must be sampled **before**
+  `Supervisor.unload`, which pops the handle in a `finally`, after which the
+  session id is unrecoverable.
+
+- **Schema migrations are now atomic (#231).** `apply_migrations` ran each file
+  through `db.executescript(sql)` and recorded the `schema_migrations` row
+  afterwards. `executescript` issues an implicit COMMIT *before* executing, so the
+  bookkeeping INSERT necessarily landed in a second transaction. Anything that
+  killed the process between the two left the DDL half-applied while the migration
+  still looked unapplied — the next boot replayed it, hit "duplicate column name",
+  and the pod never came up again. Recovery meant hand-editing the SQLite file on
+  the `/data` volume: the only failure mode in this tree with no in-band recovery.
+
+  The trigger was not exotic. A pod evicted mid-migration does it, and so does
+  ENOSPC on `/data` — the same volume the engine logs share, and a failure this
+  project has already hit once (2026-06-15).
+
+  Each file's statements and its `schema_migrations` row now commit together inside
+  one `BEGIN IMMEDIATE ... COMMIT`. An interruption either commits the whole
+  migration or none of it. A guard rejects `PRAGMA`, `VACUUM` and explicit
+  transaction control inside a migration file — several pragmas are silent no-ops
+  inside a transaction, `VACUUM` errors outright, and a migration managing its own
+  transaction would reintroduce exactly the split-commit window this closes. No
+  migration in `sql/` contains any of them today; the guard is so the next author
+  who needs one gets a loud error instead of a silent hole.
+
+### Changed
+- `GET /api/models/{id}/effective-argv` passes the configured driver into
+  `build_vllm_args`, so the preview keeps its promise of showing the argv "exactly
+  as the supervisor would at load time" now that the bind host depends on it
+  (#211). Display-only.
+- The orphan-reaper tests moved from `tests/unit/test_engine_watchdog.py` to
+  `tests/unit/runtime/test_engine_watchdog.py` and were rewritten against the new
+  `EngineOwnership` signature (#218), including the cases the substring match used
+  to get wrong — a stranger's vLLM, a second warden's orphans, and a reaper that
+  can attribute nothing.
+## [v2026.08.22.1] — 2026-08-22
+
+### Fixed
+- **`/dev/shm` sizing existed only in the docker driver; production runs the
+  other one (#210).** `docker_socket.py` has enlarged the engine container's
+  shared memory since #160 (`ipc_mode=host` plus `shm_size=16g`), but
+  `VW_ENGINE_DRIVER` defaults to `local` and production runs the
+  local-subprocess driver inside a Kubernetes pod — where the engine is a
+  child of the warden process and inherits the pod's 64 MiB default `/dev/shm`.
+  vLLM's `shm_broadcast` ring wants 160 MiB of that at the stock 16 MB chunk
+  size. tmpfs backs pages lazily, so `ftruncate()` and `mmap()` both succeed
+  and the engine only fails when a write touches a page tmpfs won't allocate —
+  an uncatchable `SIGBUS` inside `shm_broadcast.enqueue`, 78 s to 3 minutes
+  into serving, killing every in-flight request. The only thing holding
+  production up was a hand-added `VLLM_MQ_MAX_CHUNK_BYTES_MB=4` row in each
+  model's `extra_env`: a 40 MiB ring that fits inside 64 MiB, at a throughput
+  cost (payloads over the limit take vLLM's slower zmq overflow copy path,
+  which multimodal requests hit routinely) and without ever reaching the
+  ~1.1 GB of `ShmRingBuffer` segments a TP=4 engine holds.
+
+  The fix is a real `/dev/shm` on the warden pod — an `emptyDir` with
+  `medium: Memory` and an explicit `sizeLimit` — which podwarden-core #2417
+  renders from `shm_size:` on a compose service. The production stack now
+  carries `shm_size: 2g` on the `api` service, the chunk-size override has
+  been removed from every model row, and the warden deliberately ships **no**
+  `VLLM_MQ_MAX_CHUNK_BYTES_MB` default (it remains an allowed `extra_env` key
+  for a deployment that cannot get real shared memory). Note for operators:
+  the *stack-level* `shm_size` field applies to the primary service only,
+  which for this stack is Caddy — put it on the `api` service in compose.
+
+### Added
+- **CI publishes the release images on the CalVer tag pipeline.** A new
+  `publish:images` job builds both `vllm-warden` and `vllm-warden-ui` with the
+  tag baked in as `VW_BUILD_VERSION`, pushes `<tag>` / `production` / `latest`
+  to `registry.podwarden.com`, and re-reads each tag from the registry so a
+  silently failed push fails the job. Until now every release was pushed by
+  hand from a workstation (`docs/releasing.md`), which is how v2026.08.21.1
+  and .2 ended up as git tags with no images. `docs/releasing.md` now
+  describes the tag-driven flow and keeps the manual commands as a fallback.
+- **Startup warning when the local driver has too little `/dev/shm` (#210).**
+  Lifespan reads the real size via `os.statvfs` and, when the driver is `local`
+  and `/dev/shm` is under 2 GiB, logs a `WARNING` naming the measured size, the
+  minimum, and the SIGBUS symptom — so the failure mode is diagnosable from the
+  log instead of from an engine that died without a traceback. The 2 GiB floor
+  is a TP=4 engine's observed ~1.1 GB of `ShmRingBuffer` segments plus one
+  160 MiB message-queue ring, with headroom. A `/dev/shm` that cannot be read
+  at all warns about *that* rather than claiming a size it never measured, and
+  the docker driver is skipped (the warden's own `/dev/shm` says nothing about
+  a sibling engine container's).
+
+### Changed
+- **`docs/operating.md` gains an "Engine shared memory (`/dev/shm`)" section**
+  — the 2 GiB requirement, the SIGBUS-in-`shm_broadcast.enqueue` symptom, how
+  each driver obtains its shared memory (compose `shm_size:` on the `api`
+  service under PodWarden, and why the stack-level field is the wrong place),
+  and the `VLLM_MQ_MAX_CHUNK_BYTES_MB` stop-gap.
+
 ## [v2026.08.21.2] — 2026-08-21
 
 ### Fixed

@@ -272,82 +272,12 @@ async def test_crash_loop_guard_stops_restarting_and_marks_failed(wd_env, httpx_
 
 
 # --- orphaned GPU holders ---------------------------------------------------
-# unload(force=True) reaps only the wrapper the driver spawned. The TP workers
-# are grandchildren and survive it: on 2026-08-17 four VLLM::Worker_TP* processes
-# held 10550 MiB each after EngineCore and the wrapper were gone, and every
-# reload then failed with "Free memory on device cuda:0 (4.98/15.6 GiB)".
-
-def _patch_procs(monkeypatch, apps, cmds, parents):
-    from app.runtime import watchdog
-    monkeypatch.setattr(watchdog, "_gpu_compute_apps", lambda: apps)
-    monkeypatch.setattr(watchdog, "_cmdline", lambda pid: cmds.get(pid, ""))
-    monkeypatch.setattr(watchdog, "_ppid", lambda pid: parents.get(pid))
-    return watchdog
-
-
-def test_reaps_orphaned_workers(monkeypatch):
-    killed = []
-    wd = _patch_procs(
-        monkeypatch,
-        apps=[(801467, 10550), (801590, 10550)],
-        cmds={801467: "VLLM::Worker_TP0", 801590: "VLLM::Worker_TP1"},
-        # Reparented to the container shim, NOT pid 1 — the host PID namespace is
-        # shared, so an "orphan == ppid 1" test would miss these entirely.
-        parents={801467: 794190, 801590: 794190, 794190: 0},
-    )
-    monkeypatch.setattr(wd.os, "kill", lambda pid, sig: killed.append(pid))
-
-    assert sorted(wd.reap_orphan_gpu_holders(live_pids=set())) == [801467, 801590]
-    assert sorted(killed) == [801467, 801590]
-
-
-def test_never_kills_workers_of_a_live_engine(monkeypatch):
-    """A second, healthy model must survive the first one's recovery."""
-    killed = []
-    wd = _patch_procs(
-        monkeypatch,
-        apps=[(900001, 10550)],
-        cmds={900001: "VLLM::Worker_TP0"},
-        parents={900001: 888000, 888000: 794190},   # 888000 is a live wrapper
-    )
-    monkeypatch.setattr(wd.os, "kill", lambda pid, sig: killed.append(pid))
-
-    assert wd.reap_orphan_gpu_holders(live_pids={888000}) == []
-    assert killed == []
-
-
-def test_never_kills_a_foreign_gpu_process(monkeypatch):
-    killed = []
-    wd = _patch_procs(
-        monkeypatch,
-        apps=[(777, 4000)],
-        cmds={777: "/usr/bin/python train.py"},
-        parents={777: 1},
-    )
-    monkeypatch.setattr(wd.os, "kill", lambda pid, sig: killed.append(pid))
-
-    assert wd.reap_orphan_gpu_holders(live_pids=set()) == []
-    assert killed == [], "only vLLM workers may be reaped"
-
-
-@pytest.mark.asyncio
-async def test_wait_for_gpu_release_returns_when_clear(monkeypatch):
-    wd = _patch_procs(monkeypatch, apps=[], cmds={}, parents={})
-    assert await wd.wait_for_gpu_release(set(), timeout_s=1, interval_s=0.01)
-
-
-@pytest.mark.asyncio
-async def test_wait_for_gpu_release_times_out_while_held(monkeypatch):
-    """Freeing is not instant after SIGKILL; reloading too early reproduces the
-    very failure being recovered from."""
-    wd = _patch_procs(
-        monkeypatch,
-        apps=[(801467, 10550)],
-        cmds={801467: "VLLM::Worker_TP0"},
-        parents={801467: 794190, 794190: 0},
-    )
-    assert not await wd.wait_for_gpu_release(set(), timeout_s=0.2, interval_s=0.05)
-
+# Moved to tests/unit/runtime/test_engine_watchdog.py (#218). The five tests
+# that lived here called reap_orphan_gpu_holders/wait_for_gpu_release with a
+# bare set of live pids; both now take an EngineOwnership, because attributing
+# a GPU process by a 'vllm' substring in its cmdline was killing other tenants'
+# processes. The replacements cover the same behaviours against the new
+# signature, plus the stranger cases the substring match used to fail.
 
 # --- restore after a warden restart -----------------------------------------
 # The engine is a child of the warden process, so a warden restart takes the

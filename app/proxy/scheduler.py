@@ -211,10 +211,18 @@ class _Waiter:
     asyncio.PriorityQueue is heap-backed; the heap invariant only needs
     a < comparison on the tuple, so the ``Event`` is excluded via
     ``compare=False`` (otherwise Event has no __lt__).
+
+    ``cancelled`` is the tombstone flag: a waiter whose client disconnected
+    while it was still queued cannot be removed from a PriorityQueue without
+    rebuilding the heap, so it stays in place and ``_release`` drains it.
+    It is a real field (rather than an attribute stuck on from the outside)
+    so both the setter in ``acquire`` and the reader in ``_release`` are
+    type-checked — #217 was a bug in exactly that handshake.
     """
 
     sort_index: tuple[int, int]
     event: asyncio.Event = field(compare=False)
+    cancelled: bool = field(default=False, compare=False)
 
 
 _DEFAULT_ENGINE_KEY = "__default__"
@@ -241,6 +249,21 @@ class PriorityScheduler:
     distinguish engines still get a single shared pool. A cancelled waiter
     (client disconnect) is tombstoned and skipped on the next release — see
     acquire()'s CancelledError handler and ``_release``.
+
+    The invariant the whole class rests on: **``_inflight[engine_key]``
+    returns to zero once every request against that engine has finished or
+    been cancelled, under any interleaving.** Every admission has exactly one
+    matching release — the holder's `finally`, or, for a request cancelled in
+    the window between being handed a slot and taking it, the CancelledError
+    handler in ``acquire`` (#217). BOTH of those release sites run
+    ``_release`` under ``asyncio.shield``, because both can be entered while
+    the task is already unwinding a cancellation and ``_release`` awaits a
+    process-wide lock: unshielded, a second cancellation delivered while it
+    waited on that lock would abandon the release half-done. "Under any
+    interleaving" is only true because of those two shields; drop either and
+    the sentence becomes a lie. Break the invariant and the engine silently
+    stops admitting: waiters block forever in an untimed wait and the model
+    looks healthy from every angle except the proxy path.
     """
 
     def __init__(self, max_inflight: int | None = None) -> None:
@@ -314,22 +337,100 @@ class PriorityScheduler:
 
         if not fast_path:
             try:
+                # No timeout on this wait, deliberately: a queued request
+                # waits exactly as long as its client is willing to, and the
+                # client (or uvicorn, on disconnect) cancels us when it gives
+                # up. That is only safe because of the invariant stated in
+                # the class docstring — that _inflight always comes back
+                # down, under any interleaving. If a slot could leak,
+                # this wait would be the place it manifests: the engine sits
+                # permanently at max_inflight, nobody ever releases, and every
+                # later request for that engine_key blocks here forever
+                # instead of getting an error. Do not add a timeout here
+                # without also deciding what the client should be told; do not
+                # break the invariant and expect this wait to save you.
                 await waiter.event.wait()
             except asyncio.CancelledError:
-                # Client disconnected while waiting. Mark the waiter as
-                # cancelled so the next release() skips it; can't remove
-                # it from PriorityQueue cleanly without rebuilding the
-                # heap, so we use the tombstone pattern (event.set + a
-                # cancelled flag check in _release).
-                waiter.cancelled = True  # type: ignore[attr-defined]
-                waiter.event.set()
+                # Client disconnected while queued (routine under load —
+                # app/proxy/routes.py drives this context manager by hand
+                # around the whole upstream call, so a disconnect lands
+                # right here). Which cleanup we owe depends on whether a
+                # releaser had already handed us the slot, and the event is
+                # the record of that: _release pops a waiter and calls
+                # event.set() under the bookkeeping lock, *without*
+                # decrementing _inflight, on the assumption that the woken
+                # waiter will release in its turn.
+                #
+                # #217: that assumption breaks in one window. If the
+                # cancellation is delivered after event.set() but before this
+                # coroutine is rescheduled, event.wait() raises CancelledError
+                # even though the event is set — so we were handed a slot we
+                # will never enter the `yield` for. Nobody else holds it and
+                # nobody else can see it, so it leaks: _inflight stays one too
+                # high forever. VW_PROXY_MAX_INFLIGHT (default 16) such
+                # disconnects on one engine_key and that engine's proxy path
+                # is dead while the model still looks perfectly healthy.
+                #
+                # The waiter is the only party with the information needed to
+                # tell the two cases apart at the moment of cancellation, so
+                # the fix lives here rather than in _release: a releaser
+                # cannot observe from inside its own critical section whether
+                # the coroutine it just woke ever resumes without waiting for
+                # it, which would serialise release behind waiter scheduling —
+                # exactly the one-at-a-time behaviour #173 removed.
+                #
+                # There must be no await between the is_set() check and the
+                # tombstone write: the loop is single-threaded, so with no
+                # suspension point in between no releaser can slip in and set
+                # the event after we decided it was unset.
+                if waiter.event.is_set():
+                    # We own a slot. Hand it on exactly as a normal holder's
+                    # `finally` would (which is shielded for the same reason
+                    # — see below). shield() because we are already unwinding
+                    # a cancellation: if a second cancel were delivered while
+                    # _release waited on a contended lock, an unshielded await
+                    # would abandon the release half-done and leak the very
+                    # slot we are here to save.
+                    #
+                    # Note this deliberately ignores _manual_release, unlike
+                    # the `finally`: that flag is a test knob for stepping the
+                    # heap by hand and is always False in production, and a
+                    # slot handed to a waiter that then died is owed back
+                    # regardless of who is driving the releases.
+                    await asyncio.shield(self._release(engine_key))
+                else:
+                    # Still in the heap; no slot was ever ours, so there is
+                    # nothing to give back. Tombstone ourselves so the next
+                    # _release skips us (we cannot delete from a
+                    # PriorityQueue without rebuilding the heap) and set the
+                    # event so any releaser that reaches us finds a settled
+                    # waiter rather than one that might still wake up.
+                    waiter.cancelled = True
+                    waiter.event.set()
                 raise
 
         try:
             yield
         finally:
             if not self._manual_release:
-                await self._release(engine_key)
+                # shield() for exactly the reason spelled out in the
+                # CancelledError handler above (#217) — this is acquire()'s
+                # other release site and it needs the same protection. This
+                # `finally` very often runs *because* the task was cancelled
+                # (app/proxy/routes.py drives __aexit__ by hand once the
+                # upstream call ends or blows up), and self._lock is a single
+                # process-wide lock taken by every acquire and every release
+                # for every engine, so `await self._release(...)` genuinely
+                # suspends under the load this scheduler exists to handle.
+                # Unshielded, a second cancellation landing in that suspension
+                # abandons the release half-done: one admission slot lost
+                # permanently, VW_PROXY_MAX_INFLIGHT (default 16) of them and
+                # the engine's proxy path is dead while the model looks
+                # healthy — the identical failure mode to #217 itself. Double
+                # cancellation is not exotic: uvicorn cancels the request task
+                # on client disconnect and shutdown cancels the survivors
+                # again.
+                await asyncio.shield(self._release(engine_key))
 
     async def _release(self, engine_key: str = _DEFAULT_ENGINE_KEY) -> None:
         """Hand this engine's freed slot to its next waiter, or free it.
@@ -339,12 +440,18 @@ class PriorityScheduler:
         for another); otherwise the count is decremented and empty
         bookkeeping is dropped so a long-lived warden doesn't accumulate one
         dict entry per ever-seen engine.
+
+        The handoff is optimistic: we set the woken waiter's event and return,
+        trusting it to release in its turn. A waiter cancelled inside that
+        window owes us the slot back and pays it in acquire()'s
+        CancelledError handler (#217) — the two halves have to be read
+        together or the in-flight accounting doesn't add up.
         """
         async with self._lock:
             q = self._queues.get(engine_key)
             while q is not None and not q.empty():
                 nxt = q.get_nowait()
-                if getattr(nxt, "cancelled", False):
+                if nxt.cancelled:
                     continue
                 # Hand the slot off; in-flight count stays the same until
                 # the new holder exits its `async with` and releases in turn.

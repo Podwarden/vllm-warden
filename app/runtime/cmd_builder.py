@@ -23,22 +23,55 @@ import re
 _GGUF_QUANT_RE = re.compile(r"-(Q\d[_A-Za-z0-9]*)\.gguf$", re.IGNORECASE)
 
 
-def _engine_bind_host() -> str:
-    """Interface vLLM binds its HTTP server to. The docker-socket driver
-    (production default) runs each engine as a SEPARATE container, so the
-    only way the control-plane container can reach ``/health`` / ``/v1/*``
-    on the engine is for vLLM to bind ``0.0.0.0`` on its eth0 — anything
-    bound to loopback inside the engine container is not addressable from
-    the api container or from docker-proxy's published port (docker-proxy
-    forwards to the container's eth0, gets RST from the unbound port, and
-    the health probe in supervisor times out → row flips to ``failed``
-    despite ``Application startup complete.`` in the engine log).
+def _engine_bind_host(driver: str) -> str:
+    """Interface vLLM binds its HTTP server to, chosen by engine driver.
 
-    The legacy in-process subprocess driver (engine shares the api
-    container's netns) can opt back into loopback by exporting
-    ``VW_ENGINE_BIND_HOST=127.0.0.1`` at deploy time. Read per-call so the
-    env is honoured without re-importing the module."""
-    return os.environ.get("VW_ENGINE_BIND_HOST", "0.0.0.0")
+    The engine's own OpenAI server is COMPLETELY UNAUTHENTICATED: whatever
+    can open a TCP connection to it gets ``/v1/chat/completions`` directly,
+    behind the back of ``require_bearer`` (app/proxy/auth.py), the per-token
+    rate limiter, the priority scheduler and every byte of token accounting.
+    So the bind host is a security boundary, not a connectivity knob, and it
+    has to be as narrow as the driver allows.
+
+    ``local`` — the in-container subprocess driver, and the default engine
+    driver (app/config.py) i.e. what production actually runs (a Kubernetes
+    pod). The engine is a child process sharing the warden's own network
+    namespace, so the control plane reaches it over loopback
+    (``LocalSubprocessDriver.engine_host`` returns ``127.0.0.1``) and
+    ``0.0.0.0`` buys nothing except exposure: on the pod IP, ports
+    10000-10999 become a free, unmetered LLM API for every other pod in the
+    cluster. Loopback it is. This is issue #211; the pre-#211 default was
+    ``0.0.0.0`` for every driver, and the docstring here used to call the
+    local driver "legacy" and frame loopback as an opt-in, which is exactly
+    backwards and is what made the hole look deliberate.
+
+    ``docker`` — the docker-socket driver runs each engine as a SEPARATE
+    container with its own netns, so loopback inside that container is not
+    addressable from anywhere else. It genuinely needs ``0.0.0.0`` on the
+    engine's eth0: neither the api container (which dials the engine by its
+    docker DNS name) nor docker-proxy's published port can reach an
+    unbound-on-eth0 engine — docker-proxy forwards to the container's eth0,
+    gets RST, the supervisor health probe times out and the row flips to
+    ``failed`` despite ``Application startup complete.`` in the engine log
+    (that was #180). Containment for this driver belongs at the docker
+    network / firewall layer, not here.
+
+    Any other driver name resolves to loopback, same as ``local``. That is
+    deliberate: a future driver that needs a wider bind fails LOUDLY (health
+    probe times out at first load) instead of silently republishing the
+    unauthenticated API, so the failure mode of forgetting to update this
+    function is an outage, never a breach.
+
+    ``VW_ENGINE_BIND_HOST`` still wins when set, so an operator keeps the
+    escape hatch (e.g. binding one specific pod IP) — but it is no longer
+    what decides the safe default. An empty value counts as unset: an
+    exported-but-blank env var would otherwise produce ``--host ''`` and a
+    dead engine. Read per-call so the env is honoured without re-importing
+    the module."""
+    explicit = os.environ.get("VW_ENGINE_BIND_HOST", "").strip()
+    if explicit:
+        return explicit
+    return "0.0.0.0" if driver == "docker" else "127.0.0.1"
 
 
 # Override keys recognised by build_vllm_args. Any other key is a bug
@@ -58,8 +91,16 @@ def build_vllm_args(
     *,
     port: int,
     overrides: dict | None = None,
+    driver: str = "local",
 ) -> list[str]:
     """Construct the argv vector for `vllm serve <args>`.
+
+    `driver` is the active engine driver name (``settings.engine_driver``)
+    and only affects ``--host`` — see :func:`_engine_bind_host`. It defaults
+    to ``"local"``, i.e. the LOOPBACK bind, on purpose: a caller that forgets
+    to pass it gets an engine that is merely unreachable from off-host, not
+    one that silently republishes the unauthenticated vLLM API on every
+    interface (#211). Fail towards the narrow bind, always.
 
     `overrides` may contain any subset of:
       - quantization           → emit --quantization <value>
@@ -111,7 +152,7 @@ def build_vllm_args(
 
     args: list[str] = [
         "--model", model_arg,
-        "--host", _engine_bind_host(),
+        "--host", _engine_bind_host(driver),
         "--port", str(port),
         "--served-model-name", model.served_model_name,
         parallelism_flag, str(tp),

@@ -174,8 +174,24 @@ class Supervisor:
                     model,
                     hf_token=hf_token,
                     hf_cache_dir=str(self.settings.hf_cache_dir),
+                    # #210 — the shm mitigation applies to the local driver
+                    # only; the docker driver sizes /dev/shm itself.
+                    engine_driver=getattr(self.settings, "engine_driver", "local"),
                 )
-                args = build_vllm_args(model, port=port, overrides=overrides)
+                args = build_vllm_args(
+                    model,
+                    port=port,
+                    overrides=overrides,
+                    # #211 — the driver decides how wide the engine binds its
+                    # (unauthenticated) OpenAI server: only the docker driver,
+                    # whose engine lives in its own netns, needs 0.0.0.0. Under
+                    # the local driver the engine shares this process's netns,
+                    # so loopback keeps ports 10000-10999 off the pod IP and
+                    # every request through the proxy's auth + accounting.
+                    # getattr so stand-in settings in tests still resolve to
+                    # the safe local/loopback default.
+                    driver=getattr(self.settings, "engine_driver", "local"),
+                )
                 spec = EngineSpec(
                     model_id=model.id,
                     model_arg=model.hf_repo,

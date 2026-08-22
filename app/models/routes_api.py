@@ -924,7 +924,16 @@ async def get_effective_argv(
         row = await ModelRepo(db).get(model_id)
     if not row:
         raise HTTPException(404, "not found")
-    argv = build_vllm_args(row, port=_EFFECTIVE_ARGV_PREVIEW_PORT)
+    # #211 — pass the configured driver so the preview keeps its promise of
+    # showing "exactly as the supervisor would at load time". The bind host is
+    # driver-dependent now (loopback for local, 0.0.0.0 for docker), so a
+    # preview that omitted this would render --host 127.0.0.1 on a docker
+    # deployment and disagree with what actually launches. Display-only.
+    argv = build_vllm_args(
+        row,
+        port=_EFFECTIVE_ARGV_PREVIEW_PORT,
+        driver=getattr(settings, "engine_driver", "local"),
+    )
     return EffectiveArgvResponse(argv=argv)
 
 

@@ -28,14 +28,23 @@ import shutil
 import signal
 import subprocess
 import time
+from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import httpx
 
 from app.db.database import open_db
 from app.db.repos.models import ModelRepo
 from app.db.repos.settings import SettingsRepo
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    # Imported for annotations only. watchdog is imported BY the
+    # supervisor's callers, not the other way round, so a runtime
+    # import here would risk a cycle for no benefit.
+    from app.runtime.supervisor import Supervisor
 
 logger = logging.getLogger(__name__)
 
@@ -262,6 +271,34 @@ def _ppid(pid: int) -> int | None:
     return None
 
 
+def _sid(pid: int) -> int | None:
+    """Session id of ``pid``, or None if it is gone / unreadable.
+
+    #218 — this is the one fact about an orphaned worker that outlives its
+    process tree. ``LocalSubprocessDriver.spawn`` starts every engine with
+    ``start_new_session=True``, so the ``vllm serve`` wrapper is a session
+    LEADER and its session id equals its own pid. EngineCore and the
+    ``VLLM::Worker_TP*`` processes are forked underneath it, inherit that
+    session id, and keep it after the wrapper is dead — which is exactly the
+    state the reaper has to reason about. Nothing else in the corpse still
+    names the warden that started it: the parent chain is broken (that is what
+    makes it an orphan) and the cmdline is just text anyone can produce.
+
+    ``app.system.pid_attribution.read_pgid`` is a second, independent read of
+    the same ``start_new_session=True`` fact via the process GROUP id. Session
+    id is the stronger of the two — a ``setpgid`` moves a process out of its
+    group but nothing short of ``setsid`` moves it out of its session — so the
+    two want unifying onto this one; not in #218's scope, but do not add a
+    third.
+    """
+    try:
+        return os.getsid(pid)
+    except OSError:
+        # ProcessLookupError (exited between the nvidia-smi read and here) or
+        # PermissionError (another PID namespace). Either way: not attributable.
+        return None
+
+
 def _has_live_ancestor(pid: int, live_pids: set[int]) -> bool:
     """Walk up to see whether this process still belongs to a running engine.
 
@@ -279,8 +316,169 @@ def _has_live_ancestor(pid: int, live_pids: set[int]) -> bool:
     return False
 
 
-def reap_orphan_gpu_holders(live_pids: set[int]) -> list[int]:
-    """SIGKILL vLLM worker processes still holding VRAM with no live engine.
+@dataclass(frozen=True)
+class EngineOwnership:
+    """What this warden can *prove* about which GPU processes are its own (#218).
+
+    ``sessions`` holds the session ids of engines this warden started — i.e.
+    the pids of the ``vllm serve`` wrappers it spawned, live or already exited,
+    because the local driver makes every wrapper a session leader (see
+    :func:`_sid`). Membership of one of those sessions is the ownership signal:
+    a process is ours only if it was forked underneath a wrapper we started.
+
+    ``live_pids`` holds the wrapper pids the supervisor still has a running
+    handle for. Those are the "do not touch" set — their workers belong to a
+    model that is serving right now.
+
+    An EMPTY ``sessions`` set means "this warden cannot attribute anything",
+    and the reaper then kills nothing at all. That is the deliberate choice
+    #218 asks for. After a warden restart the in-memory handle table is gone
+    and ``RuntimeRepo.clear_all()`` has already wiped the persisted pids, so
+    the previous generation's session ids are unrecoverable — and a pid read
+    back from disk after a restart names whatever the kernel has since handed
+    that number to, which is how you kill a stranger. Missing an orphan costs
+    one failed reload and an operator-visible "Free memory on device cuda:0"
+    error; killing another tenant's engine costs them their job with no
+    warning and no way back. We take the recoverable failure.
+    """
+
+    sessions: frozenset[int] = frozenset()
+    live_pids: frozenset[int] = frozenset()
+
+
+# model_id -> (wrapper pid, monotonic timestamp it was observed).
+#
+# #218 — the ownership signal for an orphaned worker is its session id, which
+# equals the pid of the wrapper that fathered it. But the supervisor drops the
+# handle the instant the wrapper exits (``_watch_exit`` pops it in the same
+# breath as flipping the row to 'failed'), so on the exit-path sweep —
+# the commonest crash shape here — ``sup.get_pid`` already returns None and
+# that pid is gone before anything gets a chance to reap. This ledger keeps it,
+# refreshed from the supervisor on every tick, so it is at most one interval
+# stale.
+#
+# Deliberately in-process and NOT persisted: a pid is only meaningful for the
+# lifetime of the process table that issued it.
+_WRAPPER_PIDS: dict[str, tuple[int, float]] = {}
+
+# How long a remembered wrapper pid may be trusted. Pid numbers wrap, and a
+# model that failed and was never restarted would otherwise leave its pid in
+# the ledger indefinitely, until the kernel hands that number to a stranger who
+# then looks like one of ours. A restart happens within a tick or two of the
+# crash, so a quarter of an hour is generous for the legitimate use and short
+# enough that wraparound is not a realistic worry.
+_WRAPPER_PID_TTL_S = 900.0
+
+
+def remember_wrapper_pids(sup: Supervisor) -> None:
+    """Snapshot the supervisor's live wrapper pids into the session ledger."""
+    now = time.monotonic()
+    for model_id in list(sup._handles):  # noqa: SLF001 — no public "all handles" read
+        pid = sup.get_pid(model_id)
+        if pid:
+            _WRAPPER_PIDS[model_id] = (pid, now)
+
+
+def forget_wrapper_pids(keep: set[str]) -> None:
+    """Drop ledger entries for models that no longer exist."""
+    for gone in [m for m in _WRAPPER_PIDS if m not in keep]:
+        _WRAPPER_PIDS.pop(gone, None)
+
+
+def last_wrapper_pid(model_id: str) -> int | None:
+    """Last wrapper pid observed for ``model_id``, if still fresh enough to act on."""
+    entry = _WRAPPER_PIDS.get(model_id)
+    if entry is None:
+        return None
+    pid, seen_at = entry
+    if time.monotonic() - seen_at > _WRAPPER_PID_TTL_S:
+        _WRAPPER_PIDS.pop(model_id, None)
+        return None
+    return pid
+
+
+def engine_ownership(
+    sup: Supervisor, *, also_sessions: Iterable[int | None] = ()
+) -> EngineOwnership:
+    """Read the supervisor's handle table into an :class:`EngineOwnership`.
+
+    ``also_sessions`` carries wrapper pids the supervisor no longer holds a
+    handle for — the engine ``_restart`` just force-unloaded, or one recovered
+    from the ledger. Those are precisely the sessions whose workers are still
+    holding VRAM, so leaving them out would make the reaper a no-op on the only
+    case it exists for. Callers must sample them BEFORE the unload:
+    ``Supervisor.unload`` pops the handle in a ``finally``, after which
+    ``get_pid`` returns None and the session id is unrecoverable.
+    """
+    sessions: set[int] = {p for p in also_sessions if p}
+    live: set[int] = set()
+    # Private read: there is no public accessor that also includes handles
+    # whose process has exited, and those are exactly the ones whose workers
+    # may still be holding VRAM. ``parent_pid_to_model()`` filters them out.
+    for model_id, handle in sup._handles.items():  # noqa: SLF001
+        pid = sup.get_pid(model_id)
+        if not pid:
+            continue
+        sessions.add(pid)
+        if getattr(handle, "returncode", None) is None:
+            live.add(pid)
+    return EngineOwnership(frozenset(sessions), frozenset(live))
+
+
+def _classify_gpu_holders(
+    owned: EngineOwnership,
+) -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
+    """Partition the GPU compute apps into (reapable, declined).
+
+    *Reapable*: forked under a wrapper this warden spawned, and that wrapper is
+    gone — a true orphan of ours.
+    *Declined*: holds VRAM and is NOT provably ours. Returned, rather than
+    silently dropped, so the caller can say out loud what it left alone and why;
+    an operator staring at a failed reload needs to see that something else on
+    the box is sitting on the memory.
+    Processes belonging to a live engine of ours are in neither list — they are
+    simply fine, and reporting them as "declined" would bury the interesting case.
+    """
+    reapable: list[tuple[int, str]] = []
+    declined: list[tuple[int, str]] = []
+    live = set(owned.live_pids)
+    for pid, used in _gpu_compute_apps():
+        cmd = _cmdline(pid)
+        sid = _sid(pid)
+        if sid is None or sid not in owned.sessions:
+            # #218 — this test used to be ``"vllm" in cmd.lower()``, which is
+            # not an ownership signal at all. A second vllm-warden on the same
+            # box, another team's vLLM container, and a researcher's
+            # ``python -m vllm.entrypoints.openai.api_server`` all matched it,
+            # and all were SIGKILLed the moment this warden recovered a crashed
+            # model. Session membership is a fact about who forked the process;
+            # a substring of argv is a fact about nothing.
+            declined.append(
+                (pid, f"session={sid} not one of ours; {used} MiB; {cmd[:80]}")
+            )
+            continue
+        if sid in live or _has_live_ancestor(pid, live):
+            continue  # belongs to an engine that is still running
+        if "VLLM::" not in cmd and "vllm" not in cmd.lower():
+            # Defence in depth, NOT the ownership test. Session ids are pids and
+            # pid numbers wrap, so a session we recorded could in principle be
+            # re-created by an unrelated leader. Requiring the process to also
+            # look like a vLLM engine keeps that rare collision from becoming a
+            # kill.
+            declined.append(
+                (
+                    pid,
+                    f"in our session {sid} but does not look like vLLM; "
+                    f"{used} MiB; {cmd[:80]}",
+                )
+            )
+            continue
+        reapable.append((pid, cmd))
+    return reapable, declined
+
+
+def reap_orphan_gpu_holders(owned: EngineOwnership) -> list[int]:
+    """SIGKILL *this warden's* vLLM workers that still hold VRAM with no live engine.
 
     ``unload(force=True)`` only reaps the process the driver spawned — the
     ``vllm serve`` wrapper. The TP workers are its grandchildren and they SURVIVE
@@ -289,17 +487,22 @@ def reap_orphan_gpu_holders(live_pids: set[int]) -> list[int]:
     then dies with "Free memory on device cuda:0 (4.98/15.6 GiB) is less than
     desired (14.82 GiB)", which is a wasted restart and a wasted crash budget.
 
-    Only processes that both (a) hold GPU memory, (b) look like vLLM workers, and
-    (c) have no living engine ancestor are killed — so a healthy model's workers,
-    which still have their wrapper, are never touched.
+    A process is killed only when all three hold: it holds GPU memory, it lives
+    in a session rooted at a wrapper THIS warden spawned (``owned.sessions``),
+    and that wrapper is no longer running. Anything it cannot positively
+    attribute it leaves alone and logs — see :class:`EngineOwnership` for why
+    that trade is the right way round.
     """
+    reapable, declined = _classify_gpu_holders(owned)
+    if declined:
+        logger.warning(
+            "watchdog: leaving %d GPU process(es) alone — not provably ours "
+            "(#218): %s",
+            len(declined),
+            "; ".join(f"pid {pid}: {why}" for pid, why in declined),
+        )
     killed = []
-    for pid, _used in _gpu_compute_apps():
-        cmd = _cmdline(pid)
-        if "VLLM::" not in cmd and "vllm" not in cmd.lower():
-            continue  # not ours; never touch a foreign GPU process
-        if _has_live_ancestor(pid, live_pids):
-            continue  # belongs to a running engine
+    for pid, cmd in reapable:
         try:
             os.kill(pid, signal.SIGKILL)
             killed.append(pid)
@@ -310,19 +513,21 @@ def reap_orphan_gpu_holders(live_pids: set[int]) -> list[int]:
 
 
 async def wait_for_gpu_release(
-    live_pids: set[int], *, timeout_s: float = 30.0, interval_s: float = 2.0
+    owned: EngineOwnership, *, timeout_s: float = 30.0, interval_s: float = 2.0
 ) -> bool:
-    """Wait until no orphaned vLLM process holds VRAM. Freeing is not instant
-    after SIGKILL, and reloading too early reproduces the very failure we are
-    recovering from."""
+    """Wait until none of *our* orphaned processes still holds VRAM. Freeing is
+    not instant after SIGKILL, and reloading too early reproduces the very
+    failure we are recovering from.
+
+    Only processes the reaper would kill are waited on. A foreign GPU holder is
+    not going to release anything because we asked nicely, so blocking on one
+    would just add 30s to a reload that is going to fail either way — the
+    declined-kill log line is what tells the operator about it.
+    """
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        remaining = [
-            pid for pid, _ in _gpu_compute_apps()
-            if ("VLLM::" in _cmdline(pid) or "vllm" in _cmdline(pid).lower())
-            and not _has_live_ancestor(pid, live_pids)
-        ]
-        if not remaining:
+        reapable, _ = _classify_gpu_holders(owned)
+        if not reapable:
             return True
         await asyncio.sleep(interval_s)
     return False
@@ -331,15 +536,20 @@ async def wait_for_gpu_release(
 async def _restart(settings, app_state, model_id: str, overrides) -> str:
     """Force-unload the corpse, then reload through the shared load path."""
     sup = app_state.supervisor
+    # Sampled BEFORE the unload, and falling back to the ledger when the
+    # wrapper already exited on its own: this pid is the session id of the very
+    # workers the reaper has to find (#218), and ``unload`` pops the handle in a
+    # ``finally``, after which it is unrecoverable.
+    doomed_pid = sup.get_pid(model_id) or last_wrapper_pid(model_id)
     # force=True is the step a plain reload misses: the stale wrapper still holds
     # its port and GPU claims, so a fresh spawn would fail on both.
     await sup.unload(model_id, force=True)
 
     # force-unload kills only the wrapper the driver spawned; the TP workers are
     # its grandchildren and survive, still holding all the VRAM.
-    live_pids = {p for p in (sup.get_pid(m) for m in sup._handles) if p}  # noqa: SLF001
-    killed = reap_orphan_gpu_holders(live_pids)
-    if killed and not await wait_for_gpu_release(live_pids):
+    owned = engine_ownership(sup, also_sessions=(doomed_pid,))
+    killed = reap_orphan_gpu_holders(owned)
+    if killed and not await wait_for_gpu_release(owned):
         logger.error(
             "watchdog: VRAM still held after killing %s; reloading anyway", killed
         )
@@ -443,6 +653,13 @@ async def restore_after_warden_restart(settings, app_state) -> list[str]:
 
     Only rows marked as having been *loaded* are restored. A model that was
     mid-pull, or that a human deliberately unloaded, is left alone.
+
+    Note (#218): a restart also wipes the wrapper-pid ledger, so any VRAM still
+    held by the PREVIOUS generation's workers cannot be attributed to us and is
+    therefore not reaped here — the reload may fail on free memory and say so.
+    That is the intended trade: a fresh warden has no way to tell its own
+    predecessor's orphans from another tenant's engine, and guessing means
+    killing strangers.
     """
     async with open_db(settings.db_path) as db:
         rows = await ModelRepo(db).list_all()
@@ -481,6 +698,11 @@ async def restart_crashed_models(settings, app_state, budget) -> list[str]:
     """
     async with open_db(settings.db_path) as db:
         rows = await ModelRepo(db).list_all()
+    # NB the wrapper-pid ledger (#218) is refreshed by ``check_once``, which
+    # ``run_watchdog_forever`` always runs immediately before this sweep. It is
+    # not refreshed here on purpose: by the time a row reaches this path its
+    # wrapper has usually already exited and the supervisor has dropped the
+    # handle, so re-reading it now would find nothing the earlier pass did not.
     out = []
     for row in (r for r in rows if wants_restart(r)):
         if not budget.allow(row.id):
@@ -525,6 +747,14 @@ async def check_once(
     sup = app_state.supervisor
     async with open_db(settings.db_path) as db:
         rows = await ModelRepo(db).list_all()
+
+    # Refresh the wrapper-pid ledger while the handles are still there — after
+    # a crash the supervisor has already dropped them, and that pid is the only
+    # ownership signal an orphaned worker carries (#218). Pruned against the
+    # full row set so a deleted model does not leave a pid behind to be
+    # confused with whatever the kernel reissues that number to.
+    remember_wrapper_pids(sup)
+    forget_wrapper_pids({r.id for r in rows})
 
     # 'loading' is deliberately skipped: the load path owns that window and has
     # its own timeout. Probing it would restart a model that is merely slow.

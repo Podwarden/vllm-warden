@@ -13,8 +13,52 @@ HF_HUB_CACHE, the HF token, or PATH.
 from __future__ import annotations
 
 import logging
+import os
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Engine shared memory (#210)
+# ---------------------------------------------------------------------------
+# vLLM's tensor-parallel workers talk to each other over POSIX shared memory:
+# the shm_broadcast MessageQueue ring plus the custom-all-reduce CUDA-IPC
+# handles. The ring is sized VLLM_MQ_MAX_CHUNK_BYTES_MB * n_chunks, and tmpfs
+# backs its pages lazily -- ftruncate() and mmap() both SUCCEED even when the
+# ring cannot possibly fit in /dev/shm, and the process only finds out when a
+# write touches a page tmpfs then refuses to allocate. That fault arrives as
+# SIGBUS, which no Python handler can turn into an exception; the engine just
+# dies. That is the #210 crash: TP=4 engines taking an uncatchable SIGBUS
+# inside shm_broadcast.enqueue 78s-3min into serving.
+#
+# The docker driver sidesteps this by giving the engine container its own
+# large /dev/shm (docker_socket.ENGINE_SHM_SIZE, default 16g, plus
+# ipc_mode=host). The local-subprocess driver has no equivalent lever: the
+# engine is a child of the warden process and inherits the warden POD's
+# /dev/shm, which on Kubernetes is the 64 MiB default unless the pod spec
+# asks for an emptyDir with `medium: Memory`.
+ENGINE_SHM_PATH = "/dev/shm"
+
+# Threshold for the startup warning below. 2 GiB is the floor at which a TP>1
+# engine is safe here, not a comfortable target: a TP=4 engine has been
+# observed holding ~1.1 GB of ShmRingBuffer segments, on top of one
+# shm_broadcast ring per message queue (160 MiB each at vLLM's stock 16 MB
+# chunk size). 2 GiB clears that with headroom while sitting far enough above
+# the 64 MiB container/pod default that the warning can only mean "nobody
+# configured shared memory for this deployment".
+ENGINE_SHM_MIN_BYTES = 2 * 1024**3
+
+# There is deliberately NO VLLM_MQ_MAX_CHUNK_BYTES_MB default here. Capping
+# the chunk size at 4 MB (a 40 MiB ring that fits inside a 64 MiB pod) was
+# the stop-gap that held production up between the first SIGBUS and the real
+# fix, but it costs throughput -- payloads above the chunk limit fall back to
+# vLLM's slower zmq overflow copy path, which multimodal requests hit
+# routinely -- and it never reaches the ShmRingBuffer segments at all, so it
+# narrowed the failure window rather than closing it. The fix is a real
+# /dev/shm on the pod (podwarden-core #2417: compose `shm_size:` on the api
+# service renders a `medium: Memory` emptyDir), and the warning below is what
+# tells an operator when that is missing. A deployment that cannot get real
+# shared memory can still set the cap per model via extra_env; it is not a
+# hard-locked key.
 
 # Keys that extra_env is never permitted to override — security/incident lockdown.
 #
@@ -101,7 +145,73 @@ def _filter_extra_env(extra_env: dict[str, str]) -> dict[str, str]:
     return filtered
 
 
-def build_subprocess_env(model, *, hf_token: str, hf_cache_dir: str) -> dict[str, str]:
+def dev_shm_bytes(path: str = ENGINE_SHM_PATH) -> int | None:
+    """Total size of the filesystem mounted at ``path``, in bytes.
+
+    Returns ``None`` when the size cannot be read at all — the path does not
+    exist (a slim image, a non-Linux dev box), or ``statvfs`` is unavailable.
+    Callers treat ``None`` as "unknown", never as "too small": a missing
+    /dev/shm is not evidence of an undersized one.
+    """
+    try:
+        st = os.statvfs(path)
+    except (OSError, ValueError, AttributeError):
+        return None
+    # f_frsize is the fundamental block size; f_blocks counts those blocks.
+    return int(st.f_blocks) * int(st.f_frsize)
+
+
+def warn_if_shm_undersized(
+    engine_driver: str,
+    *,
+    path: str = ENGINE_SHM_PATH,
+    minimum: int = ENGINE_SHM_MIN_BYTES,
+) -> None:
+    """Log a startup warning when the local driver has too little /dev/shm (#210).
+
+    Only the local-subprocess driver is checked: it hands the engine whatever
+    /dev/shm the warden process itself has. The docker driver gives each engine
+    container its own (``docker_socket.ENGINE_SHM_SIZE`` / ``ipc_mode=host``),
+    so the warden's own figure says nothing about it.
+
+    This exists so an operator reads about the problem in the startup log
+    instead of discovering it as an uncatchable SIGBUS minutes into serving.
+    """
+    if engine_driver != "local":
+        return
+    total = dev_shm_bytes(path)
+    if total is None:
+        log.warning(
+            "engine shm: could not read the size of %s; vLLM tensor-parallel "
+            "workers need at least %.0f MiB of shared memory (#210)",
+            path,
+            minimum / 1024**2,
+        )
+        return
+    if total >= minimum:
+        return
+    log.warning(
+        "engine shm: %s is only %.0f MiB, below the %.0f MiB minimum for "
+        "tensor-parallel engines (#210). vLLM's shm_broadcast ring and "
+        "custom-all-reduce segments are mmap'd lazily, so an undersized "
+        "/dev/shm does not fail at startup — it kills the engine with an "
+        "uncatchable SIGBUS in shm_broadcast.enqueue minutes into serving. "
+        "The minimum comes from a TP=4 engine's observed ~1.1 GB of "
+        "ShmRingBuffer segments plus one 160 MiB message-queue ring. The fix "
+        "is a real /dev/shm on the warden pod: an emptyDir with medium: Memory "
+        "and an explicit sizeLimit (compose `shm_size:` on the api service, "
+        "podwarden-core #2417). As a stop-gap only, "
+        "VLLM_MQ_MAX_CHUNK_BYTES_MB=4 in a model's extra_env shrinks the ring "
+        "to 40 MiB at a throughput cost on large/multimodal payloads.",
+        path,
+        total / 1024**2,
+        minimum / 1024**2,
+    )
+
+
+def build_subprocess_env(
+    model, *, hf_token: str, hf_cache_dir: str, engine_driver: str = "local"
+) -> dict[str, str]:
     """Construct the env dict for a vLLM subprocess.
 
     Returns a closed dict. Caller passes this dict as the env= kwarg to
@@ -114,6 +224,11 @@ def build_subprocess_env(model, *, hf_token: str, hf_cache_dir: str) -> dict[str
     anywhere else makes it re-download the model — the 2026-06-15 ENOSPC crash,
     where the engine wrote to the tiny ``/data`` PVC instead of the model-cache
     volume and filled it to 0 bytes, taking SQLite down with it.
+
+    ``engine_driver`` is ``settings.engine_driver``. The env is the same under
+    both drivers today; the parameter is kept so a driver-specific default can
+    be added without touching every caller (the #210 chunk-size cap lived here
+    briefly and was removed once the pod got a real /dev/shm).
 
     extra_env from the model row is merged in after validation: allowed keys
     override defaults (e.g. VLLM_LOGGING_LEVEL=DEBUG overrides INFO), but
