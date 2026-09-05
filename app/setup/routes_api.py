@@ -39,10 +39,15 @@ async def post_welcome(request: Request):
     async with open_db(settings.db_path) as db:
         repo = SetupRepo(db)
         state = await repo.get()
-        if state.step != "welcome":
-            raise HTTPException(400, f"not at welcome step (current: {state.step})")
-        await repo.set_step(next_step("welcome"))
-    return {"step": "gpus"}
+        if state.step == "welcome":
+            await repo.set_step(next_step("welcome"))
+            return {"step": "gpus"}
+    # Idempotent re-entry: browser Back / a reload can land a mid-wizard
+    # visitor on the welcome page again (the client routes by URL, not by
+    # server state). The welcome step collects no data, so re-posting it is
+    # harmless — report the real current step so the client can resume
+    # there, instead of erroring the wizard into an unrecoverable state.
+    return {"step": state.step}
 
 
 class GpusBody(BaseModel):

@@ -4,6 +4,7 @@ import logging
 import secrets
 import time
 from datetime import UTC, datetime
+from typing import Any
 from uuid import uuid4
 
 import httpx
@@ -15,12 +16,18 @@ from app.db.repos.counters import CountersRepo
 from app.db.repos.models import ModelRepo
 from app.db.repos.samples import SamplesRepo
 from app.db.repos.tokens import TokenRow, TokenUsageRepo
+from app.models.context_window import effective_context_window
 from app.proxy import content_log
 from app.proxy.auth import require_bearer, token_allows
 from app.proxy.envelope_hint import enrich_5xx_from_db
 from app.proxy.reaggregate import StreamAggregator, parse_sse_event
 from app.proxy.request_registry import LiveRequest
 from app.proxy.runaway import RunawayDetector
+
+# Aliased: the forward handler already binds a LOCAL `registry` (the Plane-B
+# live-request registry off app.state), which would shadow an unaliased import
+# for the whole function -- a real F823 that ruff caught rather than a style nit.
+from app.runtime.backends import registry as backend_registry
 
 logger = logging.getLogger(__name__)
 
@@ -415,7 +422,17 @@ async def _forward(request: Request, model, host: str, port: int, path: str, tok
     request_start = time.monotonic()
 
     prompt_text = _extract_prompt(body_json)
-    prompt_tokens = await tok_cache.count(model.hf_repo, prompt_text, trust_remote_code=bool(model.trust_remote_code))
+    # fallback_repo: a GGUF-only repo ships no tokenizer.json, so counting
+    # against it raises -- on the hot path, with no try/except above -- and
+    # 500s a request the engine could have served. tokenizer_repo (migration
+    # 0015) points at the sibling that does have one; count() also fails open
+    # to a character estimate when even that is unavailable.
+    prompt_tokens = await tok_cache.count(
+        model.hf_repo,
+        prompt_text,
+        trust_remote_code=bool(model.trust_remote_code),
+        fallback_repo=getattr(model, "tokenizer_repo", None),
+    )
 
     # God mode tap (off by default). The single cheap gate below is the ONLY
     # cost on the hot path when disabled: no hub call, byte-identical forward.
@@ -490,7 +507,21 @@ async def _forward(request: Request, model, host: str, port: int, path: str, tok
     # sort ahead of default traffic. Only inject when non-zero so unprioritised
     # requests forward a byte-identical body. Re-serialize so the upstream send
     # carries the field. Never override a priority the client set explicitly.
-    if token.priority and "priority" not in body_json:
+    # Sub-project C makes the last condition a CAPABILITY question. A backend
+    # without a priority scheduler advertises supports_request_priority=False and
+    # we stop injecting the field: llama-server would silently ignore it (its
+    # parser looks up the fields it knows and never iterates the request's keys),
+    # so this is not a bug fix -- it is refusing to re-serialise a body to send a
+    # hint nothing reads, and refusing to imply a capability the engine does not
+    # have. The warden's OWN admission scheduler above still orders by priority
+    # for every backend; only the engine-side hint is backend-dependent.
+    if (
+        token.priority
+        and "priority" not in body_json
+        and backend_registry.get(
+            getattr(model, "backend", None)
+        ).capabilities.supports_request_priority
+    ):
         body_json["priority"] = -token.priority
         body = json.dumps(body_json).encode()
 
@@ -717,7 +748,12 @@ async def _forward(request: Request, model, host: str, port: int, path: str, tok
                 await _deregister()
                 await resp.aclose()
                 await client.aclose()
-                completion_tokens = await tok_cache.count(model.hf_repo, accumulated, trust_remote_code=bool(model.trust_remote_code))
+                completion_tokens = await tok_cache.count(
+                    model.hf_repo,
+                    accumulated,
+                    trust_remote_code=bool(model.trust_remote_code),
+                    fallback_repo=getattr(model, "tokenizer_repo", None),
+                )
                 await _record_counters(request, model, token_id, prompt_tokens, completion_tokens)
                 if gm_on:
                     _gm_publish(hub, {
@@ -815,7 +851,10 @@ async def _forward(request: Request, model, host: str, port: int, path: str, tok
             completion_tokens = usage.get("completion_tokens")
             if completion_tokens is None:
                 completion_tokens = await tok_cache.count(
-                    model.hf_repo, completion, trust_remote_code=bool(model.trust_remote_code)
+                    model.hf_repo,
+                    completion,
+                    trust_remote_code=bool(model.trust_remote_code),
+                    fallback_repo=getattr(model, "tokenizer_repo", None),
                 )
             if live_req is not None:
                 try:
@@ -1036,13 +1075,46 @@ async def completions(request: Request, token: TokenRow = Depends(require_bearer
 @router.get("/models")
 async def list_models(request: Request, token: TokenRow = Depends(require_bearer)):
     settings = request.app.state.settings
+    # The stress record is read on the SAME connection as the model list so a
+    # client never sees a model listed against a measurement taken for a
+    # different generation of the row.
+    from app.stress.routes_api import warden_blocks_for
+
     async with open_db(settings.db_path) as db:
         rows = await ModelRepo(db).list_all()
-    loaded = [r for r in rows if r.status == "loaded" and token_allows(token, r.served_model_name)]
-    return {
-        "object": "list",
-        "data": [
-            {"id": r.served_model_name, "object": "model", "owned_by": "vllm-warden"}
-            for r in loaded
-        ],
-    }
+        loaded = [
+            r for r in rows if r.status == "loaded" and token_allows(token, r.served_model_name)
+        ]
+        # Additive only. `id`/`object`/`owned_by` keep their exact meaning:
+        # OpenAI clients ignore unknown fields, so `warden` costs nothing to a
+        # client that does not know about it, and renaming or dropping any of
+        # the three would break every client that does not.
+        #
+        # `warden` carries MEASURED limits for this exact configuration (or a
+        # flagged stale ceiling) and never `recommended_config`, which names a
+        # configuration this engine is not running -- a client told it may send
+        # 96k-token prompts to an engine allocated for 32k would get a refusal
+        # it has no way to interpret. See app/stress/routes_api.py.
+        blocks = await warden_blocks_for(request.app.state, db, loaded, all_models=rows)
+    sup = getattr(request.app.state, "supervisor", None)
+    data = []
+    for r in loaded:
+        entry: dict[str, Any] = {
+            "id": r.served_model_name, "object": "model", "owned_by": "vllm-warden",
+        }
+        # `max_model_len` is vLLM's own spelling on this endpoint (vllm-project
+        # /vllm#4643) and OpenAI has never specified a context field, so a
+        # client that knows vLLM already reads this key and one that does not
+        # ignores it. It sits at the top level rather than inside `warden`
+        # because it is CONFIGURED, not measured: it is known the moment the
+        # engine loads, whereas the `warden` block is gated on a stress run
+        # that most wardens never have. Gating a known ceiling behind an
+        # optional measurement is what left clients guessing.
+        window = effective_context_window(settings, sup, r)
+        if window:
+            entry["max_model_len"] = window
+        block = blocks.get(r.id)
+        if block is not None:
+            entry["warden"] = block
+        data.append(entry)
+    return {"object": "list", "data": data}

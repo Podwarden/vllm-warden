@@ -8,6 +8,13 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { MODEL_HINTS } from "@/lib/settings-hints";
+import { fieldAppliesTo } from "@/lib/backend-fields";
+import {
+  LLAMACPP_MANAGED_FLAGS,
+  mergeManagedArgs,
+  setManagedArg,
+  splitManagedArgs,
+} from "@/lib/llamacpp-args";
 import { SettingField } from "@/components/settings/setting-field";
 import { SettingsSection } from "@/components/settings-section";
 import { type GpuInfo } from "@/components/gpu/gpu-checklist";
@@ -32,12 +39,35 @@ const PATCHABLE_KEYS = [
   "dtype",
   "max_model_len",
   "gpu_memory_utilization",
+  "supports_vision",
+  "supports_tools",
+  "supports_reasoning",
   "trust_remote_code",
   "extra_args",
   "extra_env",
+  // Sub-project C, migration 0028. llama.cpp only -- BACKEND_ONLY below hides
+  // them for a vLLM row, and hides vLLM's own knobs for a llama.cpp one.
+  "n_gpu_layers",
+  "mmproj_filename",
 ] as const;
 
 type PatchableKey = (typeof PATCHABLE_KEYS)[number];
+
+// llama.cpp dials with a control but NO column of their own: they live inside
+// `extra_args`, which is where a hand-typed one would go and what the argv
+// builder already appends last (@/lib/llamacpp-args explains the choice).
+//
+// Deliberately a SEPARATE list from PATCHABLE_KEYS rather than an addition to
+// it. PATCHABLE_KEYS is the backend's column allowlist and the draft's shape;
+// these three are not columns and must never appear in a PATCH body under
+// their own names -- the write they produce is an `extra_args` write, so
+// nothing new had to be allowed server-side. Two lists, two meanings: what the
+// API accepts, and what the page renders.
+const ARG_BACKED_KEYS = ["flash_attn", "cache_type_k", "cache_type_v"] as const;
+type ArgBackedKey = (typeof ARG_BACKED_KEYS)[number];
+
+/** Anything the settings page draws a control for. */
+type FieldKey = PatchableKey | ArgBackedKey;
 
 // ---------------------------------------------------------------------------
 // Section grouping (S4 design principle #1 + #2 — discrete instrument-panel
@@ -48,7 +78,7 @@ type PatchableKey = (typeof PATCHABLE_KEYS)[number];
 const SECTION_GROUPS: ReadonlyArray<{
   title: string;
   testId: string;
-  keys: ReadonlyArray<PatchableKey>;
+  keys: ReadonlyArray<FieldKey>;
 }> = [
   {
     title: "Identity",
@@ -58,7 +88,17 @@ const SECTION_GROUPS: ReadonlyArray<{
   {
     title: "Memory",
     testId: "section-memory",
-    keys: ["gpu_memory_utilization", "max_model_len", "dtype"],
+    keys: ["gpu_memory_utilization", "max_model_len", "dtype", "n_gpu_layers"],
+  },
+  {
+    // Absent entirely on a vLLM row -- every key in it is llama.cpp's, so
+    // fieldAppliesTo empties the section and SettingsSection renders nothing.
+    // These are the knobs an operator actually reaches for on a small card,
+    // and until now the only way to set any of them was to hand-type a flag
+    // into Extra args.
+    title: "llama.cpp engine",
+    testId: "section-llamacpp",
+    keys: ["flash_attn", "cache_type_k", "cache_type_v"],
   },
   {
     title: "Compute",
@@ -66,11 +106,21 @@ const SECTION_GROUPS: ReadonlyArray<{
     keys: ["gpu_indices", "tensor_parallel_size"],
   },
   {
+    title: "Capabilities",
+    testId: "section-capabilities",
+    keys: ["supports_vision", "supports_tools", "supports_reasoning"],
+  },
+  {
     title: "Advanced",
     testId: "section-advanced",
-    keys: ["trust_remote_code", "extra_args", "extra_env"],
+    keys: ["trust_remote_code", "extra_args", "extra_env", "mmproj_filename"],
   },
 ];
+
+// `fieldAppliesTo` and its table moved to @/lib/backend-fields so the model
+// DETAIL page can apply the same rule. It used to live here and be applied on
+// this page alone, which is why a llama.cpp row's detail view still advertised
+// a Tensor parallel size and a gpu_memory_utilization.
 
 interface ModelSettings {
   id: string;
@@ -85,6 +135,21 @@ interface ModelSettings {
   trust_remote_code: boolean;
   extra_args: string[];
   extra_env: Record<string, string>;
+  // Sub-project C. `backend` is read-only HERE -- switching a loaded model's
+  // engine is a load-time decision made in the wizard, and the PATCH route
+  // validates it separately (app/settings/routes_api.py::_coerce_backend).
+  // NULL decodes to vLLM (D6).
+  backend: string | null;
+  n_gpu_layers: number | null;
+  mmproj_filename: string | null;
+  // Capability flags. The GET returns the RAW column (1 / 0 / null) rather
+  // than a coerced bool precisely so the third state survives the trip — see
+  // _MODEL_TRISTATE_FIELDS in app/settings/routes_api.py. They are widened to
+  // `number | boolean | null` because the PATCH we send back uses booleans;
+  // `snapshotToDraft` normalises both shapes to `boolean | null`.
+  supports_vision: number | boolean | null;
+  supports_tools: number | boolean | null;
+  supports_reasoning: number | boolean | null;
   // Read-only fields included in GET response.
   status:
     | "registered"
@@ -99,7 +164,21 @@ interface ModelSettings {
   last_error: string | null;
 }
 
-type Draft = Pick<ModelSettings, PatchableKey>;
+// The three tri-state capability flags. Held in the draft as `boolean | null`
+// (never the raw 0/1 the GET hands back) so the PATCH body is already in the
+// shape the backend wants: true / false / null, where null means "reset to
+// auto-detection" and an omitted key means "don't touch".
+const TRISTATE_KEYS = ["supports_vision", "supports_tools", "supports_reasoning"] as const;
+type TristateKey = (typeof TRISTATE_KEYS)[number];
+
+type Draft = Omit<Pick<ModelSettings, PatchableKey>, TristateKey> & {
+  [K in TristateKey]: boolean | null;
+};
+
+/** Normalise a raw tri-state column (null / 0 / 1 / bool) to `boolean | null`. */
+function triState(v: number | boolean | null | undefined): boolean | null {
+  return v === null || v === undefined ? null : Boolean(v);
+}
 
 const DTYPE_OPTIONS = ["auto", "float16", "bfloat16", "float32"];
 
@@ -138,10 +217,10 @@ interface SuggestResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Effective argv (GET /api/models/{id}/effective-argv) — what `vllm serve`
-// would actually be invoked with for the current persisted settings (preview
-// port 10000). The panel polls along with the draft so saves show up almost
-// immediately.
+// Effective argv (GET /api/models/{id}/effective-argv) — the FULL argv, from
+// argv[0] onwards, that the engine would actually be invoked with for the
+// current persisted settings (preview port 10000). The panel polls along with
+// the draft so saves show up almost immediately.
 // ---------------------------------------------------------------------------
 interface EffectiveArgvResponse {
   argv: string[];
@@ -157,6 +236,11 @@ function snapshotToDraft(s: ModelSettings): Draft {
     dtype: s.dtype,
     max_model_len: s.max_model_len,
     gpu_memory_utilization: s.gpu_memory_utilization,
+    n_gpu_layers: s.n_gpu_layers ?? null,
+    mmproj_filename: s.mmproj_filename ?? null,
+    supports_vision: triState(s.supports_vision),
+    supports_tools: triState(s.supports_tools),
+    supports_reasoning: triState(s.supports_reasoning),
     trust_remote_code: s.trust_remote_code,
     extra_args: s.extra_args,
     extra_env: s.extra_env,
@@ -314,9 +398,19 @@ export default function ModelSettingsPage({
   // disable all inputs + Save up front and surface the same banner copy
   // the 409 branch would. The form is rendered so the operator can see
   // what's currently in place, just can't change it without unloading.
+  //
+  // One carve-out, mirroring the backend's (app/settings/routes_api.py:
+  // `capabilities_only`): a patch made up ENTIRELY of capability flags is
+  // allowed on a loaded model. Those columns are inert metadata the load
+  // runner never reads, and the loaded model is exactly the one an operator
+  // is looking at when they notice vision is set wrong.
   const isLoaded = data.status === "loaded";
   const allDisabled = isLoaded || saving;
+  const capabilitiesDisabled = saving;
   const dirty = dirtyKeys(draft, snapshotToDraft(data));
+  const capabilitiesOnly =
+    dirty.length > 0 &&
+    dirty.every((k) => (TRISTATE_KEYS as readonly string[]).includes(k));
   // Per-model gpu_indices requires >=1 selection (spec: "Save disabled /
   // validation message when empty"). Unlike Settings → default_gpu_indices
   // (which may be empty = no preset), a model with zero GPUs would be handed
@@ -324,7 +418,8 @@ export default function ModelSettingsPage({
   // an inline message next to the field.
   const gpuIndicesEmpty = draft.gpu_indices.length === 0;
   const canSave =
-    !allDisabled && dirty.length > 0 && !conflict && !gpuIndicesEmpty;
+    !saving && dirty.length > 0 && !conflict && !gpuIndicesEmpty &&
+    (!isLoaded || capabilitiesOnly);
 
   async function onSave() {
     if (!data || !draft) return;
@@ -371,7 +466,7 @@ export default function ModelSettingsPage({
       await mutate();
       // Fire-and-forget cross-page cache busts so the dashboard list and
       // the model detail page reflect the new served_model_name/etc.
-      // immediately on back-navigation. Awaiting these would make the
+      // the draft so saves show up almost immediately.on back-navigation. Awaiting these would make the
       // operator wait on two purely-cosmetic refreshes.
       void globalMutate("/api/models");
       void globalMutate(`/api/models/${id}`);
@@ -512,7 +607,9 @@ export default function ModelSettingsPage({
           <Link href={`/models/${id}`} className="underline">
             go to the model page
           </Link>{" "}
-          and unload it first.
+          and unload it first. The capability flags below are the exception:
+          they are metadata the engine never reads, so they can be corrected
+          on a loaded model.
         </div>
       )}
 
@@ -537,7 +634,18 @@ export default function ModelSettingsPage({
           <CardTitle>Model configuration</CardTitle>
         </CardHeader>
         <CardContent className="space-y-6">
-          {SECTION_GROUPS.map((group) => (
+          {SECTION_GROUPS.map((group) => {
+            // A section every one of whose keys belongs to a DIFFERENT backend
+            // is not rendered at all. Without this the "llama.cpp engine"
+            // section would draw its header and a collapse triangle over an
+            // empty body on every vLLM row -- a control that opens onto
+            // nothing, which is the defect class this branch is about. Memory
+            // is exempt because it also carries the Suggest panel.
+            const visible = group.keys.filter(
+              (k) => MODEL_HINTS[k] && fieldAppliesTo(k, data.backend),
+            );
+            if (visible.length === 0 && group.title !== "Memory") return null;
+            return (
             <SettingsSection
               key={group.testId}
               title={group.title}
@@ -556,9 +664,29 @@ export default function ModelSettingsPage({
                   onApply={applySparseSettings}
                 />
               )}
+              {/* Explain, do not offer a dead control. --split-mode and
+                  --main-gpu are DERIVED from the GPU selection (decision D4
+                  keeps the GPU count the invariant and lets plan() pick the
+                  backend-appropriate flag), and --tensor-split is left to
+                  llama.cpp's memory-proportional default, which is the better
+                  answer on a heterogeneous box. A control for any of them
+                  would be a second, competing source for a fact the Compute
+                  section already owns. */}
+              {group.testId === "section-llamacpp" && (
+                <p
+                  data-testid="llamacpp-derived-note"
+                  className="text-xs text-slate-500"
+                >
+                  <code>--split-mode</code> and <code>--main-gpu</code> follow the
+                  GPU selection in Compute and are not set here.{" "}
+                  <code>--tensor-split</code> is left to llama.cpp&apos;s
+                  memory-proportional default. Anything else goes in Extra args.
+                </p>
+              )}
               {group.keys.map((k) => {
                 const hint = MODEL_HINTS[k];
                 if (!hint) return null;
+                if (!fieldAppliesTo(k, data.backend)) return null;
                 return (
                   <SettingFieldFor
                     key={k}
@@ -569,13 +697,19 @@ export default function ModelSettingsPage({
                     setDraft={(updater) =>
                       setDraft((d) => (d === null ? d : updater(d)))
                     }
-                    disabled={allDisabled}
+                    disabled={
+                      (TRISTATE_KEYS as readonly string[]).includes(k)
+                        ? capabilitiesDisabled
+                        : allDisabled
+                    }
                     gpuIndicesEmpty={gpuIndicesEmpty}
+                    modelId={id}
                   />
                 );
               })}
             </SettingsSection>
-          ))}
+            );
+          })}
         </CardContent>
       </Card>
 
@@ -588,12 +722,25 @@ export default function ModelSettingsPage({
 // last-saved snapshot so the operator can collapse a section and still see
 // "2 unsaved" next to its title.
 function renderSectionSubtitle(
-  keys: ReadonlyArray<PatchableKey>,
+  keys: ReadonlyArray<FieldKey>,
   draft: Draft,
   snapshot: ModelSettings,
 ): string | null {
   const snap = snapshotToDraft(snapshot);
-  const dirty = keys.filter((k) => !eqValue(draft[k], snap[k]));
+  // `extra_args` is ONE column serving two sections, so it is counted in
+  // halves: the llama.cpp controls own the managed flags, Extra args owns the
+  // rest. Counting the whole column in both would report a single edit twice,
+  // in two different places, and counting it in neither would leave a changed
+  // control with no unsaved marker at all.
+  const draftArgs = splitManagedArgs(draft.extra_args);
+  const snapArgs = splitManagedArgs(snap.extra_args);
+  const dirty = keys.filter((k) => {
+    if ((ARG_BACKED_KEYS as readonly string[]).includes(k)) {
+      return draftArgs.managed[k] !== snapArgs.managed[k];
+    }
+    if (k === "extra_args") return !eqValue(draftArgs.rest, snapArgs.rest);
+    return !eqValue(draft[k as PatchableKey], snap[k as PatchableKey]);
+  });
   if (dirty.length === 0) return null;
   return `${dirty.length} unsaved`;
 }
@@ -837,9 +984,9 @@ function SuggestPanel({
 
 // ---------------------------------------------------------------------------
 // EffectiveArgvPanel — faux-terminal block at the bottom of the page that
-// shows what `vllm serve` would actually be invoked with for the *persisted*
-// settings (preview port 10000). Re-fetched on every save so the operator
-// gets a one-second feedback loop: change → save → see argv update.
+// shows the FULL argv, argv[0] included, that the engine would be invoked
+// with for the *persisted* settings (preview port 10000). Re-fetched on every
+// save so the operator gets a one-second feedback loop: change → save → see it.
 //
 // Highlight on change uses the existing `row-flash-emerald` keyframe pattern
 // from globals.css — gated by prefers-reduced-motion (S4 design principle #10).
@@ -881,7 +1028,7 @@ function EffectiveArgvPanel({ modelId }: { modelId: string }) {
     if (!data) return;
     // copyToClipboard (lib/utils.ts) tries navigator.clipboard then
     // falls back to a hidden-textarea + execCommand("copy") so the
-    // button works on the d5 LAN-HTTP deployment too (#149). The
+    // button works on a LAN-HTTP deployment too (#149). The
     // success-flash is best-effort: we still flip `copied` even if the
     // call rejects, because there is no toast surface on this panel
     // and the textarea fallback leaves the argv selected as a
@@ -909,7 +1056,15 @@ function EffectiveArgvPanel({ modelId }: { modelId: string }) {
           </Button>
         </div>
         <p className="text-xs text-slate-400" data-testid="effective-argv-subtitle">
-          Preview only — <code>--port 10000</code> is a placeholder; the supervisor binds a real ephemeral port at load time.
+          {/* The operator's question, verbatim: "why is Extra args empty but
+              Effective argv has so many arguments?" The distinction was
+              already correct and entirely invisible, which is the same defect
+              family as a control whose effect is gated elsewhere -- so say it
+              here, next to the thing that prompts the question. */}
+          The <em>whole</em> command, generated from the fields above plus your
+          Extra args — which is why it is longer than that box. Preview only:{" "}
+          <code>--port 10000</code> is a placeholder; the supervisor binds a real
+          ephemeral port at load time.
         </p>
       </CardHeader>
       <CardContent>
@@ -1046,14 +1201,18 @@ function SettingFieldFor({
   disabled,
   gpus,
   gpuIndicesEmpty,
+  modelId,
 }: {
-  fieldKey: PatchableKey;
+  fieldKey: FieldKey;
   hint: import("@/lib/settings-hints").FieldHint;
   draft: Draft;
   setDraft: (updater: (d: Draft) => Draft) => void;
   disabled: boolean;
   gpus: GpuInfo[];
   gpuIndicesEmpty: boolean;
+  /** This row's id, so its own loaded engine is not reported as a competing
+   *  occupant of the card it is running on. */
+  modelId: string;
 }) {
   // Local updater factory — narrows TS to a per-key setter that the
   // SettingField onChange callbacks can accept directly.
@@ -1071,6 +1230,30 @@ function SettingFieldFor({
           field={hint}
           value={draft[fieldKey]}
           onChange={(v) => set(fieldKey, v)}
+          disabled={disabled}
+        />
+      );
+    case "mmproj_filename":
+      return (
+        <SettingField
+          kind="text"
+          field={hint}
+          value={draft.mmproj_filename ?? ""}
+          onChange={(v) => set("mmproj_filename", v.trim() === "" ? null : v)}
+          disabled={disabled}
+        />
+      );
+    case "n_gpu_layers":
+      return (
+        <SettingField
+          kind="number"
+          field={hint}
+          value={draft.n_gpu_layers}
+          // A cleared box means "omit the flag" -- llama.cpp's own auto/--fit
+          // sizing decides -- which is NOT the same as 0 (everything on CPU).
+          // Null has to survive the round trip or the default becomes
+          // unreachable once an operator has typed a number.
+          onChange={(v) => set("n_gpu_layers", v)}
           disabled={disabled}
         />
       );
@@ -1132,6 +1315,18 @@ function SettingFieldFor({
           disabled={disabled}
         />
       );
+    case "supports_vision":
+    case "supports_tools":
+    case "supports_reasoning":
+      return (
+        <SettingField
+          kind="tristate"
+          field={hint}
+          value={draft[fieldKey]}
+          onChange={(v) => set(fieldKey, v)}
+          disabled={disabled}
+        />
+      );
     case "trust_remote_code":
       return (
         <SettingField
@@ -1150,6 +1345,7 @@ function SettingFieldFor({
             field={hint}
             value={draft.gpu_indices}
             gpus={gpus}
+            excludeModelId={modelId}
             onChange={(v) => set("gpu_indices", v)}
             disabled={disabled}
           />
@@ -1164,13 +1360,52 @@ function SettingFieldFor({
           )}
         </div>
       );
+    case "flash_attn":
+    case "cache_type_k":
+    case "cache_type_v": {
+      // Backed by `extra_args`, not by a column. The control reads the flag
+      // out of the list and writes it back into the same list, so the value
+      // has exactly ONE home and cannot end up both here and in the free-text
+      // box below. setManagedArg REPLACES; it never appends a second copy.
+      const spec = LLAMACPP_MANAGED_FLAGS.find((f) => f.key === fieldKey)!;
+      const { managed } = splitManagedArgs(draft.extra_args);
+      return (
+        <SettingField
+          kind="select"
+          field={hint}
+          value={managed[fieldKey] ?? null}
+          options={[...spec.values]}
+          // "default" clears the flag entirely rather than writing the
+          // engine's own default out. Emitting a value for an untouched
+          // control would change the launch command of every existing row --
+          // and a default the operator cannot get back to is the settings bug
+          // this codebase keeps rediscovering.
+          allowNull
+          onChange={(v) =>
+            set("extra_args", setManagedArg(draft.extra_args, fieldKey, v ?? undefined))
+          }
+          disabled={disabled}
+        />
+      );
+    }
     case "extra_args":
       return (
         <SettingField
           kind="string-list"
           field={hint}
-          value={draft.extra_args}
-          onChange={(v) => set("extra_args", v)}
+          // Only what the controls above do NOT own. A managed flag lives in
+          // exactly one place, so an operator who types `--flash-attn on` here
+          // finds it in the Flash attention control on the next load -- moved,
+          // never duplicated and never silently dropped.
+          value={splitManagedArgs(draft.extra_args).rest}
+          onChange={(v) =>
+            // Re-attach the managed flags the box never saw, so editing free
+            // text cannot clear a control the operator did not touch.
+            set(
+              "extra_args",
+              mergeManagedArgs(v, splitManagedArgs(draft.extra_args).managed),
+            )
+          }
           disabled={disabled}
         />
       );

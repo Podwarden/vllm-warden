@@ -65,6 +65,17 @@ type BooleanProps = CommonProps & {
   onChange: (v: boolean) => void;
 };
 
+// Three-valued flag: yes / no / "nobody has said". The third state is not a
+// missing value — it is the instruction "work it out yourself", which is what
+// the model capability columns mean by NULL (the backend then sniffs the
+// on-disk HF config; see app/chat2/catalog.py). A checkbox cannot express it,
+// so this renders as a select and emits `null` for Auto.
+type TristateProps = CommonProps & {
+  kind: "tristate";
+  value: boolean | null;
+  onChange: (v: boolean | null) => void;
+};
+
 // Comma-separated integer list, e.g. gpu_indices. The component owns the
 // text representation in local state (well, derived from the value prop)
 // and only emits a typed number[] when the parse succeeds; intermediate
@@ -117,12 +128,16 @@ type GpuSetProps = CommonProps & {
   value: number[];
   onChange: (v: number[]) => void;
   gpus: GpuInfo[];
+  /** The model being edited, so its own engine is not reported as competing
+   *  with itself for a card it is already loaded on. See GpuChecklist. */
+  excludeModelId?: string;
 };
 
 type Props =
   | TextProps
   | NumberProps
   | BooleanProps
+  | TristateProps
   | IntListProps
   | StringListProps
   | KvMapProps
@@ -333,12 +348,10 @@ export function SettingField(props: Props) {
   return (
     <div className="space-y-1">
       <div className="flex items-baseline justify-between gap-2">
-        {/* gpu-set delegates rendering to GpuChecklist, which owns its own
-            per-GPU checkbox ids and never consumes inputId — so a
-            `htmlFor={inputId}` here would dangle. Render a plain <span>
-            instead; the hint stays associated via GpuChecklist's
-            aria-describedby (see the gpu-set case below). */}
-        {props.kind === "gpu-set" ? (
+        {/* gpu-set and tristate delegate to controls that own their own ids
+            (GpuChecklist, Select) and never consume inputId, so a
+            `htmlFor={inputId}` here would dangle. */}
+        {props.kind === "gpu-set" || props.kind === "tristate" ? (
           <span className="font-medium text-slate-200">{field.label}</span>
         ) : (
           <label htmlFor={inputId} className="font-medium text-slate-200">
@@ -428,6 +441,28 @@ function renderControl(
         </label>
       );
 
+    case "tristate": {
+      // The Select primitive models a single string value, so the three
+      // states travel as "auto" | "yes" | "no" and are mapped back at the
+      // boundary. "auto" MUST come back as null, not as an omitted key — the
+      // backend reads null as "reset to auto-detection" and a missing key as
+      // "leave whatever is there alone".
+      const TRISTATE_OPTIONS: SelectOption<string>[] = [
+        { value: "auto", label: "Auto" },
+        { value: "yes", label: "Yes" },
+        { value: "no", label: "No" },
+      ];
+      return (
+        <Select
+          options={TRISTATE_OPTIONS}
+          value={props.value === null ? "auto" : props.value ? "yes" : "no"}
+          onChange={(v) => props.onChange(v === "auto" ? null : v === "yes")}
+          disabled={disabled}
+          ariaLabel={props.field.label}
+        />
+      );
+    }
+
     case "int-list":
       return (
         <IntListInput
@@ -491,6 +526,7 @@ function renderControl(
           onChange={props.onChange}
           disabled={disabled}
           describedById={hintId}
+          excludeModelId={props.excludeModelId}
         />
       );
   }

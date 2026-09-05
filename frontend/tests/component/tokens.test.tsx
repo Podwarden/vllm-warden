@@ -101,7 +101,7 @@ describe('RotateTokenDialog', () => {
   });
 
   it('uses execCommand fallback on non-secure context and reports Copied (#149)', async () => {
-    // Mirrors the d5 production setup: navigator.clipboard is undefined
+    // Mirrors a production setup: navigator.clipboard is undefined
     // because the page is served over plain HTTP. Without the textarea
     // fallback added in #149 this test would land on the "select
     // manually" failure path — pinning the success path here prevents

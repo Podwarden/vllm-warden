@@ -12,3 +12,6 @@ PyJWT[crypto]==2.9.0
 # kwarg; that's a CLI-only flag). Only imported when engine_driver=="docker";
 # the default local-subprocess path never touches it.
 docker==7.1.0
+# Chat2 image attachments (#chat2 T5) — server-side re-encode strips EXIF/
+# ancillary chunks and rejects polyglots before anything touches disk.
+Pillow==11.0.0

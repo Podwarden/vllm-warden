@@ -20,14 +20,113 @@ scheduling, token-cache warm-up, etc.) without papering over real bugs
 (non-401 responses surface immediately).
 """
 
+import asyncio
 import json
+import os
+import shutil
 import sqlite3
+import tempfile
 import time
 from pathlib import Path
 
-import bcrypt
-import pytest
-from fastapi.testclient import TestClient
+# Hermetic Hugging Face: ``TokenizerCache.get`` calls
+# ``AutoTokenizer.from_pretrained(hf_repo)`` for whatever repo a test seeded
+# (``Qwen/Qwen3.5-9B`` in the proxy tests), which reaches huggingface.co and,
+# on a developer machine, also picks up whatever happens to be in
+# ``~/.cache/huggingface``. Measured on tests/unit/proxy/test_proxy_route.py:
+# 13.1 s online vs 7.6 s offline, and on a cold CI container it is a real
+# download per run. Offline mode + an empty HF_HOME makes the load fail
+# immediately, which is the code path the cache already handles by falling
+# back to a character estimate (see app/proxy/tokenizers.py::count). Tests
+# that need a real tokenizer stub ``app.state.tokenizers``.
+#
+# Both variables are read by ``huggingface_hub.constants`` at import time, so
+# they must be set here, before anything imports transformers, not in a
+# fixture. ``setdefault`` so an operator can still opt back in explicitly.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault(
+    "HF_HOME", str(Path(tempfile.gettempdir()) / "vllm-warden-tests-hf-home")
+)
+Path(os.environ["HF_HOME"]).mkdir(parents=True, exist_ok=True)
+
+import bcrypt  # noqa: E402
+import pytest  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Suite-wide speed fixtures (perf/test-suite-speed)
+# ---------------------------------------------------------------------------
+#
+# Two fixed costs dominated the unit suite (measured 2026-09-03, 2035 tests,
+# 367.6 s serial on an M-series Mac before / 60.6 s after):
+#
+#   * bcrypt at the production cost factor. ``bcrypt.gensalt()`` defaults to
+#     12 rounds (~370 ms/op on an M-series Mac, more on the CI runners). The
+#     suite performs ~640 hashpw+checkpw calls per run — every
+#     ``seed_admin_user`` hashes and every ``jwt_login`` verifies — which was
+#     ~240 s of those 367.6 s. Nothing in the tree asserts on
+#     the cost factor; the hash format, the verify path and the production
+#     code are all unchanged. ``_fast_bcrypt`` lowers the DEFAULT rounds to
+#     bcrypt's minimum (4) for the duration of each test by patching the
+#     module attribute every call site resolves at call time. Production
+#     defaults are untouched.
+#
+#   * Running all 28 schema migrations against a fresh SQLite file inside
+#     every ``client`` lifespan (28 ``BEGIN IMMEDIATE``/``COMMIT`` pairs, each
+#     an fsync). ``migrated_db_template`` runs them ONCE per session through
+#     the exact same ``open_db`` + ``apply_migrations`` path and the ``client``
+#     fixture ``shutil.copyfile``s the result into the test's data dir. The
+#     lifespan still calls ``apply_migrations`` on it, sees every file already
+#     recorded in ``schema_migrations`` and applies nothing. A test that
+#     genuinely needs to observe migrations being applied by the lifespan
+#     opts out with ``@pytest.mark.fresh_db``.
+
+_FAST_BCRYPT_ROUNDS = 4
+_REAL_GENSALT = bcrypt.gensalt
+# Same content as app.auth.routes._DUMMY_HASH, at the test cost factor, so the
+# unknown-user login path is as cheap as the known-user one during tests.
+_FAST_DUMMY_HASH = bcrypt.hashpw(
+    b"timing-equalizer", _REAL_GENSALT(_FAST_BCRYPT_ROUNDS)
+).decode()
+
+
+def _fast_gensalt(rounds: int = _FAST_BCRYPT_ROUNDS, prefix: bytes = b"2b") -> bytes:
+    return _REAL_GENSALT(rounds, prefix)
+
+
+@pytest.fixture(autouse=True)
+def _fast_bcrypt(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Drop bcrypt's default cost to the minimum for the duration of a test."""
+    monkeypatch.setattr(bcrypt, "gensalt", _fast_gensalt)
+    # The timing-equaliser hash is computed at import time at the production
+    # cost, so an unknown-user login would still pay ~370 ms per checkpw.
+    from app.auth import routes as auth_routes
+
+    monkeypatch.setattr(auth_routes, "_DUMMY_HASH", _FAST_DUMMY_HASH)
+
+
+@pytest.fixture(scope="session")
+def migrated_db_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """A SQLite file with every migration in app/db/sql applied, built once.
+
+    Built through the production ``open_db`` + ``apply_migrations`` path so
+    the PRAGMAs, journal mode and ``schema_migrations`` bookkeeping are
+    byte-for-byte what the lifespan would have produced. The WAL is
+    checkpointed and truncated before the connection closes so the main file
+    is self-contained and safe to ``copyfile``.
+    """
+    from app.db.database import open_db
+    from app.db.migrations import apply_migrations
+
+    path = tmp_path_factory.mktemp("db-template") / "vllm-warden.db"
+
+    async def build() -> None:
+        async with open_db(path) as db:
+            await apply_migrations(db)
+            await db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    asyncio.run(build())
+    return path
 
 
 @pytest.fixture
@@ -36,12 +135,40 @@ def tmp_data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("VW_HF_CACHE_DIR", str(tmp_path / "hf-cache"))
     monkeypatch.setenv("VW_COOKIE_SECRET", "test-secret-32-bytes-min-padding!")
     monkeypatch.setenv("VW_CONTAINER_GPU_COUNT", "4")
+    # chat2 attachment uploads run a real `shutil.disk_usage(data_dir)` free-
+    # space check against `chat_quota_free_floor_bytes` (default 5 GiB). On a
+    # disk-constrained runner every upload in the suite would 413 with
+    # `quota_exceeded` — a failure that has nothing to do with the test. Pin
+    # the floor to 0 here; the floor itself is covered by an explicit test
+    # that raises it and monkeypatches `shutil.disk_usage`
+    # (tests/unit/chat2/test_attachments_routes.py).
+    monkeypatch.setenv("VW_CHAT_QUOTA_FREE_FLOOR_BYTES", "0")
+    # The engine watchdog's FIRST tick runs the moment the lifespan starts
+    # (interval 30 s after that). Proxy tests seed a 'loaded' model, register
+    # a fake port on the supervisor and patch ``httpx.AsyncClient.send``
+    # process-wide; the watchdog's health probe of that fake port then lands
+    # inside the patch and is recorded as the test's "forwarded request"
+    # (``calls[0]["stream"] is False``, empty body). The race window was
+    # hidden by ~750 ms of production-cost bcrypt per test and became
+    # deterministic once that went away. A unit-test app must not run an
+    # autonomous prober against ports the test itself registered as fakes:
+    # disable the probe/restart loop here. Restore-on-boot still runs (it is
+    # outside the ``enabled`` check) and the watchdog itself is unit-tested
+    # directly in tests/unit/test_engine_watchdog.py.
+    monkeypatch.setenv("VW_WATCHDOG_ENABLED", "0")
     return tmp_path
 
 
 @pytest.fixture
-def client(tmp_data_dir: Path) -> TestClient:
+def client(
+    request: pytest.FixtureRequest, tmp_data_dir: Path, migrated_db_template: Path
+) -> TestClient:
     from app.main import build_app
+
+    if request.node.get_closest_marker("fresh_db") is None:
+        # Pre-migrated copy; the lifespan's apply_migrations finds nothing to
+        # do. See the module docstring block above.
+        shutil.copyfile(migrated_db_template, tmp_data_dir / "vllm-warden.db")
     app = build_app()
     with TestClient(app) as c:
         yield c

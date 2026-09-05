@@ -92,6 +92,38 @@ test.describe("Add Model modal — #86 4-state machine", () => {
         probed_at: "2026-05-19T12:00:00Z",
         probe_error: null,
         gpus: GPUS_FIXTURE,
+        // null = no allowlist recorded = every GPU selectable. Not [].
+        allowed_indices: null,
+      }),
+    );
+    // The dialog's engine-version control gates on version_pin_available.
+    // Mirrors `bonus` as deployed: the subprocess driver cannot swap the
+    // engine image, so the field is disabled and carries the server's reason.
+    await page.route("**/api/system/backends", (route) =>
+      jsonRoute(route, {
+        default: "vllm",
+        driver: "subprocess",
+        engine_version: "0.26.0",
+        backends: [
+          {
+            name: "llamacpp",
+            display_name: "llama.cpp",
+            version: "b10731",
+            supports_version_pin: true,
+            version_pin_available: false,
+            version_pin_reason:
+              "This deployment runs the in-container engine driver, which cannot swap the engine image, so a version pin would be silently discarded. Version selection requires the docker engine driver.",
+          },
+          {
+            name: "vllm",
+            display_name: "vLLM",
+            version: "0.26.0",
+            supports_version_pin: true,
+            version_pin_available: false,
+            version_pin_reason:
+              "This deployment runs the in-container engine driver, which cannot swap the engine image, so a version pin would be silently discarded. Version selection requires the docker engine driver.",
+          },
+        ],
       }),
     );
     await page.route("**/api/models/discover**", (route) =>

@@ -1,0 +1,30 @@
+{
+  "cuda_oom": {
+    "message": "GPU ran out of memory loading the model. Use fewer/larger GPUs, lower gpu_memory_utilization, or reduce max_model_len.",
+    "recommended_max_model_len": null
+  },
+  "decrease_maxlen_phrasing": {
+    "message": "KV cache too small for the requested context. Lower max_model_len or raise gpu_memory_utilization for the selected GPU(s).",
+    "recommended_max_model_len": null
+  },
+  "empty": null,
+  "kv_overflow_no_estimate": {
+    "message": "KV cache too small for the requested context. Lower max_model_len or raise gpu_memory_utilization for the selected GPU(s).",
+    "recommended_max_model_len": null
+  },
+  "kv_overflow_with_estimate": {
+    "message": "Context too long for GPU memory: model wants 262144 tokens (needs 16.0 GiB KV cache) but only 9.6 GiB is available. vLLM estimates the max workable context here is 157216 \u2014 set max_model_len <= 157216, or raise gpu_memory_utilization.",
+    "recommended_max_model_len": 157216
+  },
+  "no_cache_blocks": {
+    "message": "GPU has no room for the KV cache after loading the weights \u2014 the model is too large for the selected GPU(s) at this gpu_memory_utilization. Use more/larger GPUs or raise gpu_memory_utilization.",
+    "recommended_max_model_len": null
+  },
+  "trust_remote_code_config_echo_is_not_a_match": null,
+  "trust_remote_code_genuinely_required": {
+    "message": "This model requires trust_remote_code to load. Enable trust_remote_code for this model (it executes code from the model repo \u2014 only do this for repos you trust), then retry.",
+    "recommended_max_model_len": null
+  },
+  "unrecognised": null,
+  "whitespace_only": null
+}

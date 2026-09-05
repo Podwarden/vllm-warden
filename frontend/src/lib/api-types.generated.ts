@@ -140,11 +140,12 @@ export interface paths {
          *     that ``app.models.discovery.DiscoveryResult`` defines; the FE selects a
          *     file from ``files`` and posts a normal ``POST /api/models`` after.
          *
-         *     ``config`` contains at most six keys: ``hidden_size``,
+         *     ``config`` is a fixed projection of ``config.json`` — ``hidden_size``,
          *     ``num_hidden_layers``, ``num_attention_heads``, ``num_key_value_heads``,
-         *     ``max_position_embeddings``, ``torch_dtype`` — exactly the set that the
-         *     parent issue #82 commits to. Anything else from ``config.json`` stays
-         *     opaque so the FE's VRAM-fit math has a stable contract.
+         *     ``max_position_embeddings``, ``torch_dtype`` (the set #82 commits to),
+         *     ``quantization_config`` (#176), and the KV-shape keys ``head_dim``,
+         *     ``sliding_window`` and ``layer_types``. Anything else from ``config.json``
+         *     stays opaque so the VRAM-fit math has a stable contract.
          *
          *     Gated repos silently reuse ``data_dir/hf-token`` (CTO decision in #84) —
          *     we do not prompt the user for a second confirmation. Failures map to
@@ -305,8 +306,9 @@ export interface paths {
          * Get Effective Argv
          * @description Return the argv that ``vllm serve`` would be invoked with for this model.
          *
-         *     Calls :func:`app.runtime.cmd_builder.build_vllm_args` against the
-         *     persisted row exactly as the supervisor would at load time, using a
+         *     Asks the row's backend for a :class:`~app.runtime.backends.LaunchPlan`
+         *     against the persisted row exactly as the supervisor would at load time,
+         *     so the returned argv includes argv[0] and its subcommand, using a
          *     fixed placeholder port (the real port comes from the supervisor's
          *     PortAllocator at load time and would jitter on every refresh).
          *     Includes ``extra_args``, parallelism flag, GGUF quant tag, tokenizer
@@ -413,6 +415,74 @@ export interface paths {
         get: operations["stream_logs_api_models__model_id__logs_stream_get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/models/{model_id}/stress": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Start Stress */
+        post: operations["start_stress_api_models__model_id__stress_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/models/{model_id}/capabilities": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Model Capabilities
+         * @description The full operator-facing record: limits with provenance, history, advice.
+         */
+        get: operations["model_capabilities_api_models__model_id__capabilities_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/models/{model_id}/stress/apply": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Apply Stress Recommendation
+         * @description Apply a measured `max_model_len` and reload the engine (design §6.4).
+         *
+         *     The only action in this feature that changes the model rather than
+         *     observing it. Three steps, in this order and for this reason: the settings
+         *     patch refuses to touch a loaded model, so the row cannot be updated while
+         *     it serves; and the engine must be restarted for a new context to take
+         *     effect at all.
+         *
+         *     Done server-side rather than as three calls from the browser: a client that
+         *     unloads, then patches, then closes its tab leaves the model unloaded and an
+         *     operator wondering why. Here the sequence either completes or reports where
+         *     it stopped.
+         */
+        post: operations["apply_stress_recommendation_api_models__model_id__stress_apply_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -688,13 +758,36 @@ export interface paths {
         };
         /**
          * Stats V2 Overview
-         * @description Aggregate dashboard payload for the new stats page.
+         * @description Aggregate dashboard payload for the stats page, for a selection of models.
+         *
+         *     ``models`` is a comma-separated list of model ids. Absent means the whole
+         *     deployment (the original behaviour, byte-for-byte). Present, it narrows
+         *     EVERY number in the response -- see ``_parse_models``.
+         *
+         *     WHAT "NARROWS" MEANS PER SERIES, because the three data sources carry
+         *     different dimensions and pretending otherwise would produce a chart that
+         *     silently answers a different question than its checkboxes:
+         *
+         *       tokens / tps   per MODEL. ``model_samples`` has a model_id column, so the
+         *                      filter is exact and a selection is a true partition:
+         *                      selecting every model sums to the unfiltered total.
+         *       vram / util /  per CARD. Those tables have no model column at all, so the
+         *       power          selection is resolved to the union of the selected models'
+         *                      ``gpu_indices`` and the cards are filtered by that. "This
+         *                      model's VRAM" is, and can only be, "the VRAM of the cards
+         *                      it occupies" -- which is also the number an operator asking
+         *                      "will another model fit beside it" needs.
+         *
+         *     A selected model holding no cards contributes none, so a selection of only
+         *     such rows yields empty GPU series rather than silently widening to the box.
          *
          *     Returns:
          *       {
          *         "range": "24h",
          *         "now_minute": int,
          *         "since_minute": int,
+         *         "selected_model_ids": [str, ...] | None,   # echo; null when unfiltered
+         *         "selected_gpu_indices": [int, ...] | None, # the cards it resolved to
          *         "current": {
          *           "vram_used_mib": int,
          *           "vram_total_mib": int,
@@ -705,7 +798,7 @@ export interface paths {
          *                                      # (prompt + completion)
          *         },
          *         "active_models": [
-         *           {"id": str, "served_model_name": str}, ...
+         *           {"id": str, "served_model_name": str, "gpu_indices": [int, ...]}, ...
          *         ],
          *         "series": {
          *           "vram": [{"minute": int, "used_mib": int, "total_mib": int}, ...],
@@ -714,6 +807,18 @@ export interface paths {
          *           "tokens": [{"minute": int, "prompt": int, "completion": int}, ...],
          *         }
          *       }
+         *
+         *     NOTE ON THE TOKEN SOURCE. The tokens series and ``tps`` come from
+         *     ``model_samples``, not ``token_usage_minute``. They were the latter, which
+         *     is keyed by API token and has no model dimension -- so it cannot be filtered
+         *     by model at all, and using it for the unfiltered case while using
+         *     ``model_samples`` for the filtered one would make "every model selected"
+         *     disagree with "no filter". One source keeps the selection a partition. The
+         *     numbers move slightly: ``model_samples`` also counts requests made without
+         *     an API token, which ``token_usage_minute`` deliberately skips so the NULL
+         *     key does not accumulate orphan rows. ``/api/stats/v2/tokens-per-key`` still
+         *     reads ``token_usage_minute`` -- that endpoint asks a per-key question, which
+         *     is the one that table answers.
          */
         get: operations["stats_v2_overview_api_stats_v2_overview_get"];
         put?: never;
@@ -777,13 +882,19 @@ export interface paths {
         };
         /**
          * Stream Live
-         * @description Stream live vLLM engine metrics as SSE events (one JSON frame per tick).
+         * @description Stream live engine metrics as SSE events (one JSON frame per tick).
          *
          *     Structure mirrors the header-metrics SSE: an immediate first frame, then an
          *     emit every ``_interval_seconds()`` with ``is_disconnected`` checks and a
-         *     belt-and-suspenders 15s keepalive. Each tick resolves the loaded model,
-         *     pulls a (possibly cached) scrape, and builds a frame — computing rates
-         *     against this connection's previous frame.
+         *     belt-and-suspenders 15s keepalive. Each tick resolves EVERY loaded model,
+         *     pulls a (possibly cached) scrape per model, and builds one block each —
+         *     computing rates against this connection's previous frame, per model.
+         *
+         *     Rate state is per model_id, not per connection. Two engines' cumulative
+         *     counters share no clock and no origin; a single previous snapshot would
+         *     have produced a rate for whichever model happened to come second that was
+         *     computed against the first model's totals -- a plausible-looking number
+         *     with no meaning at all.
          */
         get: operations["stream_live_api_stats_live_get"];
         put?: never;
@@ -961,7 +1072,14 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Get Model Settings */
+        /**
+         * Get Model Settings
+         * @description Return the whole persisted ModelRow.
+         *
+         *     The `supports_*` capability flags come back RAW (null / 0 / 1) rather than
+         *     coerced to a bool, so a client can tell "the operator said no" from "nobody
+         *     said, so it is auto-detected" — see `_MODEL_TRISTATE_FIELDS`.
+         */
         get: operations["get_model_settings_api_models__model_id__settings_get"];
         put?: never;
         post?: never;
@@ -975,6 +1093,14 @@ export interface paths {
          *     Refuses to mutate a model that is currently `status == 'loaded'` — that
          *     column is authoritative state set by the supervisor on transitions. The
          *     operator must unload the model first, which is a 409.
+         *
+         *     One carve-out: a body whose keys are ALL capability flags is allowed
+         *     through on a loaded model. Those columns are inert metadata that the load
+         *     runner and the engine never read (only the chat2 catalog does, per
+         *     request), and the loaded model is precisely the one an operator is looking
+         *     at when they notice vision is set wrong — making them unload it to fix a
+         *     label is backwards. Mixing in any real engine setting puts the whole patch
+         *     back under the guard.
          */
         patch: operations["patch_model_settings_api_models__model_id__settings_patch"];
         trace?: never;
@@ -1127,8 +1253,16 @@ export interface paths {
          *                 }
          *               ]
          *             }
-         *           ]
+         *           ],
+         *           "allowed_indices": [0, 1] | null
          *         }
+         *
+         *     ``allowed_indices`` is the setup wizard's GPU allowlist -- the same list
+         *     ``POST /api/models`` enforces with a 400. It is appended, never a
+         *     replacement for ``gpus``: every physically present card is still reported,
+         *     because hiding a card the operator can see in nvidia-smi answers a
+         *     different question than the one they asked. ``null`` means no allowlist was
+         *     recorded and is NOT the same as ``[]``.
          *
          *     When ``nvidia-smi`` is not on PATH (dev box without NVIDIA) the endpoint
          *     still returns HTTP 200 with ``gpus: []`` and ``probe_error`` populated so
@@ -1152,6 +1286,53 @@ export interface paths {
         };
         /** Get Engine */
         get: operations["get_engine_api_system_engine_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/system/backends": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Backends
+         * @description Which backends this build has, what each can do, and what the ACTIVE
+         *     driver lets them do.
+         *
+         *     Backend and driver compose as a product, not an enumeration, so this route
+         *     answers for the deployment as it actually runs. Version pinning is reported
+         *     as TWO fields, and on the deployment we run they disagree:
+         *
+         *       supports_version_pin   the ENGINE fact -- can vLLM be pinned at all?
+         *                              True, driver-invariant (operator ruling,
+         *                              2026-09-01).
+         *       version_pin_available  the DEPLOYMENT fact -- can this driver honour it?
+         *                              False under the in-container subprocess driver.
+         *
+         *     CLIENTS GATE CONTROLS ON version_pin_available. Enabling a version selector
+         *     because the engine "supports" pinning, on a box that cannot swap the image,
+         *     offers a control that silently does nothing. Advertising both is what lets
+         *     the UI disable the control AND explain why, instead of a load failing 40
+         *     seconds in.
+         *
+         *     A third field carries the "why":
+         *
+         *       version_pin_reason     non-null EXACTLY when version_pin_available is
+         *                              false; rendered verbatim beside the disabled
+         *                              control. The client cannot write this sentence
+         *                              itself -- one boolean does not say whether the
+         *                              obstacle is the driver (fixable: run the docker
+         *                              engine driver) or the backend (llama.cpp has no
+         *                              image catalogue to pin against).
+         */
+        get: operations["get_backends_api_system_backends_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1348,6 +1529,234 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/chat2/attachments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Upload */
+        post: operations["upload_api_chat2_attachments_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/chat2/attachments/{attachment_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Serve */
+        get: operations["serve_api_chat2_attachments__attachment_id__get"];
+        put?: never;
+        post?: never;
+        /** Delete Draft */
+        delete: operations["delete_draft_api_chat2_attachments__attachment_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/chat2/_whoami": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Whoami */
+        get: operations["whoami_api_chat2__whoami_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/chat2/chats": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Chats */
+        get: operations["list_chats_api_chat2_chats_get"];
+        put?: never;
+        /** Create Chat */
+        post: operations["create_chat_api_chat2_chats_post"];
+        /** Delete All */
+        delete: operations["delete_all_api_chat2_chats_delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/chat2/chats/{chat_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Chat */
+        get: operations["get_chat_api_chat2_chats__chat_id__get"];
+        put?: never;
+        post?: never;
+        /** Delete Chat */
+        delete: operations["delete_chat_api_chat2_chats__chat_id__delete"];
+        options?: never;
+        head?: never;
+        /** Patch Chat */
+        patch: operations["patch_chat_api_chat2_chats__chat_id__patch"];
+        trace?: never;
+    };
+    "/api/chat2/chats/{chat_id}/fork": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Fork Chat */
+        post: operations["fork_chat_api_chat2_chats__chat_id__fork_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/chat2/defaults": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Defaults */
+        get: operations["get_defaults_api_chat2_defaults_get"];
+        /** Put Defaults */
+        put: operations["put_defaults_api_chat2_defaults_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/chat2/models": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Models */
+        get: operations["list_models_api_chat2_models_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/chat2/budget": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Budget */
+        get: operations["get_budget_api_chat2_budget_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/chat2/chats/{chat_id}/turns": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Turn */
+        post: operations["turn_api_chat2_chats__chat_id__turns_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/chat2/chats/{chat_id}/turn/abort": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Turn Abort
+         * @description Explicitly stop the chat's detached turn.
+         *
+         *     Cancels the runner and WAITS for it: when this returns, the partial tail
+         *     is persisted as `aborted` (ledger row included) and the per-chat turn lock
+         *     is released, so the caller can immediately start a new turn without racing
+         *     a 409 `turn_in_flight`.
+         */
+        post: operations["turn_abort_api_chat2_chats__chat_id__turn_abort_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/chat2/chats/{chat_id}/turn/live": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Turn Live
+         * @description Re-attach to the chat's detached turn.
+         *
+         *     Replays every frame the original subscriber saw — byte-identical, so the
+         *     frontend reducer runs the exact same path — then follows the live tail
+         *     until the turn is done. A finished turn still replays (and terminates
+         *     immediately) for `live.DONE_TTL_S` after `done`, which covers the race
+         *     where the turn finishes between `GET /chats/{id}` and this request; after
+         *     the reap it is a 404 with the shared error envelope.
+         */
+        get: operations["turn_live_api_chat2_chats__chat_id__turn_live_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/csrf": {
         parameters: {
             query?: never;
@@ -1398,6 +1807,16 @@ export interface components {
             /** Password */
             password: string;
         };
+        /** Body_upload_api_chat2_attachments_post */
+        Body_upload_api_chat2_attachments_post: {
+            /**
+             * File
+             * Format: binary
+             */
+            file: string;
+            /** Chat Id */
+            chat_id: string;
+        };
         /** CachedRepoView */
         CachedRepoView: {
             /** Repo */
@@ -1440,12 +1859,32 @@ export interface components {
              */
             stream: boolean;
         };
+        /** ChatCreate */
+        ChatCreate: {
+            /** Model */
+            model?: string | null;
+            settings?: components["schemas"]["SettingsPatch"] | null;
+        };
         /** ChatMessage */
         ChatMessage: {
             /** Role */
             role: string;
             /** Content */
             content: string;
+        };
+        /** ChatPatch */
+        ChatPatch: {
+            /** Title */
+            title?: string | null;
+            /** Model */
+            model?: string | null;
+            settings?: components["schemas"]["SettingsPatch"] | null;
+        };
+        /** DefaultsPut */
+        DefaultsPut: {
+            /** Model */
+            model?: string | null;
+            settings: components["schemas"]["SettingsPatch"];
         };
         /**
          * EffectiveArgvResponse
@@ -1454,7 +1893,7 @@ export interface components {
         EffectiveArgvResponse: {
             /**
              * Argv
-             * @description The exact ``vllm serve`` argv that the supervisor would build for this row at next load — minus the leading ['vllm', 'serve'] pair, since those are constants. Includes overrides resolved from extra_args, parallelism_strategy, GGUF quant tag, etc.
+             * @description The exact argv that the supervisor would invoke for this row at next load, INCLUDING argv[0] and its subcommand (for the vLLM backend, ``vllm serve``). Includes overrides resolved from extra_args, parallelism_strategy, GGUF quant tag, etc.
              */
             argv: string[];
         };
@@ -1533,6 +1972,11 @@ export interface components {
              * @default 0.9
              */
             gpu_memory_utilization: number;
+            /**
+             * Backend
+             * @default vllm
+             */
+            backend: string;
             /** Max Model Len */
             max_model_len?: number | null;
         };
@@ -1548,6 +1992,13 @@ export interface components {
             recommended_max_model_len?: number | null;
             /** Warnings */
             warnings?: string[];
+        };
+        /** ForkBody */
+        ForkBody: {
+            /** At Seq */
+            at_seq: number;
+            /** Edited Text */
+            edited_text?: string | null;
         };
         /** GcCandidate */
         GcCandidate: {
@@ -1637,6 +2088,12 @@ export interface components {
              * @default main
              */
             hf_revision: string;
+            /**
+             * Backend
+             * @default vllm
+             * @enum {string}
+             */
+            backend: "vllm" | "llamacpp";
             /** Template Id */
             template_id?: string | null;
             /** Engine Channel */
@@ -1686,6 +2143,10 @@ export interface components {
             hf_config_repo?: string | null;
             /** Tokenizer Repo */
             tokenizer_repo?: string | null;
+            /** Mmproj Filename */
+            mmproj_filename?: string | null;
+            /** N Gpu Layers */
+            n_gpu_layers?: number | null;
         };
         /** PlaygroundEnsureResponse */
         PlaygroundEnsureResponse: {
@@ -1735,6 +2196,91 @@ export interface components {
             /** Presets */
             presets: components["schemas"]["PresetEntry"][];
         };
+        /** SettingsPatch */
+        SettingsPatch: {
+            /** Temperature */
+            temperature?: number | null;
+            /** Max Tokens */
+            max_tokens?: number | null;
+            /** Top P */
+            top_p?: number | null;
+            /** System Prompt */
+            system_prompt?: string | null;
+            /** Enabled Tools */
+            enabled_tools?: string[] | null;
+            /** Enabled Skills */
+            enabled_skills?: string[] | null;
+            /** Enable Thinking */
+            enable_thinking?: boolean | null;
+            /** Reasoning Effort */
+            reasoning_effort?: string | null;
+            /** Tool Policy */
+            tool_policy?: {
+                [key: string]: unknown;
+            } | null;
+            /** Scope */
+            scope?: {
+                [key: string]: unknown;
+            } | null;
+        };
+        /** StressAccepted */
+        StressAccepted: {
+            /** Run Id */
+            run_id: string;
+            /** Model Id */
+            model_id: string;
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "conservative" | "quick" | "thorough";
+            /** Status */
+            status: string;
+            /** Reused */
+            reused: boolean;
+            /** Estimate Minutes */
+            estimate_minutes: number;
+            /** Fingerprint */
+            fingerprint: string;
+            /** Disclaimer */
+            disclaimer: string;
+            /** Cooldown Expires At */
+            cooldown_expires_at?: string | null;
+        };
+        /** StressApplyRequest */
+        StressApplyRequest: {
+            /** Run Id */
+            run_id: string;
+            /**
+             * Acknowledge Disruption
+             * @default false
+             */
+            acknowledge_disruption: boolean;
+        };
+        /** StressRequest */
+        StressRequest: {
+            /**
+             * Mode
+             * @default conservative
+             * @enum {string}
+             */
+            mode: "conservative" | "quick" | "thorough";
+            /**
+             * Acknowledge Disruption
+             * @default false
+             */
+            acknowledge_disruption: boolean;
+            /**
+             * Force
+             * @default false
+             */
+            force: boolean;
+            /**
+             * Reset
+             * @default false
+             */
+            reset: boolean;
+        };
         /** TemplateCreate */
         TemplateCreate: {
             /** Id */
@@ -1783,6 +2329,25 @@ export interface components {
             /** Model Id */
             model_id?: string | null;
         };
+        /**
+         * TextPartIn
+         * @description The only inbound user part shape (images travel as `attachment_ids`).
+         *
+         *     Typed rather than `dict[str, Any]` so a malformed part -- `{"type": "text",
+         *     "text": 123}` -- is a 422 at the FastAPI boundary instead of a TypeError
+         *     deep inside the turn, after the upstream socket and the active-request
+         *     counter have already been taken (T14 review, finding 2).
+         */
+        TextPartIn: {
+            /**
+             * Type
+             * @default text
+             * @constant
+             */
+            type: "text";
+            /** Text */
+            text: string;
+        };
         /** TicketBody */
         TicketBody: {
             /** Path */
@@ -1830,6 +2395,13 @@ export interface components {
             /** Priority */
             priority?: number | null;
         };
+        /** ToolResultIn */
+        ToolResultIn: {
+            /** Call Id */
+            call_id: string;
+            /** Result */
+            result: unknown;
+        };
         /** TryStackRequest */
         TryStackRequest: {
             /** Channel */
@@ -1848,6 +2420,22 @@ export interface components {
             result: "ok" | "failed";
             /** Error */
             error?: string | null;
+        };
+        /** TurnBody */
+        TurnBody: {
+            /** Request Id */
+            request_id: string;
+            /** User Parts */
+            user_parts?: components["schemas"]["TextPartIn"][] | null;
+            /** Attachment Ids */
+            attachment_ids?: string[];
+            /** Tool Results */
+            tool_results?: components["schemas"]["ToolResultIn"][] | null;
+            /**
+             * Regenerate
+             * @default false
+             */
+            regenerate: boolean;
         };
         /** ValidationError */
         ValidationError: {
@@ -2613,6 +3201,111 @@ export interface operations {
             };
         };
     };
+    start_stress_api_models__model_id__stress_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                model_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["StressRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StressAccepted"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    model_capabilities_api_models__model_id__capabilities_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                model_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    apply_stress_recommendation_api_models__model_id__stress_apply_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                model_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["StressApplyRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     engine_versions_api_templates_engine_versions_get: {
         parameters: {
             query?: {
@@ -3041,6 +3734,7 @@ export interface operations {
         parameters: {
             query?: {
                 range?: string;
+                models?: string | null;
             };
             header?: never;
             path?: never;
@@ -3552,6 +4246,28 @@ export interface operations {
             };
         };
     };
+    get_backends_api_system_backends_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
     system_info_api_system_info_get: {
         parameters: {
             query?: never;
@@ -3694,6 +4410,540 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ActiveRequestsResponse"];
+                };
+            };
+        };
+    };
+    upload_api_chat2_attachments_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "multipart/form-data": components["schemas"]["Body_upload_api_chat2_attachments_post"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    serve_api_chat2_attachments__attachment_id__get: {
+        parameters: {
+            query: {
+                t: string;
+            };
+            header?: never;
+            path: {
+                attachment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_draft_api_chat2_attachments__attachment_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                attachment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    whoami_api_chat2__whoami_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    list_chats_api_chat2_chats_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    create_chat_api_chat2_chats_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChatCreate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_all_api_chat2_chats_delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: number;
+                    };
+                };
+            };
+        };
+    };
+    get_chat_api_chat2_chats__chat_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                chat_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_chat_api_chat2_chats__chat_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                chat_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    patch_chat_api_chat2_chats__chat_id__patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                chat_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChatPatch"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    fork_chat_api_chat2_chats__chat_id__fork_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                chat_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ForkBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_defaults_api_chat2_defaults_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    put_defaults_api_chat2_defaults_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DefaultsPut"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_models_api_chat2_models_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    get_budget_api_chat2_budget_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    turn_api_chat2_chats__chat_id__turns_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                chat_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TurnBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    turn_abort_api_chat2_chats__chat_id__turn_abort_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                chat_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    turn_live_api_chat2_chats__chat_id__turn_live_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                chat_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

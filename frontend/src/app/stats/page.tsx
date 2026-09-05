@@ -22,7 +22,7 @@
 // Range persistence: usePersistedRange('vw.stats.range') — reload-safe.
 
 import Link from "next/link";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import useSWR from "swr";
 import { authFetchJSON } from "@/lib/auth-fetch";
 import {
@@ -36,6 +36,8 @@ import {
   type StatsV2TokensPerKeyRow,
 } from "@/lib/stats-v2";
 import { usePersistedRange } from "@/lib/use-persisted-range";
+import { useModelSelection } from "@/lib/model-selection";
+import { ModelSelector } from "@/components/stats/model-selector";
 import { StatCard } from "@/components/stat-card";
 import {
   PowerChart,
@@ -63,11 +65,45 @@ export default function StatsPage() {
   const [range, setRange] = usePersistedRange(RANGE_KEY, "1h");
   const [sort, setSort] = useState<Sort>({ col: "total_tokens", dir: "desc" });
 
-  const overview = useSWR<StatsV2Overview>(
-    `/api/stats/v2/overview?range=${range}`,
-    authFetchJSON,
-    { refreshInterval },
+  // ONE request, feeding both the numbers and the selector. `active_models` is
+  // deliberately NOT narrowed by ?models= (the selector is built from it, so
+  // narrowing it would make a deselected model impossible to re-select), which
+  // means the filtered response still lists the whole fleet and no second
+  // endpoint or second poll is needed.
+  //
+  // It settles rather than loops: the first render has no selection, so the key
+  // is unfiltered; that response names the loaded models; the selection
+  // resolves against them; the key becomes filtered; the next response names
+  // the same models. `keepPreviousData` holds the previous numbers while a
+  // re-filtered request is in flight, so a checkbox click does not flash
+  // skeletons and the model list underneath it never blinks.
+  //
+  // `queryParam` is null until the selection settles (and whenever nothing is
+  // loaded), and a null parameter means "the whole deployment" — never
+  // `?models=`, which the API rejects as a client bug. See modelsQueryParam.
+  const [pendingSelection, setPendingSelection] = useState<string | null>(null);
+  const overviewKey = pendingSelection
+    ? `/api/stats/v2/overview?range=${range}&models=${encodeURIComponent(pendingSelection)}`
+    : `/api/stats/v2/overview?range=${range}`;
+  const overview = useSWR<StatsV2Overview>(overviewKey, authFetchJSON, {
+    refreshInterval,
+    keepPreviousData: true,
+  });
+  const loadedModels = useMemo(
+    () => overview.data?.active_models ?? [],
+    [overview.data],
   );
+  const modelIds = useMemo(() => loadedModels.map((m) => m.id), [loadedModels]);
+  const selection = useModelSelection(modelIds);
+  useEffect(() => {
+    setPendingSelection(selection.queryParam);
+  }, [selection.queryParam]);
+
+  // NOT filtered by model, and that is a property of the data rather than an
+  // oversight: token_usage_minute is keyed by API token and has no model
+  // column, so "this model's usage per key" is a question the rollup cannot
+  // answer. The section header below says so rather than letting the table
+  // look as though it narrowed with everything else.
   const tpk = useSWR<StatsV2TokensPerKey>(
     `/api/stats/v2/tokens-per-key?range=${range}`,
     authFetchJSON,
@@ -75,6 +111,17 @@ export default function StatsPage() {
   );
 
   const data = overview.data;
+  // What the RESPONSE says it covers, not what the checkboxes currently say.
+  // They differ for one round trip after every click, and a caption that leads
+  // the numbers is a caption that is briefly wrong.
+  const covering = data?.selected_model_ids ?? null;
+  const coveringNames = useMemo(() => {
+    if (!covering) return null;
+    const byId = new Map(loadedModels.map((m) => [m.id, m.served_model_name]));
+    return covering.map((id) => byId.get(id) ?? id);
+  }, [covering, loadedModels]);
+  const isNarrowed =
+    covering !== null && covering.length < Math.max(loadedModels.length, 1);
 
   // Detect whether the host's GPU reports power: if `current.power_w` is
   // null AND the series has zero entries, we tell the operator the
@@ -130,26 +177,22 @@ export default function StatsPage() {
               Live view
             </Link>
           </div>
-          {data && data.active_models.length > 0 && (
-            <p
-              data-testid="active-models"
-              className="mt-1 flex flex-wrap items-center gap-1.5 text-xs text-slate-400"
-            >
-              <span className="text-slate-500">Loaded:</span>
-              {data.active_models.map((m) => (
-                <span
-                  key={m.id}
-                  className="inline-flex items-center gap-1 rounded-full border border-emerald-700/60 bg-emerald-900/30 px-2 py-0.5 text-emerald-200"
-                >
-                  <span
-                    aria-hidden="true"
-                    className="h-1.5 w-1.5 rounded-full bg-emerald-400"
-                  />
-                  <span className="font-mono text-[11px]">
-                    {m.served_model_name}
-                  </span>
+          {/* What the numbers on this page cover, read off the RESPONSE. The
+              chips below are the control; this line is the effect, and it lags
+              a click by one round trip on purpose so it is never briefly
+              wrong. */}
+          {coveringNames && (
+            <p data-testid="stats-covering" className="mt-1 text-xs text-slate-400">
+              {isNarrowed ? "Showing" : "Showing all"}{" "}
+              <span className="font-mono text-slate-300">
+                {coveringNames.join(", ")}
+              </span>
+              {isNarrowed && (
+                <span className="text-slate-500">
+                  {" "}
+                  — VRAM, GPU and power cover only the cards these models occupy
                 </span>
-              ))}
+              )}
             </p>
           )}
         </div>
@@ -191,6 +234,10 @@ export default function StatsPage() {
         </div>
         </div>
       </div>
+
+      {/* Model selection — drives this page, /stats/live and /godmode alike.
+          One selection across all three, so the operator picks once. */}
+      <ModelSelector models={loadedModels} selection={selection} />
 
       {overview.error && !overview.data && (
         <p className="text-sm text-red-500">
@@ -320,7 +367,19 @@ export default function StatsPage() {
           <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-400">
             Tokens per API key
           </h2>
-          <span className="text-xs text-slate-500">last {range}</span>
+          <span className="text-xs text-slate-500">
+            last {range}
+            {isNarrowed && (
+              // Says so rather than letting the table look as though it
+              // narrowed with everything else above it. token_usage_minute is
+              // keyed by API token and carries no model column, so per-model
+              // per-key usage is a question the rollup cannot answer at all.
+              <span data-testid="tokens-per-key-scope">
+                {" "}
+                · all models (per-key usage is not recorded per model)
+              </span>
+            )}
+          </span>
         </div>
         {tpk.isLoading && !tpk.data ? (
           <Skeleton className="h-24 w-full" />

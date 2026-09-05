@@ -60,20 +60,53 @@ def kv_reserve_bytes(
     max_model_len: int,
     dtype_bytes: int,
     max_batch_size: int = 1,
+    head_dim: int | None = None,
+    sliding_layers: int = 0,
+    sliding_window: int | None = None,
 ) -> int:
-    """KV-cache reservation per the formula locked on #82.
+    """KV-cache reservation. Extends the formula locked on #82.
 
-    ``bytes_per_token = 2 * num_layers * num_kv_heads * head_dim * dtype_bytes``
-    ``kv_reserve     = bytes_per_token * max_model_len * max_batch_size``
+    ``per_layer_token = 2 * num_kv_heads * head_dim * dtype_bytes``
+    ``kv_reserve      = per_layer_token * max_batch_size *
+                        (full_layers * max_model_len + sliding_layers * window)``
 
-    where ``head_dim = hidden_size // num_attention_heads``. The factor of 2
-    accounts for both K and V tensors.
+    The factor of 2 accounts for both K and V tensors. With the defaults
+    (``head_dim=None``, ``sliding_layers=0``) this is byte-identical to the
+    original ``bytes_per_token * max_model_len * max_batch_size``.
+
+    ``head_dim`` is READ FROM THE CONFIG when the model declares one, and only
+    derived as ``hidden_size // num_attention_heads`` when it does not. The two
+    disagree in practice: gpt-oss-20b declares ``head_dim: 64`` while the
+    derivation gives ``2880 // 64 = 45``, a 30% undercount of the whole KV
+    term. Undercounting turns a red row green, which
+    ``dtype_bytes_from_torch_dtype`` already names as the dangerous direction.
+
+    ``sliding_layers`` / ``sliding_window`` describe interleaved sliding-window
+    attention, where only some layers hold the full context and the rest hold a
+    fixed window. Charging every layer the full context roughly doubles the
+    estimate for gpt-oss-20b (12 of its 24 layers slide, with a 128-token
+    window). The window is capped by ``max_model_len``: a window wider than the
+    context reserves the context.
+
+    Callers pass ``sliding_layers`` only from an EXPLICIT per-layer declaration
+    (``config.layer_types``). Model families that imply sliding attention some
+    other way keep today's all-full-attention estimate, which over-counts —
+    the safe direction — rather than inviting a per-family heuristic that would
+    silently under-count whenever it guessed wrong.
     """
     if num_attention_heads <= 0:
         raise ValueError("num_attention_heads must be positive")
-    head_dim = hidden_size // num_attention_heads
-    bytes_per_token = 2 * num_layers * num_kv_heads * head_dim * dtype_bytes
-    return bytes_per_token * max_model_len * max_batch_size
+    if sliding_layers < 0 or sliding_layers > num_layers:
+        raise ValueError("sliding_layers must be between 0 and num_layers")
+    if head_dim is None:
+        head_dim = hidden_size // num_attention_heads
+    per_layer_token = 2 * num_kv_heads * head_dim * dtype_bytes
+    full_layers = num_layers - sliding_layers
+    window = max_model_len
+    if sliding_layers and sliding_window:
+        window = min(sliding_window, max_model_len)
+    tokens = full_layers * max_model_len + sliding_layers * window
+    return per_layer_token * tokens * max_batch_size
 
 
 def weights_budget_bytes(
@@ -123,6 +156,9 @@ def recommend_max_model_len(
     dtype_bytes: int,
     max_batch_size: int = 1,
     target_ratio: float = RECOMMENDATION_TARGET_RATIO,
+    head_dim: int | None = None,
+    sliding_layers: int = 0,
+    sliding_window: int | None = None,
 ) -> int | None:
     """For tight/red rows, suggest a smaller ``max_model_len`` that lands in
     the yellow band.
@@ -136,7 +172,11 @@ def recommend_max_model_len(
         L = (total_vram * gpu_util - file_size / target_ratio)
           / (kv_per_token * batch)
 
-    where ``kv_per_token = 2 * num_layers * num_kv_heads * head_dim * dtype_bytes``.
+    where ``kv_per_token = 2 * full_layers * num_kv_heads * head_dim * dtype_bytes``.
+
+    ``gpu_memory_utilization`` is the EFFECTIVE VRAM cap fraction, which for a
+    backend declaring its own ``vram_cap_fraction`` is that value rather than
+    any operator flag -- llama.cpp has no such flag to set.
 
     Returns ``None`` when there's no positive L that achieves the target —
     that's the "won't run at any context" signal the FE should surface as
@@ -146,16 +186,32 @@ def recommend_max_model_len(
         return None
     if target_ratio <= 0:
         return None
-    head_dim = hidden_size // num_attention_heads
-    kv_per_token = 2 * num_layers * num_kv_heads * head_dim * dtype_bytes * max_batch_size
+    if sliding_layers < 0 or sliding_layers > num_layers:
+        return None
+    if head_dim is None:
+        head_dim = hidden_size // num_attention_heads
+    per_layer_token = 2 * num_kv_heads * head_dim * dtype_bytes * max_batch_size
+    # Only full-attention layers grow with L. Sliding layers contribute a
+    # CONSTANT once L exceeds their window, so they move to the numerator as
+    # fixed overhead rather than inflating the per-token slope -- which is
+    # what makes this the exact inverse of kv_reserve_bytes.
+    full_layers = num_layers - sliding_layers
+    kv_per_token = per_layer_token * full_layers
     if kv_per_token <= 0:
         return None
     cap = int(total_vram * gpu_memory_utilization)
     needed_weights = file_size / target_ratio
-    numerator = cap - needed_weights
+    sliding_fixed = 0
+    if sliding_layers and sliding_window:
+        sliding_fixed = per_layer_token * sliding_layers * sliding_window
+    numerator = cap - needed_weights - sliding_fixed
     if numerator <= 0:
         return None
     L = int(numerator // kv_per_token)
+    # The sliding term was treated as constant, which holds only for
+    # L >= window. Below that the true reserve is smaller, so the answer is
+    # conservative rather than wrong -- it under-promises context.
+
     # Floor at 1 to avoid returning 0 (vLLM rejects that); None when the
     # math gives a non-positive recommendation so the FE doesn't paste
     # garbage into the override field.

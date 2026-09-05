@@ -48,11 +48,20 @@ describe('LoginPage', () => {
     expect(screen.queryByRole('button', { name: /log in/i })).not.toBeInTheDocument();
   });
 
-  it('redirects to the setup wizard mid-setup (step past welcome, not done)', async () => {
+  it('redirects to the CURRENT wizard step mid-setup (step past welcome, not done)', async () => {
+    // Regression: hard-coding /setup/welcome here stranded half-finished
+    // setups — the welcome POST was rejected ("not at welcome step") and the
+    // welcome page offered no way forward. Funnel to the server's step.
     vi.stubGlobal('fetch', fetchMockFor({ setup: { body: { step: 'gpus', done: false } } }));
     render(<LoginPage />);
-    await waitFor(() => expect(replaceMock).toHaveBeenCalledWith('/setup/welcome'));
+    await waitFor(() => expect(replaceMock).toHaveBeenCalledWith('/setup/gpus'));
     expect(screen.queryByRole('button', { name: /log in/i })).not.toBeInTheDocument();
+  });
+
+  it('funnels a malformed setup-state body to /setup/welcome', async () => {
+    vi.stubGlobal('fetch', fetchMockFor({ setup: { body: { nonsense: 1 } } }));
+    render(<LoginPage />);
+    await waitFor(() => expect(replaceMock).toHaveBeenCalledWith('/setup/welcome'));
   });
 
   it('renders the sign-in form once setup is done', async () => {

@@ -34,6 +34,15 @@ export interface StatsV2Current {
 export interface StatsV2ActiveModel {
   id: string;
   served_model_name: string;
+  /**
+   * The cards this model occupies. Optional at the type level for ui/api skew.
+   *
+   * It matters because VRAM, utilisation and power have no model dimension —
+   * gpu_samples has no model column — so a per-model reading of them is, and
+   * can only be, "the cards this model holds". This list is what lets the
+   * selector say which cards a checkbox brings in.
+   */
+  gpu_indices?: number[];
 }
 
 export interface StatsV2VramPoint {
@@ -69,7 +78,21 @@ export interface StatsV2Overview {
   range: StatsRange;
   now_minute: number;
   since_minute: number;
+  /**
+   * The model selection this response was computed for; `null` when the
+   * request carried no `?models=` and the numbers cover the whole deployment.
+   *
+   * Echoed rather than assumed so the page states what its numbers cover from
+   * the RESPONSE, not from checkboxes that may have moved while it was in
+   * flight. Null and "all the ids, which happen to be all of them" are
+   * different questions about the CARDS, and the difference survives here.
+   */
+  selected_model_ids: string[] | null;
+  /** The cards that selection resolved to; null when unfiltered. */
+  selected_gpu_indices: number[] | null;
   current: StatsV2Current;
+  /** Every loaded model — NOT narrowed by the selection, because this is the
+   *  list the selector itself is built from. */
   active_models: StatsV2ActiveModel[];
   series: StatsV2Series;
 }

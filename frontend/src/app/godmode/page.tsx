@@ -4,7 +4,7 @@
 //
 // Admin-only surface (the SSE endpoint gates on require_jwt, same as the
 // active-requests + model-log streams). Shows, in real time, the prompts and
-// model output flowing through the vLLM warden proxy. Config-gated on the
+// model output flowing through the LLM Warden proxy. Config-gated on the
 // backend by VW_GODMODE_ENABLED — when off, the viewer renders a disabled
 // placeholder rather than a dead stream (see GodModeViewer).
 //

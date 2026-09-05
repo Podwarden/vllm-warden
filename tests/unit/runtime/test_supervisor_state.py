@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from app.runtime.backends import LaunchPlan
 from app.runtime.engine.local_subprocess import LocalHandle
 from app.runtime.supervisor import ModelState, Supervisor, UnloadRefused
 
@@ -54,9 +55,26 @@ async def test_load_sets_state_loading(tmp_path):
         model.engine_image = None
         model.engine_channel = None
         model.engine_vllm_version = None
-        with patch("app.runtime.supervisor.build_subprocess_env", return_value={}):
-            with patch("app.runtime.supervisor.build_vllm_args", return_value=[]):
-                await sup.load(model, port=10001)
+        # NULL backend, i.e. every pre-0027 row: registry.get(None) decodes it
+        # to vLLM (D6). A bare MagicMock would auto-return a truthy Mock here
+        # and UnknownBackendError would abort the load.
+        model.backend = None
+        # Sub-project C: the supervisor resolves the row's pinned files before
+        # calling plan(). A bare MagicMock auto-returns a truthy Mock for
+        # mmproj_filename, and a set-but-unresolvable projector is a hard error
+        # (a vision model launched without one loads, serves, and silently
+        # ignores every image). Real vLLM rows carry NULL for both.
+        model.mmproj_filename = None
+        model.filename = None
+        # Sub-project B: the supervisor no longer calls build_vllm_args /
+        # build_subprocess_env itself -- it asks the backend for a LaunchPlan.
+        # This test is about the state machine, not about launch construction,
+        # so stub the plan out at the same seam the two builders used to sit.
+        stub_plan = LaunchPlan(argv=["vllm", "serve"], env={}, image=None,
+                               port=10001, gpu_indices=[0])
+        with patch("app.runtime.backends.vllm.VllmBackend.plan",
+                   return_value=stub_plan):
+            await sup.load(model, port=10001)
     assert sup.get_state("m1") == ModelState.LOADING
 
 

@@ -128,8 +128,8 @@ function installTryStackStub(
     if (url === "/api/csrf") return json({ csrf: "test-csrf" });
     // #177: driver capability — docker driver honors the pin, so the version
     // selector is enabled (the default for these existing round-trip tests).
-    if (url === "/api/system/engine") {
-      return json({ driver: "docker", supports_version_select: true, vllm_version: "0.21.0" });
+    if (url === "/api/system/backends") {
+      return json(capableBackends("0.21.0"));
     }
     // #177: the version field is now a combobox backed by this endpoint.
     if (url.startsWith("/api/templates/engine-versions")) {
@@ -171,6 +171,26 @@ function installTryStackStub(
   return { calls };
 }
 
+/** A GET /api/system/backends body where the pin IS available for vLLM. */
+function capableBackends(version: string | null) {
+  return {
+    default: "vllm",
+    driver: "docker",
+    engine_version: version,
+    backends: [
+      {
+        name: "vllm",
+        display_name: "vLLM",
+        version,
+        supports_version_pin: true,
+        version_pin_available: true,
+        version_pin_reason: null,
+        version_pin_reason_code: null,
+      },
+    ],
+  };
+}
+
 function renderPanel(modelId: string, modelStatus: ModelStatus = "pulled") {
   return render(
     <SWRConfig value={{ provider: () => new Map(), dedupingInterval: 0 }}>
@@ -180,6 +200,7 @@ function renderPanel(modelId: string, modelStatus: ModelStatus = "pulled") {
         maxModelLen={4096}
         tensorParallelSize={2}
         modelStatus={modelStatus}
+        backend="vllm"
       />
     </SWRConfig>,
   );
@@ -294,8 +315,8 @@ describe("TryStackPanel vLLM-version combobox (#177)", () => {
       const method = init?.method ?? "GET";
       if (url === "/api/auth/refresh") return json({ access_token: "test-jwt-refreshed" });
       if (url === "/api/csrf") return json({ csrf: "test-csrf" });
-      if (url === "/api/system/engine") {
-        return json({ driver: "docker", supports_version_select: true, vllm_version: null });
+      if (url === "/api/system/backends") {
+        return json(capableBackends(null));
       }
       if (url.startsWith("/api/templates/engine-versions")) {
         return json({ channel: "cuda-stable", family: null, versions: [], error: null });
@@ -331,22 +352,43 @@ describe("TryStackPanel driver-capability guard (#177)", () => {
     vi.unstubAllGlobals();
   });
 
+  // The panel reads /api/system/backends, not /api/system/engine. The engine
+  // route answers only for vLLM and only about the DRIVER; the backends route
+  // answers per backend resolved against the active driver, and carries the
+  // sentence that explains a refusal -- which the panel now renders verbatim
+  // instead of writing its own copy about a driver it cannot identify.
   function installEngineStub(opts: {
     supports: boolean;
     vllmVersion: string | null;
-    withEngine?: boolean; // false => never answer /api/system/engine (loading)
+    withEngine?: boolean; // false => never answer /api/system/backends (loading)
   }) {
     const mock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
       const method = init?.method ?? "GET";
       if (url === "/api/auth/refresh") return json({ access_token: "test-jwt-refreshed" });
       if (url === "/api/csrf") return json({ csrf: "test-csrf" });
-      if (url === "/api/system/engine") {
+      if (url === "/api/system/backends") {
         if (opts.withEngine === false) return new Promise<Response>(() => {}); // never resolves
         return json({
+          default: "vllm",
           driver: opts.supports ? "docker" : "subprocess",
-          supports_version_select: opts.supports,
-          vllm_version: opts.vllmVersion,
+          engine_version: opts.vllmVersion,
+          backends: [
+            {
+              name: "vllm",
+              display_name: "vLLM",
+              version: opts.vllmVersion,
+              supports_version_pin: true,
+              version_pin_available: opts.supports,
+              version_pin_reason: opts.supports
+                ? null
+                : "This deployment runs the in-container engine driver, which " +
+                  "cannot swap the engine image, so a version pin would be " +
+                  "silently discarded. Version selection requires the docker " +
+                  "engine driver.",
+              version_pin_reason_code: opts.supports ? null : "driver",
+            },
+          ],
         });
       }
       if (url.startsWith("/api/templates/engine-versions")) {
@@ -383,6 +425,34 @@ describe("TryStackPanel driver-capability guard (#177)", () => {
     expect(screen.getByTestId("try-stack-channel")).not.toBeDisabled();
     // (Try stays disabled only because no version is typed yet — not the guard.)
     expect(screen.getByTestId("try-stack-version")).not.toBeDisabled();
+  });
+
+  it("never shows a version the deployment is not running", async () => {
+    // Operator report: the panel's note read "(vLLM 0.26.0)" while the field
+    // one line below showed 0.20.0 as its placeholder. That placeholder was a
+    // hardcoded literal carried over from the template registry's default, so
+    // the panel contradicted itself on every deployment whose engine was not
+    // that exact version -- and on this driver the field is disabled, so the
+    // operator can never type over it.
+    installEngineStub({ supports: false, vllmVersion: "0.26.0" });
+    renderPanel("mp");
+
+    await waitFor(() =>
+      expect(screen.getByTestId("try-stack-driver-note")).toBeInTheDocument(),
+    );
+    const field = screen.getByTestId("try-stack-version") as HTMLInputElement;
+    expect(screen.getByTestId("try-stack-driver-note").textContent).toMatch(/0\.26\.0/);
+    expect(field.placeholder).toBe("0.26.0");
+  });
+
+  it("falls back to no placeholder rather than inventing a version", async () => {
+    // vllm_version is null when importlib cannot find the package. An empty
+    // placeholder says nothing; a stale literal says something false.
+    installEngineStub({ supports: true, vllmVersion: null });
+    renderPanel("mq");
+
+    const field = (await screen.findByTestId("try-stack-version")) as HTMLInputElement;
+    await waitFor(() => expect(field.placeholder).toBe(""));
   });
 
   it("does not disable while engine info is still loading (no flash)", async () => {
@@ -459,6 +529,7 @@ describe("TryStackPanel unified Load", () => {
           maxModelLen={null}
           tensorParallelSize={null}
           modelStatus="unloading"
+          backend="vllm"
         />
       </SWRConfig>,
     );

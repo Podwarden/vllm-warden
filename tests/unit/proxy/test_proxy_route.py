@@ -327,3 +327,78 @@ def test_proxy_does_not_override_client_supplied_priority(tmp_data_dir, client):
     assert r.status_code == 200
     forwarded = json.loads(send.call_args.args[0].content)
     assert forwarded["priority"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Sub-project C: the engine-side priority hint is capability-gated
+# ---------------------------------------------------------------------------
+
+
+def _set_backend(db_path, backend):
+    with sqlite3.connect(db_path) as db:
+        db.execute("UPDATE models SET backend=? WHERE id='qwen'", (backend,))
+        db.commit()
+
+
+def _forward_and_capture(client, plaintext):
+    fake_resp = MagicMock()
+    fake_resp.status_code = 200
+    fake_resp.headers = {"content-type": "application/json"}
+    fake_resp.aread = AsyncMock(
+        return_value=(
+            b'{"id":"x","model":"qwen","choices":[],'
+            b'"usage":{"prompt_tokens":1,"completion_tokens":0}}'
+        )
+    )
+    fake_resp.aclose = AsyncMock()
+    with patch("httpx.AsyncClient.send", new=AsyncMock(return_value=fake_resp)) as send, \
+         patch("app.proxy.routes._record_counters", new=AsyncMock()):
+        r = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {plaintext}"},
+            json={"model": "qwen", "messages": [{"role": "user", "content": "hi"}]},
+        )
+    assert r.status_code == 200
+    return json.loads(send.call_args.args[0].content)
+
+
+def test_priority_is_not_injected_for_a_backend_without_a_scheduler(
+    tmp_data_dir, client
+):
+    """llama-server has no priority scheduler. Its request parser ignores
+    unknown fields rather than rejecting them, so injecting `priority` would be
+    harmless -- but it would also mean re-serialising the body for no effect and
+    advertising a capability the engine does not have. The warden's OWN
+    admission scheduler still orders by priority; only the engine-side hint is
+    dropped."""
+    client.get("/healthz")
+    db_path = tmp_data_dir / "vllm-warden.db"
+    plaintext = _seed(db_path)
+    _set_priority(db_path, 5)
+    _set_backend(db_path, "llamacpp")
+    client.app.state.supervisor._ports["qwen"] = 19099
+
+    assert "priority" not in _forward_and_capture(client, plaintext)
+
+
+def test_priority_is_still_injected_for_vllm(tmp_data_dir, client):
+    client.get("/healthz")
+    db_path = tmp_data_dir / "vllm-warden.db"
+    plaintext = _seed(db_path)
+    _set_priority(db_path, 5)
+    _set_backend(db_path, "vllm")
+    client.app.state.supervisor._ports["qwen"] = 19099
+
+    assert _forward_and_capture(client, plaintext)["priority"] == -5
+
+
+def test_a_null_backend_still_gets_the_vllm_hint(tmp_data_dir, client):
+    """D6: NULL decodes to vLLM, so every pre-C row keeps the #173 behaviour."""
+    client.get("/healthz")
+    db_path = tmp_data_dir / "vllm-warden.db"
+    plaintext = _seed(db_path)
+    _set_priority(db_path, 5)
+    _set_backend(db_path, None)
+    client.app.state.supervisor._ports["qwen"] = 19099
+
+    assert _forward_and_capture(client, plaintext)["priority"] == -5

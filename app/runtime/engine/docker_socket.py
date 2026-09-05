@@ -18,6 +18,8 @@ import threading
 import time
 from pathlib import Path
 
+from app.runtime.engine.run_marker import format_run_sentinel
+
 HFCACHE_VOLUME = "vllm-warden-hfcache"
 DATA_VOLUME = "vllm-warden-data"
 
@@ -44,6 +46,30 @@ ENGINE_IPC_MODE = os.environ.get("VLLM_ENGINE_IPC_MODE", "host")
 # (only correct when the control-plane itself runs on the host network).
 ENGINE_NETWORK = os.environ.get("VW_ENGINE_NETWORK", "vllm-warden_default")
 ENGINE_NAME_PREFIX = "vllm-warden-engine-"
+
+# Backends whose engine container keeps the historical, un-suffixed name.
+# ``None`` is decision D6's NULL-means-vLLM; "vllm" is the same thing spelled
+# out. Both must map to the old name or every running container is orphaned.
+_UNSUFFIXED_BACKENDS = (None, "", "vllm")
+
+
+def _engine_name(model_id: str, backend: str | None = None) -> str:
+    """Container name for one model's engine.
+
+    Sub-project B deliberately deferred this to C (its self-review reads
+    "DockerSocketDriver derives the name from ``backend`` -- deliberately
+    omitted -- identity change, sub-project C"), because ``backend`` is a
+    per-model column an operator can switch. Switching it leaves the previous
+    engine's container behind under a name the new engine would claim, and the
+    two are different programs.
+
+    The vLLM name is BYTE-IDENTICAL to what shipped, so no running container is
+    orphaned; only a non-default backend adds a segment. The
+    ``vllm-warden-engine-`` prefix itself does not change -- that identity
+    belongs to the rename (§8.3, sub-project A).
+    """
+    suffix = "" if backend in _UNSUFFIXED_BACKENDS else f"-{backend}"
+    return f"{ENGINE_NAME_PREFIX}{model_id}{suffix}"
 
 
 def _gpu_device_requests(gpu_indices: list[int]):
@@ -165,6 +191,12 @@ class DockerSocketDriver:
         # None, behaviour is unchanged (no file written) so existing tests and
         # log_dir-less callers keep working. (#177 follow-up)
         self._log_dir = Path(log_dir) if log_dir is not None else None
+        # model_id -> the container name spawn() actually used. Needed because
+        # the name now depends on the row's backend and ``engine_host`` is
+        # handed only a model_id: without this record a llama.cpp engine would
+        # be spawned as ...-<id>-llamacpp and then reached at ...-<id>, and the
+        # failure would surface as a health-probe timeout with no clue why.
+        self._names: dict[str, str] = {}
 
     def engine_host(self, model_id: str) -> str:
         # The sibling engine is reachable from the control-plane container by
@@ -172,16 +204,29 @@ class DockerSocketDriver:
         # host port is for operator debugging only — the warden talks to the
         # engine container-to-container, never via 127.0.0.1 (that is the
         # control-plane's OWN loopback, where no engine listens).
-        return f"{ENGINE_NAME_PREFIX}{model_id}"
+        #
+        # Falls back to the un-suffixed name for a model this driver instance
+        # never spawned (a warden restart with a container still up), which is
+        # the pre-C behaviour and correct for every vLLM row.
+        return self._names.get(model_id) or _engine_name(model_id)
 
     async def spawn(self, spec) -> DockerHandle:
-        name = f"{ENGINE_NAME_PREFIX}{spec.model_id}"
+        name = _engine_name(spec.model_id, getattr(spec, "backend", None))
+        self._names[spec.model_id] = name
         # A per-model engine image (resolved from the template's engine axis
-        # by app.templates.resolver) arrives on spec.image and wins; the
+        # by app.runtime.backends.vllm.images) arrives on spec.image and wins; the
         # driver-level image is the fallback default.
         image = spec.image or self._image
+        # argv[0] is set as the container ENTRYPOINT rather than being folded
+        # into `command`. Before sub-project B the driver passed the
+        # post-binary tail as `command` and relied on the engine image's baked
+        # ENTRYPOINT to be `vllm serve`. Now that the backend owns argv[0],
+        # passing the whole vector as `command` would double-invoke it. Setting
+        # the entrypoint explicitly also removes the dependency on what a
+        # pinned image happened to bake in.
         kwargs = dict(
-            command=spec.args,
+            entrypoint=spec.argv[0],
+            command=list(spec.argv[1:]),
             detach=True,
             environment=_relative_cuda_visible_devices(
                 dict(spec.env), list(spec.gpu_indices)
@@ -255,8 +300,15 @@ class DockerSocketDriver:
             try:
                 log_dir.mkdir(parents=True, exist_ok=True)
                 # Truncate: a fresh engine run must clear stale content (the
-                # d5 false "still v0.20.0" reading came from a stale file).
+                # the observed false "still v0.20.0" reading came from a stale file).
                 with open(log_path, "wb") as f:
+                    # Run boundary (#234). This driver truncates, so the
+                    # sentinel is redundant for scoping here -- write it anyway
+                    # so the reader's contract is "logs are delimited", not
+                    # "logs are delimited unless the docker driver wrote them",
+                    # and so an operator greps one marker on both drivers.
+                    f.write(f"{format_run_sentinel()}\n".encode())
+                    f.flush()
                     for chunk in container.logs(
                         stream=True, follow=True, stdout=True, stderr=True
                     ):

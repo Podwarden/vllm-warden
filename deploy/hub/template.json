@@ -1,7 +1,7 @@
 {
   "application": {
     "slug": "vllm-warden",
-    "name": "vLLM Warden",
+    "name": "LLM Warden",
     "description": "Self-hosted OpenAI-compatible LLM inference with a setup wizard. Deploy any HuggingFace model in minutes.",
     "category_slug": "ai-ml",
     "tags": ["llm", "vllm", "openai-api", "inference", "ai", "gpu"],
@@ -25,8 +25,8 @@
   "stack": {
     "slug": "vllm-warden",
     "stack_type": "compose_stack",
-    "stack_label": "vLLM Warden",
-    "name": "vLLM Warden",
+    "stack_label": "LLM Warden",
+    "name": "LLM Warden",
     "version": "2.0.1",
     "breaking": false,
     "min_compatible_warden_version": "v2026.05.12.0",

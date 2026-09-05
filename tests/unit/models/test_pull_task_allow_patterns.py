@@ -229,3 +229,50 @@ def test_allow_patterns_for_single_safetensors_unchanged():
         "*.txt",
         "*.md",
     ]
+
+
+# ---------------------------------------------------------------------------
+# Sub-project C: the multimodal projector is part of a per-file pull
+# ---------------------------------------------------------------------------
+
+
+def test_mmproj_is_included_in_a_per_file_pull():
+    """Without this the projector is never downloaded and Task 6's resolver
+    raises ModelFileNotFound at load time -- correct, but late and confusing,
+    because the operator DID select a vision model."""
+    pats = allow_patterns_for(
+        "model-IQ3_XXS.gguf", mmproj_filename="mmproj-BF16.gguf"
+    )
+    assert "mmproj-BF16.gguf" in pats
+    assert "model-IQ3_XXS.gguf" in pats
+
+
+def test_mmproj_absent_leaves_the_patterns_exactly_as_before():
+    """The vLLM path must not gain a file. Byte-for-byte the pre-C list."""
+    assert allow_patterns_for("model.safetensors") == [
+        "model.safetensors",
+        "config.json",
+        "tokenizer*",
+        "*.txt",
+        "*.md",
+    ]
+
+
+def test_whole_repo_pull_is_still_none():
+    assert allow_patterns_for(None) is None
+    assert allow_patterns_for(None, mmproj_filename="mmproj-BF16.gguf") is None
+
+
+def test_sharded_gguf_still_expands_to_the_whole_family_with_an_mmproj():
+    pats = allow_patterns_for(
+        "m-Q4_K_M-00001-of-00003.gguf", mmproj_filename="mmproj-BF16.gguf"
+    )
+    assert any("-of-00003.gguf" in p and "*" in p for p in pats)
+    assert "mmproj-BF16.gguf" in pats
+
+
+def test_the_projector_is_appended_last_not_folded_into_the_shard_glob():
+    """It is not a member of the weights shard family, and ordering matters
+    only in that a reviewer reading the list should see it as an addition."""
+    pats = allow_patterns_for("m.gguf", mmproj_filename="mmproj-BF16.gguf")
+    assert pats[-1] == "mmproj-BF16.gguf"

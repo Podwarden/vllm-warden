@@ -1,22 +1,39 @@
 """Live engine-metrics SSE — ``GET /api/stats/live`` (Plane A).
 
-Scrapes the loaded model's vLLM ``/metrics`` endpoint (aggregate Prometheus
+Scrapes EVERY loaded model's engine ``/metrics`` endpoint (aggregate Prometheus
 text) and emits a parsed JSON frame over SSE, mirroring the header-metrics SSE
 in ``app/header/routes_api.py`` (ticket auth, ``sse_headers``, ~2s cadence, 15s
 keepalive, shared TTL cache so multi-tab collapses to one scrape).
 
+FRAME SHAPE. ``{...leading model's block, "models": [block, ...]}`` — one block
+per loaded model, each exactly what ``build_frame`` has always produced, plus
+the leading block spread at the top level for a UI bundle older than the
+``models`` key. ``build_frame`` itself is untouched and stays pinned by
+tests/fixtures/live_frame_golden.json: eleven dashboard panels read it field by
+field, so multi-model support had to be a wrapper around that shape rather than
+a change to it.
+
+WHICH models a viewer sees is the CLIENT's choice. Filtering here would put a
+selection into the SSE ticket path, so every checkbox click would tear down and
+re-mint the stream, and the frame already carries the per-model data — there is
+nothing to gain by moving the choice to the server. Combining several blocks
+into one number is likewise the client's job, and the ``| None`` contract below
+is what makes that safe to do.
+
 Two data planes back the live-stats dashboard (see docs/live-stats-spec.md).
-This module is Plane A: the *aggregate* engine truth vLLM exposes on
+This module is Plane A: the *aggregate* engine truth the engine exposes on
 ``127.0.0.1:{engine_port}/metrics``. Per-request KV/context truth is Plane B
 (``app/stats/live_requests.py``), a separate module — they never share a file.
 
 Design notes:
 
-* **Parser** — a tiny inline Prometheus text parser (no new dependency).
-  ``vllm:`` metric names are matched; a renamed/absent name maps to ``null``
-  rather than raising (vLLM 0.25.1 renamed several — e.g. ``gpu_cache_usage_perc``
-  → ``kv_cache_usage_perc``). All parse/extract helpers are pure functions so
-  the unit tests exercise them against a captured metrics blob.
+* **Dialect** — this module names **no engine metric at all**. Sub-project C
+  moved the metric NAMES into each backend (``app/runtime/backends/*/metrics.py``)
+  and the shared Prometheus text parser into ``app/stats/prometheus.py``. What
+  arrives here is an ``EngineReading``: one field per concept, every field
+  ``float | None``, where ``None`` means *this engine does not report it* — never
+  zero. That is what lets llama.cpp, which publishes no KV gauge, no preemption
+  counter and no latency histograms, degrade instead of lying.
 * **Cache** — ``_MetricsCache`` keyed on ``model_id`` with a ~1.5s TTL and a
   single ``asyncio.Lock`` collapses N concurrent tabs to one scrape, mirroring
   ``_ProbeCache`` in ``app/system/routes_gpus.py``. The cached entry carries the
@@ -36,11 +53,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
 import os
-import re
 import time
-from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -50,6 +64,20 @@ from fastapi.responses import StreamingResponse
 
 from app.db.database import open_db
 from app.models.routes_logs import require_sse_ticket
+from app.runtime.backends import registry
+from app.runtime.backends.metrics import EngineReading
+
+# Re-exported: this module owned the parser until sub-project C, and
+# tests/unit/stats/test_live_engine.py -- plus any operator snippet -- still
+# imports the names from here. The parser now lives in app/stats/prometheus.py
+# because both backends need it and neither should have to import the SSE route.
+from app.stats.prometheus import (  # noqa: F401
+    Metrics,
+    PromSample,
+    hist_mean,
+    hist_quantile,
+    parse_prometheus,
+)
 from app.utils.sse import sse_headers
 
 router = APIRouter(prefix="/api/stats", tags=["stats-live"])
@@ -85,171 +113,6 @@ STATS_LIVE_CACHE_TTL_S: float = 1.5
 # httpx timeout for the /metrics scrape. Short — the endpoint is loopback and a
 # slow scrape should surface as scrape_error, not stall the whole stream.
 SCRAPE_TIMEOUT_S: float = 5.0
-
-
-# --------------------------------------------------------------------------- #
-# Prometheus text parser (inline, no new dependency)
-# --------------------------------------------------------------------------- #
-
-# A metric line is ``name{labels} value [timestamp]`` or ``name value``.
-_LINE_RE = re.compile(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{.*\})?\s+(.+)$")
-# One label pair: ``key="value"`` where value may contain escaped quotes.
-_LABEL_RE = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"')
-
-
-def _unescape(v: str) -> str:
-    return v.replace("\\\\", "\\").replace('\\"', '"').replace("\\n", "\n")
-
-
-def _parse_value(raw: str) -> float | None:
-    tok = raw.split()[0] if raw else ""
-    try:
-        return float(tok)
-    except ValueError:
-        return None
-
-
-@dataclass(frozen=True)
-class PromSample:
-    name: str
-    labels: dict[str, str]
-    value: float
-
-
-def parse_prometheus(text: str) -> list[PromSample]:
-    """Parse Prometheus exposition text into a flat list of samples.
-
-    ``# HELP`` / ``# TYPE`` comment lines and blanks are skipped. A malformed
-    sample line is dropped rather than raising — a partial scrape must never
-    crash the stream.
-    """
-    out: list[PromSample] = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        m = _LINE_RE.match(line)
-        if not m:
-            continue
-        name, label_blob, raw_val = m.group(1), m.group(2), m.group(3)
-        val = _parse_value(raw_val)
-        if val is None:
-            continue
-        labels: dict[str, str] = {}
-        if label_blob:
-            for k, v in _LABEL_RE.findall(label_blob):
-                labels[k] = _unescape(v)
-        out.append(PromSample(name=name, labels=labels, value=val))
-    return out
-
-
-class Metrics:
-    """Accessor over parsed Prometheus samples.
-
-    All lookups aggregate (sum) across label series with the same metric name
-    so a metric that vLLM happens to split by an extra label (e.g. an engine
-    index) collapses to a single engine-wide figure. A name with no matching
-    series returns ``None`` — never a crash — which is how a renamed/absent
-    metric turns into ``null`` in the frame.
-    """
-
-    def __init__(self, samples: list[PromSample]) -> None:
-        self._samples = samples
-        self._by_name: dict[str, list[PromSample]] = defaultdict(list)
-        for s in samples:
-            self._by_name[s.name].append(s)
-
-    def _matching(self, name: str, label_filter: dict[str, str]):
-        for s in self._by_name.get(name, ()):
-            if all(s.labels.get(k) == v for k, v in label_filter.items()):
-                yield s
-
-    def value(self, name: str, **label_filter: str) -> float | None:
-        """Sum of matching series' values, or ``None`` if none match."""
-        vals = [s.value for s in self._matching(name, label_filter)]
-        return sum(vals) if vals else None
-
-    def value_any(self, *names: str, **label_filter: str) -> float | None:
-        """First non-None ``value`` across alternative metric names.
-
-        vLLM 0.25.1 renamed several counters and sometimes appends ``_total``;
-        callers pass the plausible spellings and take whichever exists.
-        """
-        for name in names:
-            v = self.value(name, **label_filter)
-            if v is not None:
-                return v
-        return None
-
-    def info(self, name: str) -> dict[str, str] | None:
-        """Labels of the first series with ``name`` (Prometheus ``*_info``)."""
-        for s in self._by_name.get(name, ()):
-            return s.labels
-        return None
-
-    def histogram(self, base: str):
-        """Return ``(buckets, sum, count)`` for a histogram, or ``None``.
-
-        ``buckets`` is a list of ``(le, cumulative_count)`` sorted ascending,
-        counts summed across any non-``le`` label series. Returns ``None`` when
-        the histogram is entirely absent.
-        """
-        bmap: dict[float, float] = defaultdict(float)
-        saw_bucket = False
-        for s in self._by_name.get(base + "_bucket", ()):
-            le = s.labels.get("le")
-            if le is None:
-                continue
-            try:
-                le_f = float(le)
-            except ValueError:
-                continue
-            bmap[le_f] += s.value
-            saw_bucket = True
-        total_sum = self.value(base + "_sum")
-        total_count = self.value(base + "_count")
-        if not saw_bucket and total_count is None:
-            return None
-        buckets = sorted(bmap.items())
-        return buckets, total_sum, total_count
-
-
-def hist_quantile(buckets: list[tuple[float, float]], q: float) -> float | None:
-    """Interpolate a quantile from cumulative histogram buckets.
-
-    ``buckets`` is ascending ``(le, cumulative_count)`` including the ``+Inf``
-    bucket. Linear interpolation within the bucket that straddles the rank —
-    the standard Prometheus ``histogram_quantile`` shape. Returns ``None`` for
-    an empty or all-zero histogram.
-    """
-    if not buckets:
-        return None
-    total = buckets[-1][1]
-    if not total or total <= 0:
-        return None
-    rank = q * total
-    prev_le = 0.0
-    prev_c = 0.0
-    for le, c in buckets:
-        if rank <= c:
-            if math.isinf(le):
-                # Rank falls in the open-ended top bucket; the best finite
-                # answer is the last finite boundary we passed.
-                return prev_le if prev_c > 0 else None
-            if c <= prev_c:
-                return le
-            frac = (rank - prev_c) / (c - prev_c)
-            return prev_le + frac * (le - prev_le)
-        if not math.isinf(le):
-            prev_le = le
-        prev_c = c
-    return prev_le
-
-
-def hist_mean(sum_v: float | None, count_v: float | None) -> float | None:
-    if sum_v is None or count_v is None or count_v <= 0:
-        return None
-    return sum_v / count_v
 
 
 def _pct(hist, q: float) -> float | None:
@@ -303,11 +166,17 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
-def _null_frame(model, model_id, max_model_len, scrape_error: str) -> dict:
+def _null_frame(
+    model, model_id, max_model_len, scrape_error: str, backend: str | None = None
+) -> dict:
     return {
         "ts": _now_iso(),
         "model": model,
         "model_id": model_id,
+        # Sub-project C: the same additive key build_frame emits, so the two
+        # frame shapes stay identical and the frontend never has to branch on
+        # which one it got. ``None`` when no model could be resolved at all.
+        "backend": backend,
         "max_model_len": max_model_len,
         "engine": None,
         "throughput": None,
@@ -320,105 +189,82 @@ def _null_frame(model, model_id, max_model_len, scrape_error: str) -> dict:
 
 
 def build_frame(
-    m: Metrics,
+    r,  # EngineReading
     *,
     model: str | None,
     model_id: str | None,
     max_model_len: int | None,
     prev: RateState | None,
     scrape_monotonic: float,
+    backend: str = "vllm",
 ) -> tuple[dict, RateState]:
-    """Build the ``data:`` frame from parsed metrics; return ``(frame, state)``.
+    """Build the ``data:`` frame from one EngineReading; return ``(frame, state)``.
 
-    ``state`` is the counter snapshot the caller stores to compute rates on the
-    next tick. When ``prev`` is ``None`` (first frame) all rates are ``null``.
+    This function no longer knows any engine's metric names -- the backend put
+    them into ``r`` (app/runtime/backends/*/metrics.py). What stays here is what
+    is the same for every engine: per-second rates against the connection's
+    previous snapshot, histogram quantiles, and the frame schema the dashboard
+    reads field by field.
+
+    A None in ``r`` means the engine does not report that number. It flows
+    straight through as JSON null and is NEVER defaulted to 0; the frontend
+    renders null as an em dash or hides the row entirely.
     """
     dt = (scrape_monotonic - prev.monotonic) if prev else 0.0
 
-    # --- raw cumulative counters (also fed into next-frame rate state) ---
-    gen_total = m.value("vllm:generation_tokens_total")
-    prompt_total = m.value("vllm:prompt_tokens_total")
-    preempt_total = m.value("vllm:num_preemptions_total")
-    prefix_hits = m.value_any("vllm:prefix_cache_hits_total", "vllm:prefix_cache_hits")
-    prefix_queries = m.value_any(
-        "vllm:prefix_cache_queries_total", "vllm:prefix_cache_queries"
-    )
-
-    # --- KV cache: usage% -> absolute tokens via cache_config_info ---
-    kv_perc = m.value("vllm:kv_cache_usage_perc")
-    if kv_perc is None:  # 0.25.1 rename fallback
-        kv_perc = m.value("vllm:gpu_cache_usage_perc")
-    kv_total: int | None = None
-    info = m.info("vllm:cache_config_info")
-    if info is not None:
-        try:
-            block_size = int(info["block_size"])
-            num_gpu_blocks = int(info["num_gpu_blocks"])
-            kv_total = block_size * num_gpu_blocks
-        except (KeyError, ValueError):
-            kv_total = None
     kv_used = (
-        int(round(kv_perc * kv_total))
-        if (kv_perc is not None and kv_total is not None)
+        int(round(r.kv_cache_usage_perc * r.kv_tokens_total))
+        if (r.kv_cache_usage_perc is not None and r.kv_tokens_total is not None)
         else None
     )
 
     engine = {
-        "num_requests_running": _int_or_none(m.value("vllm:num_requests_running")),
-        "num_requests_waiting": _int_or_none(m.value("vllm:num_requests_waiting")),
+        "num_requests_running": _int_or_none(r.requests_running),
+        "num_requests_waiting": _int_or_none(r.requests_waiting),
         "waiting_by_reason": {
-            "capacity": _int_or_none(
-                m.value("vllm:num_requests_waiting_by_reason", reason="capacity")
-            ),
-            "deferred": _int_or_none(
-                m.value("vllm:num_requests_waiting_by_reason", reason="deferred")
-            ),
+            "capacity": _int_or_none(r.waiting_capacity),
+            "deferred": _int_or_none(r.waiting_deferred),
         },
-        "kv_cache_usage_perc": kv_perc,
+        "kv_cache_usage_perc": r.kv_cache_usage_perc,
         "kv_tokens_used": kv_used,
-        "kv_tokens_total": kv_total,
-        "engine_sleep_state": _int_or_none(m.value("vllm:engine_sleep_state")),
-        "preemptions_total": _int_or_none(preempt_total),
-        "preemptions_per_s": _rate(preempt_total, prev.preempt if prev else None, dt),
+        "kv_tokens_total": _int_or_none(r.kv_tokens_total),
+        "engine_sleep_state": _int_or_none(r.engine_sleep_state),
+        "preemptions_total": _int_or_none(r.preemptions_total),
+        "preemptions_per_s": _rate(
+            r.preemptions_total, prev.preempt if prev else None, dt
+        ),
     }
 
     throughput = {
-        "prompt_tokens_per_s": _rate(prompt_total, prev.prompt if prev else None, dt),
-        "generation_tokens_per_s": _rate(gen_total, prev.gen if prev else None, dt),
-        "prompt_tokens_total": _int_or_none(prompt_total),
-        "generation_tokens_total": _int_or_none(gen_total),
+        "prompt_tokens_per_s": _rate(
+            r.prompt_tokens_total, prev.prompt if prev else None, dt
+        ),
+        "generation_tokens_per_s": _rate(
+            r.generation_tokens_total, prev.gen if prev else None, dt
+        ),
+        "prompt_tokens_total": _int_or_none(r.prompt_tokens_total),
+        "generation_tokens_total": _int_or_none(r.generation_tokens_total),
     }
 
     # Interval prefix-cache hit rate = delta hits / delta queries over the tick.
     interval_hit_rate: float | None = None
     if prev is not None and dt > 0:
-        dh = _rate(prefix_hits, prev.prefix_hits, dt)  # per-s, reuse reset guard
-        dq = _rate(prefix_queries, prev.prefix_queries, dt)
+        dh = _rate(r.prefix_cache_hits, prev.prefix_hits, dt)  # per-s, reuse reset guard
+        dq = _rate(r.prefix_cache_queries, prev.prefix_queries, dt)
         if dh is not None and dq is not None and dq > 0:
             interval_hit_rate = dh / dq
     cache = {
         "prefix_hit_rate": interval_hit_rate,
-        "prefix_hit_rate_cumulative": _ratio(prefix_hits, prefix_queries),
-        "mm_hit_rate_cumulative": _ratio(
-            m.value_any("vllm:mm_cache_hits_total", "vllm:mm_cache_hits"),
-            m.value_any("vllm:mm_cache_queries_total", "vllm:mm_cache_queries"),
+        "prefix_hit_rate_cumulative": _ratio(
+            r.prefix_cache_hits, r.prefix_cache_queries
         ),
+        "mm_hit_rate_cumulative": _ratio(r.mm_cache_hits, r.mm_cache_queries),
         "external_prefix_hit_rate_cumulative": _ratio(
-            m.value_any(
-                "vllm:external_prefix_cache_hits_total",
-                "vllm:external_prefix_cache_hits",
-            ),
-            m.value_any(
-                "vllm:external_prefix_cache_queries_total",
-                "vllm:external_prefix_cache_queries",
-            ),
+            r.external_prefix_cache_hits, r.external_prefix_cache_queries
         ),
     }
 
-    ttft = m.histogram("vllm:time_to_first_token_seconds")
-    itl = m.histogram("vllm:inter_token_latency_seconds")
-    tpot = m.histogram("vllm:time_per_output_token_seconds")
-    e2e = m.histogram("vllm:e2e_request_latency_seconds")
+    ttft, itl, tpot, e2e = r.ttft_hist, r.itl_hist, r.tpot_hist, r.e2e_hist
     latency = {
         "ttft_p50": _pct(ttft, 0.5),
         "ttft_p90": _pct(ttft, 0.9),
@@ -432,34 +278,29 @@ def build_frame(
         "e2e_p99": _pct(e2e, 0.99),
     }
 
-    # MFU (Model FLOPs Utilization). We expose the cumulative estimated FLOPs
-    # counter vLLM reports; a true MFU% needs peak device FLOPs (dtype-specific)
-    # which we don't resolve in v1, so ``mfu_estimate`` stays null. Formula for
-    # a later iteration:
+    # MFU (Model FLOPs Utilization). We expose the cumulative estimated-FLOPs
+    # counter the engine reports; a true MFU% needs peak device FLOPs
+    # (dtype-specific) which we don't resolve in v1, so ``mfu_estimate`` stays
+    # null. Formula for a later iteration:
     #   mfu = (d(flops_per_gpu_total)/dt) / peak_flops_per_gpu(dtype)
     # i.e. the per-second FLOPs rate divided by the GPU's advertised peak FLOPs
     # for the engine's compute dtype.
-    mfu = {
-        "flops_per_gpu_total": m.value("vllm:estimated_flops_per_gpu_total"),
-        "mfu_estimate": None,
-    }
+    mfu = {"flops_per_gpu_total": r.flops_per_gpu_total, "mfu_estimate": None}
 
     finished = {
-        "stop": _int_or_none(
-            m.value("vllm:request_success_total", finished_reason="stop")
-        ),
-        "length": _int_or_none(
-            m.value("vllm:request_success_total", finished_reason="length")
-        ),
-        "abort": _int_or_none(
-            m.value("vllm:request_success_total", finished_reason="abort")
-        ),
+        "stop": _int_or_none(r.finished_stop),
+        "length": _int_or_none(r.finished_length),
+        "abort": _int_or_none(r.finished_abort),
     }
 
     frame = {
         "ts": _now_iso(),
         "model": model,
         "model_id": model_id,
+        # Sub-project C's one additive field. The dashboard needs it to say
+        # "llama.cpp does not report this" rather than showing a blank tile of
+        # unknown provenance -- design spec §9.1.
+        "backend": backend,
         "max_model_len": max_model_len,
         "engine": engine,
         "throughput": throughput,
@@ -471,11 +312,11 @@ def build_frame(
     }
     state = RateState(
         monotonic=scrape_monotonic,
-        gen=gen_total,
-        prompt=prompt_total,
-        preempt=preempt_total,
-        prefix_hits=prefix_hits,
-        prefix_queries=prefix_queries,
+        gen=r.generation_tokens_total,
+        prompt=r.prompt_tokens_total,
+        preempt=r.preemptions_total,
+        prefix_hits=r.prefix_cache_hits,
+        prefix_queries=r.prefix_cache_queries,
     )
     return frame, state
 
@@ -487,20 +328,27 @@ def build_frame(
 
 @dataclass
 class ScrapeResult:
-    metrics: Metrics | None
+    # Sub-project C: an EngineReading, not a Metrics. The backend did the
+    # name lookup; what reaches the stats layer is already dialect-free.
+    metrics: EngineReading | None
     error: str | None
     monotonic: float
 
 
-async def _default_fetch(host: str, port: int, at: float) -> ScrapeResult:
-    """Scrape ``/metrics`` once and parse. Never raises — a failed scrape is a
-    ``ScrapeResult`` with ``error`` set and ``metrics=None`` (fail-open)."""
-    url = f"http://{host}:{port}/metrics"
+async def _default_fetch(host: str, port: int, at: float, backend) -> ScrapeResult:
+    """Scrape the backend's metrics path once and parse. Never raises — a failed
+    scrape is a ``ScrapeResult`` with ``error`` set and ``metrics=None``.
+
+    The path comes from ``backend.capabilities.metrics_path`` rather than a
+    literal: llama.cpp happens to use ``/metrics`` too, but it only serves it
+    when ``--metrics`` was passed, and a future backend need not agree at all.
+    """
+    url = f"http://{host}:{port}{backend.capabilities.metrics_path}"
     try:
         async with httpx.AsyncClient(timeout=SCRAPE_TIMEOUT_S) as client:
             r = await client.get(url)
         r.raise_for_status()
-        return ScrapeResult(metrics=Metrics(parse_prometheus(r.text)), error=None, monotonic=at)
+        return ScrapeResult(metrics=backend.parse_metrics(r.text), error=None, monotonic=at)
     except Exception as exc:  # noqa: BLE001 — any scrape failure is surfaced, not raised
         return ScrapeResult(
             metrics=None, error=str(exc) or exc.__class__.__name__, monotonic=at
@@ -531,14 +379,16 @@ class _MetricsCache:
         self._cache: dict[str, ScrapeResult] = {}
         self.invocations = 0  # exposed for tests
 
-    async def get(self, model_id: str, host: str, port: int) -> ScrapeResult:
+    async def get(
+        self, model_id: str, host: str, port: int, backend
+    ) -> ScrapeResult:
         async with self._lock:
             now = self._clock()
             hit = self._cache.get(model_id)
             if hit is not None and (now - hit.monotonic) < self._ttl:
                 return hit
             self.invocations += 1
-            res = await self._fetch(host, port, now)
+            res = await self._fetch(host, port, now, backend)
             self._cache[model_id] = res
             return res
 
@@ -551,21 +401,34 @@ def _get_cache(request: Request) -> _MetricsCache:
     return cache
 
 
-async def _loaded_model(db_path) -> tuple[str | None, str | None, int | None]:
-    """Return ``(model_id, served_model_name, max_model_len)`` of the loaded
-    model, or ``(None, None, None)``. Same 'loaded' semantics as the header
-    stream: ``models.status='loaded'`` with a ``model_runtime`` row."""
+async def _loaded_models(
+    db_path,
+) -> list[tuple[str, str, int | None, str | None]]:
+    """``(model_id, served_model_name, max_model_len, backend)`` for EVERY
+    loaded model, ordered by served name. Empty list when nothing is loaded.
+
+    Same 'loaded' semantics as the header stream: ``models.status='loaded'``
+    with a ``model_runtime`` row.
+
+    This was ``_loaded_model``, singular, with ``LIMIT 1``. On a box running two
+    engines the live dashboard therefore showed one of them, and *which* one was
+    whatever SQLite happened to return first -- not a stable choice, let alone a
+    stated one. The ordering is by served name for the same reason the header's
+    is: this feeds a view that repaints every two seconds, and a list that
+    reorders under the operator cannot be read.
+
+    ``backend`` is selected raw -- NULL stays NULL here and ``registry.get``
+    resolves it to the default (D6), so the fallback lives in exactly one place.
+    """
     async with open_db(db_path) as db:
         cur = await db.execute(
-            "SELECT m.id, m.served_model_name, m.max_model_len "
+            "SELECT m.id, m.served_model_name, m.max_model_len, m.backend "
             "FROM models m JOIN model_runtime r ON r.model_id = m.id "
             "WHERE m.status = 'loaded' "
-            "LIMIT 1"
+            "ORDER BY m.served_model_name ASC"
         )
-        row = await cur.fetchone()
-    if row is None:
-        return (None, None, None)
-    return (row[0], row[1], row[2])
+        rows = await cur.fetchall()
+    return [(r[0], r[1], r[2], r[3]) for r in rows]
 
 
 # --------------------------------------------------------------------------- #
@@ -573,43 +436,94 @@ async def _loaded_model(db_path) -> tuple[str | None, str | None, int | None]:
 # --------------------------------------------------------------------------- #
 
 
+def envelope(blocks: list[dict]) -> dict:
+    """Wrap per-model blocks into the frame the dashboard receives.
+
+    ``blocks`` are ``build_frame`` / ``_null_frame`` outputs, one per model,
+    UNCHANGED -- which is the point. ``build_frame``'s shape is pinned by a
+    committed golden (tests/fixtures/live_frame_golden.json) because eleven
+    panels read it field by field, so multi-model support is a wrapper around
+    it and never an edit to it.
+
+    The envelope is the per-model list PLUS the leading block's keys spread at
+    the top level. The duplication is deliberate and is the same bargain the
+    header frame strikes: ui and api ship as separate images and skew in both
+    directions, so a bundle that predates ``models`` keeps reading the frame it
+    knows instead of rendering nothing while an engine serves.
+
+    The client picks WHICH models it displays. Filtering here would mean the
+    SSE ticket path carrying a selection, so every checkbox click would tear
+    down and re-mint a stream -- and the data is already per-model in the
+    frame, so there is nothing to gain by moving the choice to the server.
+    Combining several models into one number is the client's job too, and the
+    None-vs-zero rule below is what makes that safe.
+    """
+    lead = blocks[0] if blocks else _null_frame(None, None, None, "no model loaded")
+    return {**lead, "models": blocks}
+
+
 @router.get("/live")
 async def stream_live(request: Request, _user: str = Depends(require_sse_ticket)):
-    """Stream live vLLM engine metrics as SSE events (one JSON frame per tick).
+    """Stream live engine metrics as SSE events (one JSON frame per tick).
 
     Structure mirrors the header-metrics SSE: an immediate first frame, then an
     emit every ``_interval_seconds()`` with ``is_disconnected`` checks and a
-    belt-and-suspenders 15s keepalive. Each tick resolves the loaded model,
-    pulls a (possibly cached) scrape, and builds a frame — computing rates
-    against this connection's previous frame.
+    belt-and-suspenders 15s keepalive. Each tick resolves EVERY loaded model,
+    pulls a (possibly cached) scrape per model, and builds one block each —
+    computing rates against this connection's previous frame, per model.
+
+    Rate state is per model_id, not per connection. Two engines' cumulative
+    counters share no clock and no origin; a single previous snapshot would
+    have produced a rate for whichever model happened to come second that was
+    computed against the first model's totals -- a plausible-looking number
+    with no meaning at all.
     """
     cache = _get_cache(request)
     settings = request.app.state.settings
     supervisor = request.app.state.supervisor
     interval = _interval_seconds()
 
-    async def _one_frame(prev: RateState | None) -> tuple[dict, RateState | None]:
-        """Resolve target, scrape (cached), and build one frame.
+    async def _one_block(
+        row: tuple[str, str, int | None, str | None],
+        prev: RateState | None,
+    ) -> tuple[dict, RateState | None]:
+        """Scrape one model (cached) and build its block.
 
-        Returns ``(frame, new_state_or_None)``. On any failure (no model
-        loaded, no port, scrape error) returns a null frame with
-        ``scrape_error`` set and ``None`` state so rate accounting resumes
-        cleanly once the engine is back.
+        Returns ``(block, new_state_or_None)``. On failure (no port, scrape
+        error) returns a null block with ``scrape_error`` set and ``None``
+        state, so rate accounting for THAT model resumes cleanly once its
+        engine is back without disturbing any other model's.
         """
-        model_id, model_name, max_model_len = await _loaded_model(settings.db_path)
-        if model_id is None:
-            return _null_frame(None, None, None, "no model loaded"), None
+        model_id, model_name, max_model_len, backend_name = row
+        # The row's OWN backend decides both the metrics path and the metric
+        # dialect. An UnknownBackendError here would be a row asking for a
+        # backend this build lacks -- which the load path already refuses, so it
+        # cannot happen for a *loaded* model; the SSE loop's own try/except
+        # would surface it as a scrape_error rather than killing the stream.
+        backend = registry.get(backend_name)
         port = supervisor.get_port(model_id)
         if port is None:
             return (
-                _null_frame(model_name, model_id, max_model_len, "engine not running"),
+                _null_frame(
+                    model_name,
+                    model_id,
+                    max_model_len,
+                    "engine not running",
+                    backend.capabilities.name,
+                ),
                 None,
             )
         host = supervisor.get_host(model_id) or "127.0.0.1"
-        res = await cache.get(model_id, host, port)
+        res = await cache.get(model_id, host, port, backend)
         if res.metrics is None:
             return (
-                _null_frame(model_name, model_id, max_model_len, res.error or "scrape failed"),
+                _null_frame(
+                    model_name,
+                    model_id,
+                    max_model_len,
+                    res.error or "scrape failed",
+                    backend.capabilities.name,
+                ),
                 None,
             )
         return build_frame(
@@ -619,17 +533,35 @@ async def stream_live(request: Request, _user: str = Depends(require_sse_ticket)
             max_model_len=max_model_len,
             prev=prev,
             scrape_monotonic=res.monotonic,
+            backend=backend.capabilities.name,
         )
 
+    async def _one_frame(prev: dict[str, RateState]) -> dict:
+        """One tick: every loaded model, one block each. Mutates ``prev``."""
+        rows = await _loaded_models(settings.db_path)
+        if not rows:
+            # `models: []`, and a top level that still carries the old
+            # "no model loaded" scrape_error for a client that reads only that.
+            return envelope([])
+        blocks = []
+        for row in rows:
+            block, state = await _one_block(row, prev.get(row[0]))
+            if state is not None:
+                prev[row[0]] = state
+            else:
+                # A model whose scrape failed must not derive its next rate
+                # against a snapshot from before the gap; drop its history the
+                # same way the single-model loop dropped the connection's.
+                prev.pop(row[0], None)
+            blocks.append(block)
+        return envelope(blocks)
+
     async def gen():
-        prev: RateState | None = None
+        prev: dict[str, RateState] = {}
         last_yield_at = time.monotonic()
         # Immediate first frame so the consumer isn't blank for ``interval``s.
         try:
-            frame, state = await _one_frame(prev)
-            if state is not None:
-                prev = state
-            yield f"data: {json.dumps(frame)}\n\n"
+            yield f"data: {json.dumps(await _one_frame(prev))}\n\n"
             last_yield_at = time.monotonic()
         except Exception:  # noqa: BLE001 — first-tick failure falls through to the loop
             pass
@@ -644,13 +576,16 @@ async def stream_live(request: Request, _user: str = Depends(require_sse_ticket)
             if await request.is_disconnected():
                 return
             try:
-                frame, state = await _one_frame(prev)
-                if state is not None:
-                    prev = state
-                yield f"data: {json.dumps(frame)}\n\n"
+                yield f"data: {json.dumps(await _one_frame(prev))}\n\n"
                 last_yield_at = time.monotonic()
             except Exception as exc:  # noqa: BLE001 — never let a frame error kill the stream
-                yield f"data: {json.dumps(_null_frame(None, None, None, str(exc) or exc.__class__.__name__))}\n\n"
+                # `models: []`, NOT `[err]`: a block with no model_id would
+                # render as an anonymous panel in a per-model view. The error
+                # belongs to the tick, not to a model.
+                err = _null_frame(
+                    None, None, None, str(exc) or exc.__class__.__name__
+                )
+                yield f"data: {json.dumps({**err, 'models': []})}\n\n"
                 last_yield_at = time.monotonic()
             if time.monotonic() - last_yield_at >= KEEPALIVE_INTERVAL_S:
                 yield ": keepalive\n\n"

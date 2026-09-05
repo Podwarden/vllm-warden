@@ -114,7 +114,11 @@ def test_discover_returns_files_and_config(tmp_data_dir, client, monkeypatch):
     assert kinds["tokenizer.json"] == "tokenizer"
     assert kinds["model-00001-of-00002.safetensors"] == "safetensors_sharded"
     assert kinds["README.md"] == "other"
-    # Config keys: the six locked by #82 + quantization_config (#176), no extras.
+    # Config keys: the six locked by #82, quantization_config (#176), and the
+    # three KV-shape keys the fit math reads. No extras. The route reads
+    # discovery["config"], so a key missing here is one the fit preview cannot
+    # see -- which is how head_dim and interleaved sliding-window attention
+    # went uncounted.
     assert set(body["config"].keys()) == {
         "hidden_size",
         "num_hidden_layers",
@@ -123,6 +127,9 @@ def test_discover_returns_files_and_config(tmp_data_dir, client, monkeypatch):
         "max_position_embeddings",
         "torch_dtype",
         "quantization_config",
+        "head_dim",
+        "sliding_window",
+        "layer_types",
     }
     assert body["config"]["quantization_config"] == {"quant_method": "awq"}
     assert body["errors"] == []

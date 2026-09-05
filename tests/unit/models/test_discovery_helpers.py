@@ -92,3 +92,40 @@ def test_parse_quant(filename, expected):
 )
 def test_parse_params(filename, expected):
     assert _parse_params(filename) == expected
+
+
+# ---------------------------------------------------------------------------
+# Sub-project C: a projector is a GGUF, but it is not WEIGHTS
+# ---------------------------------------------------------------------------
+
+
+def test_mmproj_files_classify_as_mmproj_not_gguf():
+    """The wizard's weights-file radio list must not offer the projector as a
+    weights file: llama.cpp would load it, find no language model, and fail in a
+    way that reads like a corrupt download."""
+    from app.models.discovery import _classify
+
+    assert _classify("mmproj-Qwen3.8-27B-BF16.gguf") == "mmproj"
+    assert _classify("Qwen3.8-27B-GSQ-RCO-IQ3_XXS.gguf") == "gguf"
+
+
+def test_mmproj_detection_is_prefix_anchored():
+    """Only the upstream convention, so a legitimate weights file whose name
+    happens to contain the substring is not misfiled."""
+    from app.models.discovery import _classify
+
+    assert _classify("mmproj.gguf") == "mmproj"
+    assert _classify("model-with-mmproj-support-Q4.gguf") == "gguf"
+
+
+def test_mmproj_classification_survives_a_subdirectory():
+    from app.models.discovery import _classify
+
+    assert _classify("some/dir/mmproj-BF16.gguf") == "mmproj"
+
+
+def test_a_non_gguf_named_mmproj_is_not_a_projector():
+    """The kind is about the FILE, not about the name: --mmproj takes a GGUF."""
+    from app.models.discovery import _classify
+
+    assert _classify("mmproj-notes.txt") == "other"

@@ -63,7 +63,7 @@ async def test_spawn_runs_engine_image_with_gpus():
     client = _FakeClient()
     drv = DockerSocketDriver(client=client, image="vllm/vllm-openai:v0.20.0")
     spec = EngineSpec(model_id="m1", model_arg="openai/gpt-oss-20b",
-                      args=["--model", "openai/gpt-oss-20b", "--port", "8001"],
+                      argv=["vllm", "serve", "--model", "openai/gpt-oss-20b", "--port", "8001"],
                       env={"VLLM_USE_V1": "1"}, port=8001, gpu_indices=[0, 1])
     handle = await drv.spawn(spec)
     kw = client.containers.run_kwargs
@@ -95,7 +95,7 @@ async def test_spawn_remaps_cuda_visible_devices_to_relative_indices():
     drv = DockerSocketDriver(client=client, image="img:tag")
     # Single non-zero GPU: the exact case that crashed (host index 2, but the
     # container only has relative index 0).
-    spec = EngineSpec(model_id="m1", model_arg="x", args=[], env={
+    spec = EngineSpec(model_id="m1", model_arg="x", argv=["vllm", "serve"], env={
         "CUDA_VISIBLE_DEVICES": "2", "VLLM_LOGGING_LEVEL": "INFO"},
         port=8001, gpu_indices=[2])
     await drv.spawn(spec)
@@ -113,7 +113,7 @@ async def test_spawn_remaps_multi_gpu_cuda_visible_devices():
     # container, while device_requests still pins the physical 1 and 3.
     client = _FakeClient()
     drv = DockerSocketDriver(client=client, image="img:tag")
-    spec = EngineSpec(model_id="m1", model_arg="x", args=[],
+    spec = EngineSpec(model_id="m1", model_arg="x", argv=["vllm", "serve"],
                       env={"CUDA_VISIBLE_DEVICES": "1,3"}, port=8001,
                       gpu_indices=[1, 3])
     await drv.spawn(spec)
@@ -129,7 +129,7 @@ async def test_spawn_gives_engine_adequate_shared_memory():
     # then uses the host's large /dev/shm) plus an explicit shm_size fallback.
     client = _FakeClient()
     drv = DockerSocketDriver(client=client, image="img:tag")
-    spec = EngineSpec(model_id="m1", model_arg="x", args=[], env={}, port=8001,
+    spec = EngineSpec(model_id="m1", model_arg="x", argv=["vllm", "serve"], env={}, port=8001,
                       gpu_indices=[0, 1])
     await drv.spawn(spec)
     kw = client.containers.run_kwargs
@@ -152,13 +152,18 @@ async def test_spawn_ipc_mode_overridable_to_private_shm(monkeypatch):
     try:
         client = _FakeClient()
         drv = ds.DockerSocketDriver(client=client, image="img:tag")
-        spec = EngineSpec(model_id="m1", model_arg="x", args=[], env={},
+        spec = EngineSpec(model_id="m1", model_arg="x", argv=["vllm", "serve"], env={},
                           port=8001, gpu_indices=[0, 1])
         await drv.spawn(spec)
         kw = client.containers.run_kwargs
         assert "ipc_mode" not in kw
         assert kw["shm_size"] == "8g"
     finally:
+        # Undo the env BEFORE the restoring reload: monkeypatch only reverts
+        # at teardown, so reloading here with the override still in place
+        # baked the override into the module for every later test (an
+        # ordering bug surfaced by random/xdist ordering).
+        monkeypatch.undo()
         importlib.reload(ds)
 
 
@@ -181,7 +186,7 @@ async def test_spawn_attaches_engine_to_control_plane_network():
     # container name MUST match engine_host() so DNS resolves.
     client = _FakeClient()
     drv = DockerSocketDriver(client=client, image="img:tag")
-    spec = EngineSpec(model_id="m1", model_arg="x", args=[], env={}, port=8001,
+    spec = EngineSpec(model_id="m1", model_arg="x", argv=["vllm", "serve"], env={}, port=8001,
                       gpu_indices=[0, 1])
     await drv.spawn(spec)
     kw = client.containers.run_kwargs
@@ -204,11 +209,14 @@ async def test_spawn_network_overridable(monkeypatch):
     try:
         client = _FakeClient()
         drv = ds.DockerSocketDriver(client=client, image="img:tag")
-        spec = EngineSpec(model_id="m1", model_arg="x", args=[], env={},
+        spec = EngineSpec(model_id="m1", model_arg="x", argv=["vllm", "serve"], env={},
                           port=8001, gpu_indices=[0, 1])
         await drv.spawn(spec)
         assert "network" not in client.containers.run_kwargs
     finally:
+        # See test_spawn_ipc_mode_overridable_to_private_shm: revert the env
+        # first, then reload, or the empty network sticks for later tests.
+        monkeypatch.undo()
         importlib.reload(ds)
 
 
@@ -216,7 +224,7 @@ async def test_spawn_network_overridable(monkeypatch):
 async def test_spawn_requests_all_gpus_when_unpinned():
     client = _FakeClient()
     drv = DockerSocketDriver(client=client, image="img:tag")
-    spec = EngineSpec(model_id="m1", model_arg="x", args=[], env={}, port=8001)
+    spec = EngineSpec(model_id="m1", model_arg="x", argv=["vllm", "serve"], env={}, port=8001)
     await drv.spawn(spec)
     dreqs = client.containers.run_kwargs["device_requests"]
     assert len(dreqs) == 1
@@ -227,11 +235,11 @@ async def test_spawn_requests_all_gpus_when_unpinned():
 @pytest.mark.asyncio
 async def test_spawn_prefers_spec_image_over_driver_default():
     # The driver-level image is the fallback default; a per-model engine
-    # axis (resolved by app.templates.resolver) arrives on spec.image and
+    # axis (resolved by app.runtime.backends.vllm.images) arrives on spec.image and
     # MUST win so different models can run on different engine images.
     client = _FakeClient()
     drv = DockerSocketDriver(client=client, image="default:fallback")
-    spec = EngineSpec(model_id="m1", model_arg="x", args=[], env={}, port=8001,
+    spec = EngineSpec(model_id="m1", model_arg="x", argv=["vllm", "serve"], env={}, port=8001,
                       image="vllm/vllm-openai:v0.21.0")
     await drv.spawn(spec)
     assert client.containers.run_kwargs["image"] == "vllm/vllm-openai:v0.21.0"
@@ -241,7 +249,7 @@ async def test_spawn_prefers_spec_image_over_driver_default():
 async def test_spawn_falls_back_to_driver_image_when_spec_image_none():
     client = _FakeClient()
     drv = DockerSocketDriver(client=client, image="default:fallback")
-    spec = EngineSpec(model_id="m1", model_arg="x", args=[], env={}, port=8001)
+    spec = EngineSpec(model_id="m1", model_arg="x", argv=["vllm", "serve"], env={}, port=8001)
     await drv.spawn(spec)
     assert client.containers.run_kwargs["image"] == "default:fallback"
 
@@ -250,7 +258,7 @@ async def test_spawn_falls_back_to_driver_image_when_spec_image_none():
 async def test_terminate_stops_and_removes():
     client = _FakeClient()
     drv = DockerSocketDriver(client=client, image="img:tag")
-    spec = EngineSpec(model_id="m1", model_arg="x", args=[], env={}, port=8001)
+    spec = EngineSpec(model_id="m1", model_arg="x", argv=["vllm", "serve"], env={}, port=8001)
     handle = await drv.spawn(spec)
     await drv.terminate(handle, grace_s=1.0)
     assert handle.returncode == 0
@@ -265,7 +273,7 @@ async def test_handle_wait_is_memoized_single_reap():
     # container.wait().
     client = _FakeClient()
     drv = DockerSocketDriver(client=client, image="img:tag")
-    spec = EngineSpec(model_id="m1", model_arg="x", args=[], env={}, port=8001)
+    spec = EngineSpec(model_id="m1", model_arg="x", argv=["vllm", "serve"], env={}, port=8001)
     handle = await drv.spawn(spec)
     rc1 = await handle.wait()
     rc2 = await handle.wait()
@@ -279,7 +287,7 @@ async def test_terminate_reuses_watcher_reap():
     # reuse it rather than open a second container.wait().
     client = _FakeClient()
     drv = DockerSocketDriver(client=client, image="img:tag")
-    spec = EngineSpec(model_id="m1", model_arg="x", args=[], env={}, port=8001)
+    spec = EngineSpec(model_id="m1", model_arg="x", argv=["vllm", "serve"], env={}, port=8001)
     handle = await drv.spawn(spec)
     watcher = asyncio.ensure_future(handle.wait())  # simulate exit-watcher
     await drv.terminate(handle, grace_s=1.0)
@@ -302,7 +310,7 @@ async def test_terminate_reaps_poisoned_cancelled_wait_task():
     # Either way terminate() returns without raising and sets a returncode.
     client = _FakeClient()
     drv = DockerSocketDriver(client=client, image="img:tag")
-    spec = EngineSpec(model_id="m1", model_arg="x", args=[], env={}, port=8001)
+    spec = EngineSpec(model_id="m1", model_arg="x", argv=["vllm", "serve"], env={}, port=8001)
     handle = await drv.spawn(spec)
 
     # Simulate the exit-watcher's wait() that unload() cancelled: a memoized
@@ -332,7 +340,7 @@ async def test_wait_does_not_reuse_cancelled_task():
     # poisoned future, so the normal reap path still yields the exit code.
     client = _FakeClient()
     drv = DockerSocketDriver(client=client, image="img:tag")
-    spec = EngineSpec(model_id="m1", model_arg="x", args=[], env={}, port=8001)
+    spec = EngineSpec(model_id="m1", model_arg="x", argv=["vllm", "serve"], env={}, port=8001)
     handle = await drv.spawn(spec)
 
     async def _never():
@@ -353,13 +361,24 @@ async def test_wait_does_not_reuse_cancelled_task():
 
 def _read_log_with_retry(log_path, expected: bytes, *, tries=50, delay=0.05):
     # The log pump runs on a daemon thread; poll briefly for it to flush.
+    # Matched as a SUFFIX, not equality: since #234 the pump stamps a run
+    # sentinel line ahead of the container's own output.
     import time
 
     for _ in range(tries):
-        if log_path.exists() and log_path.read_bytes() == expected:
+        if log_path.exists() and log_path.read_bytes().endswith(expected):
             return log_path.read_bytes()
         time.sleep(delay)
     return log_path.read_bytes() if log_path.exists() else None
+
+
+def _split_sentinel(content: bytes) -> bytes:
+    """Strip the leading run-boundary sentinel, asserting it was there."""
+    from app.runtime.engine.run_marker import is_run_sentinel
+
+    head, _, rest = content.partition(b"\n")
+    assert is_run_sentinel(head.decode()), f"no run sentinel at head of {content!r}"
+    return rest
 
 
 @pytest.mark.asyncio
@@ -374,12 +393,12 @@ async def test_spawn_mirrors_container_logs_to_per_model_file(tmp_path):
     drv = DockerSocketDriver(
         client=client, image="img:tag", log_dir=str(tmp_path)
     )
-    spec = EngineSpec(model_id="m1", model_arg="x", args=[], env={}, port=8001)
+    spec = EngineSpec(model_id="m1", model_arg="x", argv=["vllm", "serve"], env={}, port=8001)
     handle = await drv.spawn(spec)
 
     log_path = tmp_path / "m1.log"
     content = _read_log_with_retry(log_path, b"".join(chunks))
-    assert content == b"".join(chunks)
+    assert _split_sentinel(content) == b"".join(chunks)
     # The driver must request the blocking follow stream of BOTH std streams.
     lk = handle._c.logs_kwargs
     assert lk == {
@@ -393,7 +412,7 @@ async def test_spawn_mirrors_container_logs_to_per_model_file(tmp_path):
 @pytest.mark.asyncio
 async def test_spawn_truncates_stale_log_file(tmp_path):
     # A fresh run must clear stale content — otherwise an operator sees the
-    # previous engine's log (this is the d5 "still v0.20.0" false reading).
+    # previous engine's log (this is the observed "still v0.20.0" false reading).
     log_path = tmp_path / "m1.log"
     log_path.write_bytes(b"STALE old-engine v0.20.0 output\n")
 
@@ -402,12 +421,12 @@ async def test_spawn_truncates_stale_log_file(tmp_path):
     drv = DockerSocketDriver(
         client=client, image="img:tag", log_dir=str(tmp_path)
     )
-    spec = EngineSpec(model_id="m1", model_arg="x", args=[], env={}, port=8001)
+    spec = EngineSpec(model_id="m1", model_arg="x", argv=["vllm", "serve"], env={}, port=8001)
     await drv.spawn(spec)
 
     content = _read_log_with_retry(log_path, b"".join(chunks))
     assert b"STALE" not in content
-    assert content == b"".join(chunks)
+    assert _split_sentinel(content) == b"".join(chunks)
 
 
 @pytest.mark.asyncio
@@ -417,7 +436,28 @@ async def test_spawn_without_log_dir_does_not_pump_logs(tmp_path):
     # and must NOT call container.logs() at all.
     client = _FakeClient(log_chunks=[b"should not be read\n"])
     drv = DockerSocketDriver(client=client, image="img:tag")
-    spec = EngineSpec(model_id="m1", model_arg="x", args=[], env={}, port=8001)
+    spec = EngineSpec(model_id="m1", model_arg="x", argv=["vllm", "serve"], env={}, port=8001)
     handle = await drv.spawn(spec)
     assert handle._c.logs_kwargs is None
     assert not (tmp_path / "m1.log").exists()
+
+
+@pytest.mark.asyncio
+async def test_spawn_splits_argv_into_entrypoint_and_command():
+    """argv[0] must reach docker as the ENTRYPOINT, not as the first arg.
+
+    The driver used to pass command=spec.args and rely on the engine image's
+    baked ENTRYPOINT to supply 'vllm serve'. Now that argv carries argv[0],
+    passing the whole vector as `command` would run 'vllm serve vllm serve
+    --model ...'. Setting entrypoint explicitly is also strictly more correct:
+    it no longer matters what the chosen image baked in.
+    """
+    client = _FakeClient()
+    driver = DockerSocketDriver(client=client, image="vllm/vllm-openai:v0.26.0")
+    spec = EngineSpec(model_id="m1", model_arg="org/m",
+                      argv=["vllm", "serve", "--model", "org/m"],
+                      env={}, port=10000, gpu_indices=[0])
+    await driver.spawn(spec)
+    kwargs = client.containers.run_kwargs
+    assert kwargs["entrypoint"] == "vllm"
+    assert kwargs["command"] == ["serve", "--model", "org/m"]

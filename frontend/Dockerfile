@@ -1,7 +1,23 @@
+# syntax=docker/dockerfile:1
 FROM node:20-alpine AS deps
 WORKDIR /app
-COPY package.json package-lock.json* ./
-RUN npm ci
+COPY package.json package-lock.json* .npmrc ./
+# The GitLab registry token arrives as a BuildKit secret (env= needs the
+# dockerfile 1.10+ frontend — hence the unpinned `1` syntax line). It is read
+# by npm for this RUN only and never lands in a layer.
+#
+# `required=true`: without it a build that forgot `--secret id=npm,...` mounts
+# an empty value and fails fast with "secret npm not found" instead of a late,
+# confusing npm E401 partway through the install.
+#
+# The npm cache is a BuildKit cache mount, not a layer: `npm ci` deletes and
+# recreates node_modules every time, so when this step IS invalidated (a
+# package-lock.json change) the tarballs are already local and only the
+# unpack cost remains. sharing=locked because npm's cache is not safe against
+# concurrent writers, and build:ui / publish:images can overlap on a runner.
+RUN --mount=type=secret,id=npm,env=NPM_TOKEN,required=true \
+    --mount=type=cache,target=/root/.npm,sharing=locked \
+    npm ci
 
 FROM node:20-alpine AS build
 WORKDIR /app
@@ -30,6 +46,16 @@ ARG VW_BUILD_SHA=unknown
 ENV NEXT_PUBLIC_VW_BUILD_VERSION=${VW_BUILD_VERSION} \
     NEXT_PUBLIC_VW_BUILD_SHA=${VW_BUILD_SHA}
 
+# PERFORMANCE NOTE, deliberately not "fixed". NEXT_PUBLIC_VW_BUILD_SHA changes
+# on every commit and is set immediately above this line, so this step is
+# invalidated on every commit even when `COPY . .` reports CACHED -- measured at
+# 53-70 s per build (job 228612). It cannot be reordered away: Next inlines
+# NEXT_PUBLIC_* into the client bundle AT BUILD TIME, so the value has to be in
+# the environment before `npm run build` runs, and moving the ENV after the
+# build would silently return the footer to the `dev · unknown` banner that #45
+# and #67 exist to prevent. Making the UI read its identity at runtime instead
+# would recover the 53-70 s, but that is a product change to how the version
+# banner works, not a build optimisation, and it belongs in its own MR.
 RUN mkdir -p public && npm run build
 
 FROM node:20-alpine AS runtime

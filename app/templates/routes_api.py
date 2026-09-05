@@ -4,7 +4,7 @@ Single read-only endpoint: ``GET /api/templates/engine-versions?channel=...``.
 Backs the try-stack panel's vLLM-version field with the published
 ``vllm/vllm-openai`` semver tags that actually resolve to an image.
 
-The channel → image family map (``app/templates/resolver.py``) decides
+The channel → image family map (``app/runtime/backends/vllm/images.py``) decides
 resolvability: every CUDA channel → ``vllm/vllm-openai``; rocm/cpu/xpu/unknown
 have no upstream tag scheme today and return an empty list (they already 400
 on try-stack, so the dropdown simply offers nothing). Docker Hub's anonymous
@@ -18,7 +18,7 @@ from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
 
 from app.auth.deps import require_jwt
-from app.templates.engine_versions import EngineVersionsCache, resolve_family
+from app.runtime.backends.vllm.versions import EngineVersionsCache, resolve_family
 
 router = APIRouter(prefix="/api/templates", tags=["templates"])
 

@@ -565,3 +565,119 @@ def test_fit_preview_propagates_hf_not_found(tmp_data_dir, client, monkeypatch):
     assert r.status_code == 404
     body = r.json()
     assert body["detail"]["error_code"] == "repo_not_found"
+
+
+# ---- Backend-aware budget + real KV shape --------------------------------
+#
+# Reported from a live install: gpt-oss-20b-Q8_0.gguf (11.28 GiB) showed
+# "won't fit" on a 16 GiB card with llama.cpp selected. Three separate errors
+# compounded -- vLLM's gpu_memory_utilization applied to a backend with no
+# such flag, `head_dim` derived (45) instead of read from the config (64),
+# and 12 sliding-attention layers charged the full 131072-token context.
+
+_GPT_OSS_CONFIG = {
+    "hidden_size": 2880,
+    "num_hidden_layers": 24,
+    "num_attention_heads": 64,
+    "num_key_value_heads": 8,
+    "max_position_embeddings": 131072,
+    "torch_dtype": "bfloat16",
+    "head_dim": 64,
+    "sliding_window": 128,
+    "layer_types": [
+        "sliding_attention" if i % 2 == 0 else "full_attention" for i in range(24)
+    ],
+}
+
+
+def _gpt_oss_info():
+    return FakeModelInfo(
+        id="openai/gpt-oss-20b-GGUF",
+        siblings=[
+            FakeSibling("gpt-oss-20b-Q8_0.gguf", int(11.28 * GIB)),
+            FakeSibling("config.json", 1024),
+        ],
+    )
+
+
+def _post_fit(client, auth, **over):
+    body = {
+        "repo_id": "openai/gpt-oss-20b-GGUF",
+        "filename": "gpt-oss-20b-Q8_0.gguf",
+        "gpu_indices": [0],
+        "gpu_memory_utilization": 0.9,
+    }
+    body.update(over)
+    return client.post("/api/models/fit-preview", json=body,
+                       headers={**auth, **csrf_header(client)})
+
+
+def _setup(tmp_data_dir, client, monkeypatch):
+    client.get("/healthz")
+    _seed_done(tmp_data_dir / "vllm-warden.db")
+    auth = _jwt_login(client)
+    _install_fake_discover(monkeypatch, info=_gpt_oss_info(), config=_GPT_OSS_CONFIG)
+    _install_fake_gpus(client, [
+        _FakeGpuLive(index=0, name="Quadro RTX 5000", memory_total_mib=16384,
+                     compute_cap=7.5),
+    ])
+    return auth
+
+
+def test_llamacpp_is_not_charged_vllms_gpu_memory_utilization(
+    tmp_data_dir, client, monkeypatch
+):
+    """llama-server has no gpu_memory_utilization flag, so 0.9 must not apply.
+
+    The operator's value is still in the payload -- the dialog always sends
+    it -- and must be ignored rather than silently shrinking the card by 10%.
+    """
+    auth = _setup(tmp_data_dir, client, monkeypatch)
+
+    llama = _post_fit(client, auth, backend="llamacpp").json()
+    vllm = _post_fit(client, auth, backend="vllm").json()
+
+    # Same card, same weights, same KV -- the ONLY difference is the cap.
+    assert llama["breakdown"]["total_vram"] == vllm["breakdown"]["total_vram"]
+    assert llama["breakdown"]["kv_reserve"] == vllm["breakdown"]["kv_reserve"]
+    assert llama["breakdown"]["weights_budget"] > vllm["breakdown"]["weights_budget"]
+
+    # And the reported defect: it fits on llama.cpp.
+    assert vllm["verdict"] != "green"
+    assert llama["verdict"] != "red", (
+        "11.28 GiB of weights on a 16 GiB card is not 'won't fit' for an "
+        "engine that does not reserve a fractional cap"
+    )
+
+
+def test_fit_preview_defaults_to_vllm_when_backend_is_omitted(
+    tmp_data_dir, client, monkeypatch
+):
+    """Back-compat: an older client that sends no `backend` is unchanged."""
+    auth = _setup(tmp_data_dir, client, monkeypatch)
+    omitted = _post_fit(client, auth).json()
+    explicit = _post_fit(client, auth, backend="vllm").json()
+    assert omitted["breakdown"] == explicit["breakdown"]
+    assert omitted["verdict"] == explicit["verdict"]
+
+
+def test_fit_preview_rejects_an_unknown_backend(tmp_data_dir, client, monkeypatch):
+    """Refuse rather than silently pricing the model for the wrong engine."""
+    auth = _setup(tmp_data_dir, client, monkeypatch)
+    r = _post_fit(client, auth, backend="not-a-backend")
+    assert r.status_code == 422
+    assert r.json()["detail"]["error_code"] == "unknown_backend"
+
+
+def test_kv_reserve_reads_head_dim_and_discounts_sliding_layers(
+    tmp_data_dir, client, monkeypatch
+):
+    """The KV term must reflect the config, not a derivation of it.
+
+    12 of the 24 layers slide with a 128-token window; the other 12 hold the
+    full 131072. Per layer per token = 2 * 8 * 64 * 2 = 2048 bytes.
+    """
+    auth = _setup(tmp_data_dir, client, monkeypatch)
+    body = _post_fit(client, auth, backend="llamacpp").json()
+    expected = 2048 * (12 * 131072 + 12 * 128)
+    assert body["breakdown"]["kv_reserve"] == expected

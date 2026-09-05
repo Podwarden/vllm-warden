@@ -86,7 +86,7 @@ describe('HeaderMetrics', () => {
     expect(screen.getByTestId('header-metrics-gpu-pct').textContent).toContain(
       '87',
     );
-    expect(screen.getByTestId('header-metrics-model')).toHaveTextContent('idle');
+    expect(screen.getByTestId('header-metrics-models')).toHaveTextContent('idle');
   });
 
   it('shows the active model name when one is loaded and switches to emerald', () => {
@@ -96,7 +96,7 @@ describe('HeaderMetrics', () => {
       errorCode: null,
     };
     render(<HeaderMetrics />);
-    expect(screen.getByTestId('header-metrics-model')).toHaveTextContent(
+    expect(screen.getByTestId('header-metrics-models')).toHaveTextContent(
       'gpt-oss-20b',
     );
     // Accent + dot both carry the emerald color when a model is loaded.
@@ -117,7 +117,7 @@ describe('HeaderMetrics', () => {
       errorCode: null,
     };
     render(<HeaderMetrics />);
-    expect(screen.getByTestId('header-metrics-model')).toHaveTextContent(
+    expect(screen.getByTestId('header-metrics-models')).toHaveTextContent(
       'loading',
     );
     const root = screen.getByTestId('header-metrics');
@@ -136,7 +136,7 @@ describe('HeaderMetrics', () => {
       errorCode: null,
     };
     render(<HeaderMetrics />);
-    expect(screen.getByTestId('header-metrics-model')).toHaveTextContent(
+    expect(screen.getByTestId('header-metrics-models')).toHaveTextContent(
       'error',
     );
     const root = screen.getByTestId('header-metrics');
@@ -171,7 +171,7 @@ describe('HeaderMetrics', () => {
       errorCode: null,
     };
     render(<HeaderMetrics />);
-    expect(screen.getByTestId('header-metrics-model')).toHaveTextContent(
+    expect(screen.getByTestId('header-metrics-models')).toHaveTextContent(
       'gpt-oss-20b',
     );
     const root = screen.getByTestId('header-metrics');
@@ -215,7 +215,7 @@ describe('HeaderMetrics', () => {
     const root = screen.getByTestId('header-metrics');
     expect(root).toHaveAttribute('data-status', 'terminal-error');
     expect(root.className).toContain('text-red-400');
-    expect(screen.getByTestId('header-metrics-model')).toHaveTextContent(
+    expect(screen.getByTestId('header-metrics-models')).toHaveTextContent(
       'offline',
     );
     // Percentages drop to the "--" placeholder so the operator doesn't

@@ -30,6 +30,14 @@ type ParallelismStrategy = "auto" | "tp" | "pp";
 const MAX_BATCH_SIZE_MIN = 1;
 const MAX_BATCH_SIZE_MAX = 64;
 
+// The image channel an engine-version pin resolves against. `resolve_image`
+// needs (channel, version) as a pair -- a version on its own is stored and
+// never turned into an image. The wizard offers only the stable channel: the
+// other two exist for the Try-stack panel's trial-and-error loop, which is
+// where an operator goes when stable has already failed. Adding a channel
+// dropdown here would ask a question nobody creating a model can answer yet.
+const ENGINE_CHANNEL = "cuda-stable";
+
 // Mirror app/models/schemas.py:SLUG_RE so the user gets immediate feedback
 // without round-tripping a malformed request through the API. Backend is
 // still the source of truth — these client checks are a UX nicety, not a
@@ -46,10 +54,36 @@ type FileKind =
   | "safetensors_single"
   | "safetensors_sharded"
   | "gguf"
+  // Sub-project C. A multimodal projector is a GGUF, but it is NOT weights:
+  // llama.cpp takes it via --mmproj alongside -m. Deliberately absent from
+  // isWeightsFile, so it never appears in the weights radio -- picking it there
+  // produces a load failure that reads like a corrupt download.
+  | "mmproj"
   | "pytorch_bin"
   | "config"
   | "tokenizer"
   | "other";
+
+/** Which engine serves a model. Mirrors ModelCreate.backend's Literal. */
+type BackendName = "vllm" | "llamacpp";
+
+/**
+ * Decision D6's pre-selection rule, stated once.
+ *
+ * A `.gguf` weights file PRE-SELECTS llama.cpp -- in this wizard only. It is
+ * never persisted logic and never a server-side inference, and the caller
+ * applies it only while the operator has not chosen: a GGUF that vLLM can also
+ * serve must stay available to vLLM for throughput.
+ *
+ * BOTH selection paths go through this, and that is the point. The wizard picks
+ * a first weights file automatically on discovery, so a rule applied only in
+ * the click handler would leave a GGUF repo showing "vLLM" until the operator
+ * happened to click a DIFFERENT file -- the pre-selection would be invisible in
+ * exactly the common case it exists for.
+ */
+function backendForFilename(filename: string): BackendName {
+  return filename.toLowerCase().endsWith(".gguf") ? "llamacpp" : "vllm";
+}
 
 interface DiscoveredFile {
   filename: string;
@@ -70,6 +104,35 @@ interface DiscoveryWarning {
   type: "gguf_arch_unsupported" | "gguf_arch_unknown";
   filename: string;
   arch: string | null;
+}
+
+/** One entry of GET /api/system/backends. Only the fields this dialog reads. */
+interface BackendCapability {
+  name: string;
+  display_name: string;
+  /** The engine version baked into THIS warden image; null outside a build. */
+  version: string | null;
+  /** The ENGINE fact. Deliberately unused here — see the useSWR comment. */
+  supports_version_pin: boolean;
+  /** The DEPLOYMENT fact. This is the one a control is gated on. */
+  version_pin_available: boolean;
+  /** Non-null exactly when `version_pin_available` is false. */
+  version_pin_reason: string | null;
+  /**
+   * null = this backend honours the operator's gpu_memory_utilization.
+   * A number = it has no such flag and uses that fraction of the card.
+   * Mirrors BackendCapabilities.vram_cap_fraction; must match what
+   * /api/models/fit-preview used, or the client-side budget recompute
+   * disagrees with the badge the server produced.
+   */
+  vram_cap_fraction: number | null;
+}
+
+interface BackendsResponse {
+  default: string;
+  driver: string;
+  engine_version: string | null;
+  backends: BackendCapability[];
 }
 
 interface DiscoveryResultDict {
@@ -178,11 +241,30 @@ export function AddModelModal({ open, onClose }: AddModelModalProps) {
   // backend resolves the remaining knobs (dtype, TP size, GMU, engine combo)
   // from the stored template.
   const [templateId, setTemplateId] = useState("");
+  // Sub-project C: WHICH ENGINE serves this model. `vllm` is the persisted
+  // default (decision D6) -- a client that never chooses behaves exactly as
+  // before. `backendTouched` is what makes the .gguf rule a SUGGESTION rather
+  // than a policy: once the operator has answered, changing the weights file
+  // must not silently undo "serve this GGUF on vLLM for the throughput".
+  const [backend, setBackend] = useState<BackendName>("vllm");
+  const [backendTouched, setBackendTouched] = useState(false);
+  // llama.cpp only. The multimodal projector GGUF that sits beside the weights
+  // in the same repo; llama-server takes it as a separate --mmproj file.
+  const [mmprojFilename, setMmprojFilename] = useState("");
   const [authRequired, setAuthRequired] = useState<DiscoverErrorDetail | null>(null);
   const [discovery, setDiscovery] = useState<DiscoveryResultDict | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [gpus, setGpus] = useState<GpuInfo[]>([]);
+  // The setup wizard's `allowed_gpu_indices`, from GET /api/system/gpus. null
+  // means "none recorded" -- no restriction -- which is deliberately NOT the
+  // same as an empty list.
+  const [allowedGpuIndices, setAllowedGpuIndices] = useState<number[] | null>(null);
   const [selectedGpus, setSelectedGpus] = useState<Set<number>>(new Set());
+  // Engine version pin. Only ever sent when the ACTIVE backend's
+  // `version_pin_available` is true on this deployment; see the Engine version
+  // block in the render for why gating on `supports_version_pin` instead would
+  // reintroduce #177.
+  const [engineVersion, setEngineVersion] = useState("");
   const [selectedFilename, setSelectedFilename] = useState<string | null>(null);
   const [fitByFilename, setFitByFilename] = useState<Record<string, FitPreviewResponse>>({});
   const [fitInFlight, setFitInFlight] = useState<Set<string>>(new Set());
@@ -259,11 +341,16 @@ export function AddModelModal({ open, onClose }: AddModelModalProps) {
     setHfRepo("");
     setHfRevision("main");
     setTemplateId("");
+    setBackend("vllm");
+    setBackendTouched(false);
+    setMmprojFilename("");
     setName("");
     setAuthRequired(null);
     setDiscovery(null);
     setError(null);
     setSelectedGpus(new Set());
+    setAllowedGpuIndices(null);
+    setEngineVersion("");
     setSelectedFilename(null);
     setFitByFilename({});
     setFitInFlight(new Set());
@@ -281,6 +368,33 @@ export function AddModelModal({ open, onClose }: AddModelModalProps) {
     open ? "/api/models/templates" : null,
     authFetchJSON,
   );
+
+  // Which engines this build has, and what the ACTIVE driver lets each of them
+  // do. Two version-pin fields ship and they disagree on the deployment this
+  // was reported from:
+  //
+  //   supports_version_pin   the ENGINE fact  -- can this engine be pinned?
+  //   version_pin_available  the DEPLOYMENT fact -- can this driver honour it?
+  //
+  // Gate on the SECOND. Gating on the first lights up a selector on a box that
+  // cannot swap the image, which is #177 verbatim. `version_pin_reason` is the
+  // server's sentence for the disabled state -- the frontend cannot write it,
+  // because it cannot tell whether the obstacle is the driver or the backend.
+  const { data: backendCaps } = useSWR<BackendsResponse>(
+    open ? "/api/system/backends" : null,
+    authFetchJSON,
+  );
+  const activeBackendCaps = backendCaps?.backends.find((b) => b.name === backend) ?? null;
+  // The VRAM cap fraction the SELECTED backend actually imposes. Falls back to
+  // GMU when the capability list has not loaded yet, which matches the server
+  // default (vLLM) rather than inventing a more generous number.
+  const effectiveCapFraction =
+    activeBackendCaps?.vram_cap_fraction ?? GMU;
+  // While loading (undefined) do NOT disable: the same no-flash rule
+  // try-stack-panel.tsx follows. Only a known `false` locks the control.
+  const versionPinDisabled = activeBackendCaps
+    ? activeBackendCaps.version_pin_available === false
+    : false;
 
   // Apply (or clear) a template selection. Prefills the wizard fields the
   // enter-repo stage manages directly (repo, revision, max_model_len) and
@@ -390,6 +504,10 @@ export function AddModelModal({ open, onClose }: AddModelModalProps) {
       if (firstWeights) {
         setSelectedFilename(firstWeights.filename);
         setName(deriveServedName(hfRepo, firstWeights.filename));
+        // D6's pre-selection has to run here too, not only in the click
+        // handler: this IS the selection for a repo the operator does not
+        // re-click, which is the common case.
+        setBackend(backendForFilename(firstWeights.filename));
       }
       // Best-effort load GPUs in parallel with the discovery transition.
       // `/api/system/gpus` already has a 2 s TTL cache server-side. The
@@ -397,16 +515,29 @@ export function AddModelModal({ open, onClose }: AddModelModalProps) {
       // a later screen we still want gpus seeded for the open session,
       // so we only gate on openGen (a Cancel-then-reopen would have
       // bumped it).
-      authFetchJSON<{ gpus: GpuInfo[]; probed_at: string; probe_error: string | null }>(
-        "/api/system/gpus",
-      )
+      authFetchJSON<{
+        gpus: GpuInfo[];
+        probed_at: string;
+        probe_error: string | null;
+        // The setup wizard's allowlist. null = none recorded = no restriction;
+        // NOT the same as [].
+        allowed_indices?: number[] | null;
+      }>("/api/system/gpus")
         .then((resp) => {
           if (openGenRef.current !== gen) return;
           const list = resp.gpus ?? [];
+          const allowed = resp.allowed_indices ?? null;
           setGpus(list);
-          // Default selection = GPU 0 (or first available) so the fit row
-          // has a non-zero budget on first paint.
-          if (list.length > 0) setSelectedGpus(new Set([list[0].index]));
+          setAllowedGpuIndices(allowed);
+          // Default selection = the first SELECTABLE GPU, so the fit row has a
+          // non-zero budget on first paint. It used to be `list[0].index`
+          // unconditionally, which on a deployment whose allowlist excludes
+          // GPU 0 pre-filled a form the server was always going to 400.
+          const selectable =
+            allowed === null ? list : list.filter((g) => allowed.includes(g.index));
+          if (selectable.length > 0) {
+            setSelectedGpus(new Set([selectable[0].index]));
+          }
         })
         .catch(() => {
           if (openGenRef.current !== gen) return;
@@ -414,6 +545,7 @@ export function AddModelModal({ open, onClose }: AddModelModalProps) {
           // backend POST /api/models will surface the real validation
           // error if their pick isn't in `allowed_gpu_indices`.
           setGpus([]);
+          setAllowedGpuIndices(null);
         });
       setStage("select-file");
     } catch (err) {
@@ -483,6 +615,10 @@ export function AddModelModal({ open, onClose }: AddModelModalProps) {
           filename,
           gpu_indices: gpuIndices,
           gpu_memory_utilization: GMU,
+          // The verdict is about a specific engine. Without this the server
+          // defaults to vLLM and applies GMU to a llama.cpp row, which is
+          // what made an 11.28 GiB GGUF read "won't fit" on a 16 GiB card.
+          backend,
         };
         if (includeBatch) body.max_batch_size = batchN;
         if (includeLen) body.max_model_len = lenN;
@@ -523,7 +659,7 @@ export function AddModelModal({ open, onClose }: AddModelModalProps) {
     // operator's latest overrides — debounced refetch on either change is
     // wired in the effect below.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [hfRepo, hfRevision, maxBatchSize, maxModelLen],
+    [hfRepo, hfRevision, maxBatchSize, maxModelLen, backend],
   );
 
   // First-paint fit-preview for the auto-selected weights file. Runs when
@@ -553,6 +689,20 @@ export function AddModelModal({ open, onClose }: AddModelModalProps) {
   // five times during typing. The first render of this effect is skipped
   // via `advancedRefetchInitialRender` so it doesn't double-fire with the
   // first-paint effect above on stage transition.
+  // Switching engine invalidates every cached verdict. `fitByFilename` is
+  // keyed by filename alone, so without this the badge keeps showing the
+  // answer for the PREVIOUS backend -- the wrong number, rendered with full
+  // confidence, which is worse than the dash on an unevaluated row. Dropping
+  // the cache lets the first-paint effect above refetch for the new engine.
+  const backendRefetchInitialRender = useRef(true);
+  useEffect(() => {
+    if (backendRefetchInitialRender.current) {
+      backendRefetchInitialRender.current = false;
+      return;
+    }
+    setFitByFilename({});
+  }, [backend]);
+
   const advancedRefetchInitialRender = useRef(true);
   useEffect(() => {
     if (advancedRefetchInitialRender.current) {
@@ -587,14 +737,22 @@ export function AddModelModal({ open, onClose }: AddModelModalProps) {
     const totalVram = (Array.isArray(gpus) ? gpus : [])
       .filter((g) => selectedGpus.has(g.index))
       .reduce((acc, g) => acc + g.memory_total_mib * MIB, 0);
-    const cap = Math.floor(totalVram * GMU);
+    const cap = Math.floor(totalVram * effectiveCapFraction);
     if (!cached) return cap; // pre-server case: no KV reserve known yet
     return cap - cached.breakdown.kv_reserve;
-  }, [selectedFilename, fitByFilename, gpus, selectedGpus]);
+  }, [selectedFilename, fitByFilename, gpus, selectedGpus, effectiveCapFraction]);
 
   function pickFilename(filename: string) {
     setSelectedFilename(filename);
     setName(deriveServedName(hfRepo, filename));
+    // D6: a .gguf PRE-SELECTS llama.cpp -- in this wizard only. It is never
+    // persisted logic and never a server-side inference, and it is always
+    // overridable, because a GGUF that vLLM can also serve must stay available
+    // to vLLM for throughput. Sub-project E adds the compatibility verdicts
+    // that make this pre-selection intelligent; C stops at the suggestion.
+    if (!backendTouched) {
+      setBackend(backendForFilename(filename));
+    }
   }
 
   async function submit(e: React.FormEvent) {
@@ -655,9 +813,27 @@ export function AddModelModal({ open, onClose }: AddModelModalProps) {
       gpu_indices: Array.from(selectedGpus).sort((a, b) => a - b),
       filename: selectedFilename,
       parallelism_strategy: parallelismStrategy,
+      backend,
     };
+    // llama.cpp only, and only when the operator picked one. Absent stays
+    // absent so the column keeps its NULL rather than an empty string.
+    if (backend === "llamacpp" && mmprojFilename) {
+      body.mmproj_filename = mmprojFilename;
+    }
     if (parsedBatch !== null) body.max_batch_size = parsedBatch;
     if (parsedMaxModelLen !== null) body.max_model_len = parsedMaxModelLen;
+    // Engine version pin. Sent ONLY when this deployment can honour it --
+    // `versionPinDisabled` is derived from `version_pin_available`, the
+    // deployment fact. Sending a pin the driver will discard is precisely the
+    // silent no-op the two-field capability split exists to prevent, and the
+    // backend refuses it anyway. The channel travels with it because
+    // `resolve_image` needs both to produce an image; a version alone is
+    // stored and never resolved.
+    const trimmedEngineVersion = engineVersion.trim();
+    if (!versionPinDisabled && trimmedEngineVersion !== "") {
+      body.engine_vllm_version = trimmedEngineVersion;
+      body.engine_channel = ENGINE_CHANNEL;
+    }
     // #162 — forward the chosen template so the backend resolves dtype / TP
     // size / GMU / engine combo from the stored template. Empty == Custom,
     // which omits the field and keeps the legacy direct-create path.
@@ -843,8 +1019,21 @@ export function AddModelModal({ open, onClose }: AddModelModalProps) {
           gpus={gpus}
           selectedGpus={selectedGpus}
           onGpusChange={setSelectedGpus}
+          allowedGpuIndices={allowedGpuIndices}
           selectedFilename={selectedFilename}
           onPickFilename={pickFilename}
+          backend={backend}
+          onBackendChange={(b) => {
+            setBackend(b);
+            setBackendTouched(true);
+          }}
+          engineVersion={engineVersion}
+          onEngineVersionChange={setEngineVersion}
+          engineVersionDisabled={versionPinDisabled}
+          engineVersionReason={activeBackendCaps?.version_pin_reason ?? null}
+          engineVersionRunning={activeBackendCaps?.version ?? null}
+          mmprojFilename={mmprojFilename}
+          onMmprojFilenameChange={setMmprojFilename}
           fitByFilename={fitByFilename}
           liveBudget={liveBudget}
           showGgufWarn={showGguf}
@@ -932,8 +1121,23 @@ interface SelectFileStageProps {
   gpus: GpuInfo[];
   selectedGpus: Set<number>;
   onGpusChange: (s: Set<number>) => void;
+  /** Setup's `allowed_gpu_indices`; null = none recorded = no restriction. */
+  allowedGpuIndices: number[] | null;
   selectedFilename: string | null;
   onPickFilename: (f: string) => void;
+  backend: BackendName;
+  onBackendChange: (b: BackendName) => void;
+  // Engine version pin, for the SELECTED backend. `engineVersionDisabled`
+  // comes from `version_pin_available` (the deployment fact) and
+  // `engineVersionReason` is the server's explanation for it.
+  engineVersion: string;
+  onEngineVersionChange: (v: string) => void;
+  engineVersionDisabled: boolean;
+  engineVersionReason: string | null;
+  /** The version this warden image actually runs, for the placeholder. */
+  engineVersionRunning: string | null;
+  mmprojFilename: string;
+  onMmprojFilenameChange: (v: string) => void;
   fitByFilename: Record<string, FitPreviewResponse>;
   liveBudget: number;
   showGgufWarn: boolean;
@@ -963,8 +1167,18 @@ function SelectFileStage({
   gpus,
   selectedGpus,
   onGpusChange,
+  allowedGpuIndices,
   selectedFilename,
   onPickFilename,
+  backend,
+  onBackendChange,
+  engineVersion,
+  onEngineVersionChange,
+  engineVersionDisabled,
+  engineVersionReason,
+  engineVersionRunning,
+  mmprojFilename,
+  onMmprojFilenameChange,
   fitByFilename,
   liveBudget,
   showGgufWarn,
@@ -987,6 +1201,14 @@ function SelectFileStage({
   // complete picture of the repo, just non-selectable + dimmed.
   const rows = discovery.files;
 
+  // Only `mmproj`-kind files (app/models/discovery.py classifies them). A
+  // projector is a GGUF but it is NOT weights, so it is excluded from the
+  // weights radio by isWeightsFile and offered here instead.
+  const mmprojCandidates = useMemo(
+    () => rows.filter((f) => f.kind === "mmproj"),
+    [rows],
+  );
+
   // #112: group sharded safetensors / GGUF into a single "family" row with a
   // disclosure-triangle that expands to individual shards. The fit-preview is
   // computed against the family's representative shard (shard-00001) — the
@@ -1002,11 +1224,22 @@ function SelectFileStage({
   // catch-all GGUF banner). Map preserves insertion order; an array is fine.
   const warningsByFilename = useMemo(() => {
     const m = new Map<string, DiscoveryWarning>();
+    // The other half of the gate 200 lines below. `gguf_arch_unsupported` is
+    // measured against KNOWN_GGUF_ARCHES, which is vLLM's GGUF-loader
+    // allowlist -- so on llama.cpp it is not a weaker warning, it is a
+    // statement about a loader that is not being used. GGUF is llama.cpp's
+    // native format; ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF serves on it while
+    // sitting outside that allowlist.
+    //
+    // Gating here rather than at the two render sites keeps `backend` out of
+    // ShardFamilyRows and FileRow: this map is the only way a warning reaches
+    // either of them.
+    if (backend !== "vllm") return m;
     for (const w of discovery.warnings ?? []) {
       m.set(w.filename, w);
     }
     return m;
-  }, [discovery.warnings]);
+  }, [discovery.warnings, backend]);
 
   // VRAM cap (`total_vram * GMU`) for the currently-selected GPUs, mirrored
   // from the modal's `vramBudget()` helper. The cap differs from `liveBudget`
@@ -1092,7 +1325,116 @@ function SelectFileStage({
         </div>
       </div>
 
-      {showGgufWarn && (discovery.warnings?.length ?? 0) === 0 && (
+      {/* Backend ------------------------------------------------------
+          Rendered BELOW the file table, not beside the template picker: the
+          backend is a CONSEQUENCE of the model (design spec §9.1), so it has to
+          appear after the file is chosen rather than as a question asked first. */}
+      <div>
+        <label
+          htmlFor="backend-select"
+          className="text-xs uppercase tracking-wide text-slate-500"
+        >
+          Engine
+        </label>
+        <select
+          id="backend-select"
+          data-testid="backend-select"
+          value={backend}
+          onChange={(e) => onBackendChange(e.target.value as BackendName)}
+          className="mt-1 w-full rounded-md border border-slate-700 bg-slate-900 px-2 py-1.5 text-sm text-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500"
+        >
+          <option value="vllm">vLLM</option>
+          <option value="llamacpp">llama.cpp</option>
+        </select>
+        <p className="mt-1 text-[11px] text-slate-500">
+          {backend === "llamacpp"
+            ? "llama.cpp serves a single .gguf file. It splits a multi-GPU model by layer rather than by tensor, so vLLM remains the choice when throughput across several cards matters."
+            : "vLLM is the default. It serves safetensors and GGUF, and is the only backend here with tensor-parallel multi-GPU."}
+        </p>
+      </div>
+
+      {/* Engine version ----------------------------------------------
+          Gated on `version_pin_available` -- what THIS deployment can honour --
+          never on `supports_version_pin`, which is true for both engines and
+          would light up a control that silently does nothing (#177).
+
+          Disabled-and-explained rather than hidden: "can this be pinned here?"
+          is a question the operator is entitled to a stated answer to, and the
+          answer differs by backend and by driver. The sentence comes from the
+          server, which is the only party that knows whether the obstacle is
+          the driver or the engine. */}
+      <div>
+        <label
+          htmlFor="engine-version"
+          className="text-xs uppercase tracking-wide text-slate-500"
+        >
+          Engine version
+        </label>
+        <Input
+          id="engine-version"
+          data-testid="engine-version"
+          value={engineVersion}
+          onChange={(e) => onEngineVersionChange(e.target.value)}
+          disabled={engineVersionDisabled}
+          placeholder={engineVersionRunning ?? ""}
+          aria-describedby="engine-version-note"
+          className="mt-1"
+        />
+        <p
+          id="engine-version-note"
+          data-testid="engine-version-note"
+          className={
+            "mt-1 text-[11px] " +
+            (engineVersionDisabled ? "text-amber-300" : "text-slate-500")
+          }
+        >
+          {engineVersionDisabled
+            ? engineVersionReason ??
+              "This deployment cannot pin an engine version."
+            : `Leave blank to use the version this warden runs${
+                engineVersionRunning ? ` (${engineVersionRunning})` : ""
+              }.`}
+        </p>
+      </div>
+
+      {/* Multimodal projector, llama.cpp only -------------------------
+          Only `mmproj`-kind files are offered: a projector is a GGUF but it is
+          not weights, and llama.cpp takes it via --mmproj alongside -m. */}
+      {backend === "llamacpp" && mmprojCandidates.length > 0 && (
+        <div>
+          <label
+            htmlFor="mmproj-select"
+            className="text-xs uppercase tracking-wide text-slate-500"
+          >
+            Vision projector
+          </label>
+          <select
+            id="mmproj-select"
+            data-testid="mmproj-select"
+            value={mmprojFilename}
+            onChange={(e) => onMmprojFilenameChange(e.target.value)}
+            className="mt-1 w-full rounded-md border border-slate-700 bg-slate-900 px-2 py-1.5 text-sm text-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500"
+          >
+            <option value="">(none)</option>
+            {mmprojCandidates.map((f) => (
+              <option key={f.filename} value={f.filename}>
+                {f.filename}
+              </option>
+            ))}
+          </select>
+          <p className="mt-1 text-[11px] text-slate-500">
+            Needed for image input. Pulled alongside the weights; a vision model
+            started without it loads, serves, and silently ignores every image.
+          </p>
+        </div>
+      )}
+
+      {/* Gated on the vLLM backend: both banners are statements about VLLM's
+          loader ("vLLM-known GGUF allowlist", "verify vLLM supports this
+          GGUF"), and both are false and confusing next to a llama.cpp
+          selection. Sub-project E replaces them with a real per-backend
+          verdict strip; C's job is only to stop showing the wrong one. */}
+      {backend === "vllm" && showGgufWarn && (discovery.warnings?.length ?? 0) === 0 && (
         <div
           role="alert"
           data-testid="gguf-warn"
@@ -1111,6 +1453,7 @@ function SelectFileStage({
             gpus={gpus}
             selected={Array.from(selectedGpus).sort((a, b) => a - b)}
             onChange={(next) => onGpusChange(new Set(next))}
+            allowedIndices={allowedGpuIndices}
           />
         </div>
       </div>
@@ -1383,15 +1726,10 @@ function ArchWarningBanner({ warning }: { warning: DiscoveryWarning }) {
       className="rounded-md border border-amber-700 bg-amber-900/20 px-2 py-1.5 text-[11px] text-amber-200"
     >
       {message}{" "}
-      <a
-        href="/docs/operating.md#supported-gguf-architectures"
-        target="_blank"
-        rel="noreferrer"
-        className="underline hover:text-amber-100"
-        data-testid="gguf-arch-warning-doc-link"
-      >
-        See supported architectures.
-      </a>
+      <span data-testid="gguf-arch-warning-remedy">
+        GGUF is llama.cpp&apos;s native format — switching this model&apos;s
+        engine to llama.cpp skips the vLLM allowlist entirely.
+      </span>
     </div>
   );
 }

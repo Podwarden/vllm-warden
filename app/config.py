@@ -35,7 +35,7 @@ class Settings:
     # POST /v1/completions before marking the load failed. Closes the
     # window between /health 200 and actual serving readiness (e.g.
     # Qwen3-VL's _warmup_mm_processor). Configurable via env override.
-    warmup_probe_timeout_s: float = 60.0
+    warmup_probe_timeout_s: float = 600.0
     # Server-side wall-clock backstop for a single proxied request (streaming
     # or not). 0.0 = disabled (default; behaviour-identical to pre-reaper).
     # When > 0, a streamed generation that has run longer than this many
@@ -51,6 +51,12 @@ class Settings:
     session_refresh_ttl_days: int = 7
     allowed_origins: tuple[str, ...] = ("http://localhost:3000",)
     trust_proxy_origin: bool = False
+    # When no origin is configured, accept the origin this request was actually
+    # addressed to (see app/auth/origin.py). Defaults False so the documented
+    # Settings-level guarantee below still holds: constructing
+    # Settings(allowed_origins=()) blocks every origin. Only load_settings
+    # turns this on, and only when the operator configured nothing.
+    derive_origin_from_request: bool = False
     sse_ticket_ttl_seconds: int = 60
     # #160 — which engine driver Supervisor uses to run the vLLM engine.
     # "local" = in-container subprocess (default, behaviour-identical to
@@ -126,6 +132,11 @@ class Settings:
     # with it -- the 2026-06-15 ENOSPC incident.
     engine_log_max_bytes: int = 32 * 1024 * 1024
 
+    # --- Chat2 attachments (2026-08-23) ------------------------------------
+    chat_quota_user_bytes: int = 2 * 1024**3
+    chat_quota_free_floor_bytes: int = 5 * 1024**3
+    chat_attachment_ttl_days: int = 90
+
     @property
     def db_path(self) -> Path:
         return self.data_dir / "vllm-warden.db"
@@ -155,18 +166,39 @@ def load_settings() -> Settings:
     if not secret or len(secret) < 32:
         raise RuntimeError("VW_COOKIE_SECRET must be set and >=32 chars")
     gpu_count = int(os.environ.get("VW_CONTAINER_GPU_COUNT", "0"))
-    raw_origins = os.environ.get("VW_FRONTEND_ORIGIN", "http://localhost:3000")
-    # An explicitly-empty VW_FRONTEND_ORIGIN ("" or whitespace/commas only)
-    # parses to () and falls back to the localhost default here — by design,
-    # so a blank-but-set env var doesn't silently lock admins out of refresh.
-    # This is NOT a fail-open hole: the fail-closed contract lives at the
-    # Settings level — constructing Settings(allowed_origins=()) directly (with
-    # trust_proxy_origin=False) still blocks every origin. Env-parse leniency
-    # and the Settings-level fail-closed guarantee are deliberately separate.
-    allowed_origins = _parse_origins(raw_origins) or ("http://localhost:3000",)
+    # `None` when unset, distinct from a set-but-blank value. Both mean "not
+    # configured" here, but reading it with a default would make an unset var
+    # look configured and silently disable derivation.
+    raw_origins = os.environ.get("VW_FRONTEND_ORIGIN") or ""
+    # An unset or explicitly-empty VW_FRONTEND_ORIGIN means "nobody told us our
+    # public URL" — the normal state behind a reverse proxy, since nothing in
+    # the deploy flow knows it at container-build time.
+    #
+    # The localhost fallback STAYS, because local development is genuinely
+    # cross-origin: the frontend dev server runs on :3000 while this API is on
+    # :8080, so the browser's Origin never equals the host it addressed and
+    # derivation alone would reject every dev request.
+    #
+    # What the fallback could not do is serve a proxied install, where
+    # localhost is never the browser's origin — so every request carrying a
+    # real Origin was 403'd and every page reload logged the operator out. The
+    # old comment claimed this fallback existed so a blank value would not
+    # "silently lock admins out of refresh"; it did precisely that.
+    #
+    # So derivation is added ALONGSIDE it rather than replacing it: an
+    # unconfigured deployment accepts both the dev origin and whatever host it
+    # is actually served on. Configuring VW_FRONTEND_ORIGIN is a deliberate act
+    # — that allowlist is then honoured exactly, with derivation off.
+    #
+    # The Settings-level fail-closed guarantee is unchanged: constructing
+    # Settings(allowed_origins=()) directly — with derive_origin_from_request
+    # and trust_proxy_origin both False — still blocks every origin.
+    configured = _parse_origins(raw_origins)
+    derive_origin_from_request = not configured
+    allowed_origins = configured or ("http://localhost:3000",)
     trust_proxy_origin = _truthy(os.environ.get("VW_TRUST_PROXY_ORIGIN", ""))
     warmup_probe_timeout_s = float(
-        os.environ.get("VW_WARMUP_PROBE_TIMEOUT_S", "60.0")
+        os.environ.get("VW_WARMUP_PROBE_TIMEOUT_S", "600.0")
     )
     engine_driver = os.environ.get("VW_ENGINE_DRIVER", "local")
     watchdog_enabled = _truthy(os.environ.get("VW_WATCHDOG_ENABLED", "1"))
@@ -224,6 +256,11 @@ def load_settings() -> Settings:
     runaway_think_budget = int(os.environ.get("VW_RUNAWAY_THINK_BUDGET", "24000"))
     runaway_repeat_max = int(os.environ.get("VW_RUNAWAY_REPEAT_MAX", "6"))
     runaway_hard_max = int(os.environ.get("VW_RUNAWAY_HARD_MAX", "96000"))
+    chat_quota_user_bytes = int(os.environ.get("VW_CHAT_QUOTA_USER_BYTES", 2 * 1024**3))
+    chat_quota_free_floor_bytes = int(
+        os.environ.get("VW_CHAT_QUOTA_FREE_FLOOR_BYTES", 5 * 1024**3)
+    )
+    chat_attachment_ttl_days = int(os.environ.get("VW_CHAT_ATTACHMENT_TTL_DAYS", 90))
     return Settings(
         data_dir=data_dir,
         hf_cache_dir=hf_cache_dir,
@@ -231,6 +268,7 @@ def load_settings() -> Settings:
         container_gpu_count=gpu_count,
         allowed_origins=allowed_origins,
         trust_proxy_origin=trust_proxy_origin,
+        derive_origin_from_request=derive_origin_from_request,
         warmup_probe_timeout_s=warmup_probe_timeout_s,
         engine_driver=engine_driver,
         watchdog_enabled=watchdog_enabled,
@@ -258,4 +296,7 @@ def load_settings() -> Settings:
         runaway_think_budget=runaway_think_budget,
         runaway_repeat_max=runaway_repeat_max,
         runaway_hard_max=runaway_hard_max,
+        chat_quota_user_bytes=chat_quota_user_bytes,
+        chat_quota_free_floor_bytes=chat_quota_free_floor_bytes,
+        chat_attachment_ttl_days=chat_attachment_ttl_days,
     )

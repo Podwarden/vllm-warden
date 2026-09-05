@@ -1,4 +1,4 @@
-# vLLM Warden
+# LLM Warden
 
 Self-hosted, OpenAI-compatible LLM inference with a guided setup wizard. Deploy any model from HuggingFace and expose it on your network in minutes — no command-line tuning required.
 

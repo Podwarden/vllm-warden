@@ -34,7 +34,7 @@ class TestUrlCoercerHappyPath:
             ("http://vllm.local", "http://vllm.local"),
             # Port is preserved.
             ("https://vllm.example.com:8443", "https://vllm.example.com:8443"),
-            ("http://10.10.0.187:10000", "http://10.10.0.187:10000"),
+            ("http://192.0.2.10:10000", "http://192.0.2.10:10000"),
             # Surrounding whitespace gets stripped before parse.
             ("  https://vllm.example.com  ", "https://vllm.example.com"),
             # Path is preserved (only the trailing slash on the whole URL

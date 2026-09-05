@@ -29,8 +29,25 @@ def test_post_welcome_advances_to_gpus(tmp_data_dir, client):
     client.get("/healthz")
     r = client.post("/api/setup/welcome", follow_redirects=False, headers=csrf_header(client))
     assert r.status_code == 200
+    assert r.json() == {"step": "gpus"}
     step, _ = _setup_state(tmp_data_dir / "vllm-warden.db")
     assert step == "gpus"
+
+
+def test_post_welcome_is_idempotent_mid_wizard(tmp_data_dir, client):
+    # Regression: browser Back / reload lands a mid-wizard visitor on the
+    # welcome page again; re-posting welcome must NOT 400 (that stranded
+    # first-run setup) — it reports the real current step so the client
+    # can resume there, and leaves state untouched.
+    client.get("/healthz")
+    h = csrf_header(client)
+    client.post("/api/setup/welcome", headers=h)  # welcome -> gpus
+
+    r = client.post("/api/setup/welcome", headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json() == {"step": "gpus"}
+    step, _ = _setup_state(tmp_data_dir / "vllm-warden.db")
+    assert step == "gpus"  # unchanged — no double-advance
 
 
 def test_post_gpus_validates_subset_and_persists(tmp_data_dir, client, monkeypatch):

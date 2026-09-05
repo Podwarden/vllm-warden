@@ -10,7 +10,7 @@ small. The real fix is a `medium: Memory` emptyDir on the pod (core #2417).
 import logging
 import os
 
-from app.runtime.env_builder import (
+from app.runtime.backends.vllm.env import (
     ENGINE_SHM_MIN_BYTES,
     build_subprocess_env,
     dev_shm_bytes,
@@ -91,7 +91,7 @@ def test_dev_shm_bytes_returns_none_when_the_path_is_missing(tmp_path):
 
 def test_warns_when_local_driver_has_an_undersized_shm(monkeypatch, caplog):
     _fake_shm(monkeypatch, 64 * 1024**2)  # the Kubernetes pod default
-    with caplog.at_level(logging.WARNING, logger="app.runtime.env_builder"):
+    with caplog.at_level(logging.WARNING, logger="app.runtime.backends.vllm.env"):
         warn_if_shm_undersized("local")
     assert len(caplog.records) == 1
     msg = caplog.records[0].getMessage()
@@ -103,7 +103,7 @@ def test_warns_when_local_driver_has_an_undersized_shm(monkeypatch, caplog):
 
 def test_no_warning_when_shm_is_large_enough(monkeypatch, caplog):
     _fake_shm(monkeypatch, ENGINE_SHM_MIN_BYTES)
-    with caplog.at_level(logging.WARNING, logger="app.runtime.env_builder"):
+    with caplog.at_level(logging.WARNING, logger="app.runtime.backends.vllm.env"):
         warn_if_shm_undersized("local")
     assert caplog.records == []
 
@@ -112,7 +112,7 @@ def test_no_warning_for_the_docker_driver(monkeypatch, caplog):
     """The warden's own /dev/shm says nothing about a sibling engine
     container's, so checking it there would only produce false alarms."""
     _fake_shm(monkeypatch, 64 * 1024**2)
-    with caplog.at_level(logging.WARNING, logger="app.runtime.env_builder"):
+    with caplog.at_level(logging.WARNING, logger="app.runtime.backends.vllm.env"):
         warn_if_shm_undersized("docker")
     assert caplog.records == []
 
@@ -121,7 +121,7 @@ def test_warns_when_shm_size_is_unreadable(monkeypatch, caplog):
     """Unknown is still worth saying out loud — but the message must not claim
     a size it never read."""
     _fake_shm(monkeypatch, None)
-    with caplog.at_level(logging.WARNING, logger="app.runtime.env_builder"):
+    with caplog.at_level(logging.WARNING, logger="app.runtime.backends.vllm.env"):
         warn_if_shm_undersized("local")
     assert len(caplog.records) == 1
     assert "could not read" in caplog.records[0].getMessage()

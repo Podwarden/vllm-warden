@@ -1,7 +1,7 @@
 import pytest
 
 from app.db.repos.models import ModelRow
-from app.runtime.cmd_builder import build_vllm_args
+from app.runtime.backends.vllm.args import build_vllm_args
 from app.runtime.supervisor import Supervisor
 from tests.fakes.fake_engine import FakeDriver
 
@@ -498,7 +498,7 @@ async def test_supervisor_load_binds_loopback_under_local_driver(tmp_path, monke
     drv = FakeDriver()
     sup = Supervisor(_SupSettings(tmp_path, "local"), driver=drv)
     await sup.load(_SupModel(), port=8001)
-    args = drv.spawned[0].args
+    args = drv.spawned[0].argv
     assert args[args.index("--host") + 1] == "127.0.0.1"
     # Reap the exit-watcher task; a bare load() leaves it pending and pytest
     # prints "Task was destroyed but it is pending!" at interpreter shutdown.
@@ -516,6 +516,6 @@ async def test_supervisor_load_binds_all_interfaces_under_docker_driver(
     drv = FakeDriver()
     sup = Supervisor(_SupSettings(tmp_path, "docker"), driver=drv)
     await sup.load(_SupModel(), port=8001)
-    args = drv.spawned[0].args
+    args = drv.spawned[0].argv
     assert args[args.index("--host") + 1] == "0.0.0.0"
     await sup.unload("qwen", force=True)

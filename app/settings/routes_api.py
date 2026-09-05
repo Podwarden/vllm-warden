@@ -504,6 +504,78 @@ _PATCHABLE_MODEL_FIELDS: frozenset[str] = _derive_patchable_model_fields()
 # ModelRow fields persisted as JSON in the underlying column.
 _MODEL_JSON_FIELDS = frozenset({"gpu_indices", "extra_args", "extra_env"})
 
+# Capability flags are TRI-state, not boolean: 1 = yes, 0 = no, NULL = "nobody
+# has stated an answer". The third state is load-bearing — app/chat2/catalog.py
+# only auto-detects vision from the on-disk HF config while the column is NULL,
+# so collapsing NULL into 0 is what silently turned every pasted image into
+# "[image omitted]" on a model that could read it perfectly well.
+#
+# JSON has exactly one way to say "no value", so the wire contract is:
+#   * `true` / `false`  -> explicit 1 / 0, the operator's answer wins forever
+#   * `null`            -> back to auto (NULL)
+#   * key omitted       -> left exactly as it was
+# The last of those is already how every other field on this endpoint behaves,
+# so there is no extra sentinel to learn. The body is an untyped dict, so the
+# value is normalised through `int(bool(v))` — the same coercion
+# `trust_remote_code` uses below — rather than being written raw.
+_MODEL_TRISTATE_FIELDS = frozenset({
+    "supports_tools", "supports_vision", "supports_reasoning",
+})
+
+
+def _coerce_tristate(field: str, v: Any) -> int | None:
+    """Validate one capability flag, or raise 400.
+
+    Deliberately NOT `int(bool(v))` (what `trust_remote_code` uses): that reads
+    the string `"no"` -- a perfectly plausible thing for a shell script to
+    send -- as an explicit YES, the exact opposite of what was asked, and
+    silently. Only real JSON booleans, their case-insensitive string spellings
+    (form-encoded clients and `curl` recipes), and null get through; anything
+    else is a loud 400.
+    """
+    if v is None:
+        return None
+    if isinstance(v, bool):  # must precede the int check -- bool IS an int
+        return int(v)
+    if isinstance(v, str) and v.strip().lower() in ("true", "false"):
+        return int(v.strip().lower() == "true")
+    raise HTTPException(
+        status_code=400,
+        detail=f"{field} must be true, false, or null (got {v!r})",
+    )
+
+
+def _coerce_backend(v: Any) -> str | None:
+    """Validate models.backend, or raise 400.
+
+    Necessary because the PATCH allowlist is DERIVED from ModelRow's fields, so
+    a new column is patchable the moment it exists. Without this, an operator
+    could write 'sglang' and the failure would surface from inside
+    Supervisor.load as an UnknownBackendError -- after the GPU claim, as an
+    opaque last_error, at load time rather than at write time.
+    ``registry.is_known`` is the single source of truth, so this can never
+    drift from what the build can actually run.
+
+    None is accepted: it is the D6 default (NULL decodes to 'vllm') and is how
+    an operator returns a row to the default without naming it. Note the
+    explicit ``v and`` -- ``is_known("")`` is True by design (it treats falsy
+    as "unset"), and letting an empty string through would write a value that
+    is neither NULL nor a backend name.
+    """
+    from app.runtime.backends import registry
+
+    if v is None:
+        return None
+    if isinstance(v, str) and v and registry.is_known(v):
+        return v
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"backend must be null or one of {list(registry.available())} "
+            f"(got {v!r})"
+        ),
+    )
+
 
 model_settings_router = APIRouter(prefix="/api/models", tags=["model-settings"])
 
@@ -514,6 +586,12 @@ async def get_model_settings(
     request: Request,
     _user: str = Depends(require_jwt),
 ) -> dict[str, Any]:
+    """Return the whole persisted ModelRow.
+
+    The `supports_*` capability flags come back RAW (null / 0 / 1) rather than
+    coerced to a bool, so a client can tell "the operator said no" from "nobody
+    said, so it is auto-detected" — see `_MODEL_TRISTATE_FIELDS`.
+    """
     settings = request.app.state.settings
     async with open_db(settings.db_path) as db:
         m = await ModelRepo(db).get(model_id)
@@ -534,6 +612,14 @@ async def patch_model_settings(
     Refuses to mutate a model that is currently `status == 'loaded'` — that
     column is authoritative state set by the supervisor on transitions. The
     operator must unload the model first, which is a 409.
+
+    One carve-out: a body whose keys are ALL capability flags is allowed
+    through on a loaded model. Those columns are inert metadata that the load
+    runner and the engine never read (only the chat2 catalog does, per
+    request), and the loaded model is precisely the one an operator is looking
+    at when they notice vision is set wrong — making them unload it to fix a
+    label is backwards. Mixing in any real engine setting puts the whole patch
+    back under the guard.
     """
     bad = [k for k in body if k not in _PATCHABLE_MODEL_FIELDS]
     if bad:
@@ -541,13 +627,14 @@ async def patch_model_settings(
             status_code=400,
             detail=f"unknown or non-patchable keys: {sorted(bad)}",
         )
+    capabilities_only = bool(body) and set(body) <= _MODEL_TRISTATE_FIELDS
 
     settings = request.app.state.settings
     async with open_db(settings.db_path) as db:
         m = await ModelRepo(db).get(model_id)
         if not m:
             raise HTTPException(status_code=404, detail="model not found")
-        if m.status == "loaded":
+        if m.status == "loaded" and not capabilities_only:
             raise HTTPException(
                 status_code=409,
                 detail="model must be unloaded before editing settings",
@@ -565,6 +652,13 @@ async def patch_model_settings(
             v = body[k]
             if k in _MODEL_JSON_FIELDS:
                 values.append(json.dumps(v))
+            elif k in _MODEL_TRISTATE_FIELDS:
+                # `null` is a deliberate reset to auto, not a missing value —
+                # only an omitted key means "don't touch". Validated (not
+                # coerced) so junk is a 400 before anything is written.
+                values.append(_coerce_tristate(k, v))
+            elif k == "backend":
+                values.append(_coerce_backend(v))
             elif k == "trust_remote_code":
                 values.append(int(bool(v)))
             else:

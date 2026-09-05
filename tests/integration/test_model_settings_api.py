@@ -227,3 +227,149 @@ async def test_patch_json_field_roundtrips(app_and_client):
     assert body["tensor_parallel_size"] == 2
     assert body["extra_args"] == ["--foo", "bar"]
     assert body["extra_env"] == {"VLLM_LOGGING_LEVEL": "DEBUG"}
+
+
+@pytest.mark.integration
+async def test_capability_flags_are_tri_state(app_and_client):
+    """`supports_*` are 1 / 0 / NULL, and PATCH must be able to reach all three.
+
+    NULL is not "no" — it means nobody has stated an answer, which is what lets
+    app/chat2/catalog.py auto-detect vision from the on-disk HF config. An
+    operator who has been burned by a wrong guess needs to pin 0 or 1; one who
+    pinned the wrong value needs a way back to auto. JSON already has exactly
+    one way to say "no value", so `null` is the reset and an OMITTED key is
+    "leave it alone" — the same rule every other field on this endpoint uses.
+    """
+    _, client, tmp_path = app_and_client
+    auth, mut = await _login_and_prime_csrf(client)
+    model_id = await _create_model(client, mut, name="caps")
+
+    # A fresh model has stated nothing: the raw tri-state must survive GET so
+    # the UI can render "Auto" rather than an unearned "No".
+    body = (await client.get(f"/api/models/{model_id}/settings", headers=auth)).json()
+    assert body["supports_vision"] is None
+    assert body["supports_tools"] is None and body["supports_reasoning"] is None
+
+    r = await client.patch(
+        f"/api/models/{model_id}/settings",
+        json={"supports_vision": True, "supports_tools": False},
+        headers=mut,
+    )
+    assert r.status_code == 200, r.text
+    body = (await client.get(f"/api/models/{model_id}/settings", headers=auth)).json()
+    # stored as 1/0, not as SQLite's stringly-typed bools
+    assert body["supports_vision"] == 1 and body["supports_tools"] == 0
+    assert body["supports_reasoning"] is None, "an omitted flag must not be touched"
+    with sqlite3.connect(tmp_path / "vllm-warden.db") as db:
+        assert db.execute(
+            "SELECT supports_vision, supports_tools FROM models WHERE id = ?", (model_id,)
+        ).fetchone() == (1, 0)
+
+    # A patch that does not mention the flags leaves them exactly as they were.
+    r = await client.patch(f"/api/models/{model_id}/settings",
+                           json={"max_model_len": 2048}, headers=mut)
+    assert r.status_code == 200, r.text
+    body = (await client.get(f"/api/models/{model_id}/settings", headers=auth)).json()
+    assert body["supports_vision"] == 1 and body["supports_tools"] == 0
+
+    # ...and `null` puts one back to auto.
+    r = await client.patch(f"/api/models/{model_id}/settings",
+                           json={"supports_vision": None}, headers=mut)
+    assert r.status_code == 200, r.text
+    body = (await client.get(f"/api/models/{model_id}/settings", headers=auth)).json()
+    assert body["supports_vision"] is None, "null must reset the flag to auto"
+    assert body["supports_tools"] == 0, "resetting one flag must not disturb another"
+
+
+@pytest.mark.integration
+async def test_capability_flags_are_stored_as_0_or_1(app_and_client):
+    """An accepted flag lands in the column as a real INTEGER.
+
+    Storing the raw JSON value would put a TEXT into an INTEGER-shaped
+    tri-state and make `IS NULL` the only reliable read left — the catalog's
+    `is None` check would still work, but the UI's "explicit vs auto"
+    distinction would start rendering whatever junk was posted.
+    """
+    _, client, tmp_path = app_and_client
+    auth, mut = await _login_and_prime_csrf(client)
+    model_id = await _create_model(client, mut, name="caps-coerce")
+
+    r = await client.patch(f"/api/models/{model_id}/settings",
+                           json={"supports_vision": True, "supports_reasoning": False},
+                           headers=mut)
+    assert r.status_code == 200, r.text
+    with sqlite3.connect(tmp_path / "vllm-warden.db") as db:
+        stored = db.execute(
+            "SELECT supports_vision, typeof(supports_vision), supports_reasoning, "
+            "typeof(supports_reasoning) FROM models WHERE id = ?", (model_id,)
+        ).fetchone()
+    assert stored == (1, "integer", 0, "integer"), stored
+    body = (await client.get(f"/api/models/{model_id}/settings", headers=auth)).json()
+    assert body["supports_vision"] == 1 and body["supports_reasoning"] == 0
+
+
+@pytest.mark.integration
+async def test_capability_flags_are_patchable_on_a_loaded_model(app_and_client):
+    """The 409 unload-first guard does NOT apply to a capability-only patch.
+
+    That guard exists because the lifecycle columns are supervisor-owned state.
+    The `supports_*` flags are inert metadata the load runner never reads, and
+    the loaded model is exactly the one an operator is looking at when they
+    notice vision is wrong -- making them unload it first is backwards.
+    """
+    _, client, tmp_path = app_and_client
+    auth, mut = await _login_and_prime_csrf(client)
+    model_id = await _create_model(client, mut, name="caps-loaded")
+    _force_status(tmp_path / "vllm-warden.db", model_id, "loaded")
+
+    r = await client.patch(f"/api/models/{model_id}/settings",
+                           json={"supports_vision": True}, headers=mut)
+    assert r.status_code == 200, r.text
+    body = (await client.get(f"/api/models/{model_id}/settings", headers=auth)).json()
+    assert body["supports_vision"] == 1 and body["status"] == "loaded"
+
+    # Mixing in a real engine setting puts the whole patch back under the guard
+    # -- the carve-out is for bodies that touch ONLY capability flags.
+    r = await client.patch(f"/api/models/{model_id}/settings",
+                           json={"supports_vision": False, "max_model_len": 4096},
+                           headers=mut)
+    assert r.status_code == 409, r.text
+    body = (await client.get(f"/api/models/{model_id}/settings", headers=auth)).json()
+    assert body["supports_vision"] == 1, "the refused patch must not partially apply"
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("bad", ["no", "yes", 1, 0, "", [], {"a": 1}, 2])
+async def test_capability_flags_reject_non_boolean_values(app_and_client, bad):
+    """`"no"` must not become 1.
+
+    The body is an untyped dict, so `int(bool(v))` would coerce the *string*
+    "no" -- a perfectly plausible thing for a script to send -- into an
+    explicit YES, which is the exact opposite of what was asked. Only real
+    JSON booleans, their case-insensitive string spellings, and null are
+    accepted; anything else is a 400 rather than a silent misread.
+    """
+    _, client, _ = app_and_client
+    auth, mut = await _login_and_prime_csrf(client)
+    model_id = await _create_model(client, mut, name=f"caps-bad-{abs(hash(str(bad))) % 9999}")
+
+    r = await client.patch(f"/api/models/{model_id}/settings",
+                           json={"supports_vision": bad}, headers=mut)
+    assert r.status_code == 400, r.text
+    body = (await client.get(f"/api/models/{model_id}/settings", headers=auth)).json()
+    assert body["supports_vision"] is None, "a rejected patch must not write anything"
+
+
+@pytest.mark.integration
+async def test_capability_flags_accept_string_booleans(app_and_client):
+    """Form-encoded clients and shell scripts send "true"/"false" as strings."""
+    _, client, _ = app_and_client
+    auth, mut = await _login_and_prime_csrf(client)
+    model_id = await _create_model(client, mut, name="caps-strbool")
+
+    r = await client.patch(f"/api/models/{model_id}/settings",
+                           json={"supports_vision": "True", "supports_tools": "false"},
+                           headers=mut)
+    assert r.status_code == 200, r.text
+    body = (await client.get(f"/api/models/{model_id}/settings", headers=auth)).json()
+    assert body["supports_vision"] == 1 and body["supports_tools"] == 0

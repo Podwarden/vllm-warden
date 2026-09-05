@@ -273,3 +273,108 @@ def test_recommend_max_model_len_handles_zero_attention_heads():
         dtype_bytes=2,
     )
     assert rec is None
+
+
+# ---- head_dim and sliding-window attention (fit-preview backend-awareness) --
+#
+# Both are properties of the MODEL, not of the engine, so they belong here
+# rather than in the backend-aware budget math. They are in this change
+# because without them the backend fix does not actually move the verdict:
+# for gpt-oss-20b the two errors are worth ~2x on the KV term between them.
+
+GPT_OSS_20B_REAL = dict(
+    hidden_size=2880,
+    num_layers=24,
+    num_kv_heads=8,
+    num_attention_heads=64,
+    max_model_len=131072,
+    dtype_bytes=2,
+)
+
+
+def test_head_dim_is_used_when_the_config_declares_one():
+    """gpt-oss-20b declares head_dim 64; hidden_size // heads gives 45.
+
+    2880 // 64 = 45, but the config says 64. Deriving it undercounts the KV
+    cache by 30% -- the direction dtype_bytes_from_torch_dtype's docstring
+    calls "the dangerous direction", because it turns a red row green.
+    """
+    derived = kv_reserve_bytes(**GPT_OSS_20B_REAL)
+    declared = kv_reserve_bytes(**GPT_OSS_20B_REAL, head_dim=64)
+    assert derived < declared
+    # 2 * 24 * 8 * 64 * 2 = 49152 bytes/token
+    assert declared == 49152 * 131072
+
+
+def test_head_dim_defaults_to_the_derived_value():
+    """Absent head_dim, behaviour is byte-identical to before this change."""
+    assert kv_reserve_bytes(**GPT_OSS_20B_REAL) == kv_reserve_bytes(
+        **GPT_OSS_20B_REAL, head_dim=None
+    )
+    assert kv_reserve_bytes(**GPT_OSS_20B_REAL) == 34560 * 131072
+
+
+def test_sliding_layers_only_hold_their_window():
+    """gpt-oss-20b: 12 full_attention + 12 sliding_attention, window 128.
+
+    Charging all 24 layers the full 131072-token context doubles the KV
+    estimate. Per layer per token = 2 * 8 * 64 * 2 = 2048 bytes.
+    """
+    got = kv_reserve_bytes(
+        **GPT_OSS_20B_REAL, head_dim=64, sliding_layers=12, sliding_window=128
+    )
+    expected = 2048 * (12 * 131072 + 12 * 128)
+    assert got == expected
+    # Just over half the all-full-attention figure, not the whole thing.
+    assert got < kv_reserve_bytes(**GPT_OSS_20B_REAL, head_dim=64)
+
+
+def test_sliding_window_is_capped_by_the_context():
+    """A window wider than the context reserves the context, not the window."""
+    got = kv_reserve_bytes(
+        hidden_size=2880, num_layers=2, num_kv_heads=8, num_attention_heads=64,
+        max_model_len=64, dtype_bytes=2, head_dim=64,
+        sliding_layers=1, sliding_window=4096,
+    )
+    # Both layers reserve 64 tokens: the full one by definition, the sliding
+    # one because its window exceeds what exists.
+    assert got == 2048 * (1 * 64 + 1 * 64)
+
+
+def test_no_sliding_layers_is_todays_behaviour():
+    assert kv_reserve_bytes(
+        **GPT_OSS_20B_REAL, head_dim=64, sliding_layers=0, sliding_window=128
+    ) == kv_reserve_bytes(**GPT_OSS_20B_REAL, head_dim=64)
+
+
+def test_recommendation_uses_the_same_kv_shape_as_the_reserve():
+    """The two must agree, or the suggested context does not land in yellow.
+
+    `recommend_max_model_len` solves the inverse of `kv_reserve_bytes`. If one
+    knows about head_dim and interleaved sliding layers and the other does
+    not, the number pasted into the override field produces a different
+    verdict than the one that produced the recommendation.
+    """
+    GIB = 1024**3
+    common = dict(
+        hidden_size=2880, num_layers=24, num_kv_heads=8, num_attention_heads=64,
+        dtype_bytes=2, head_dim=64, sliding_layers=12, sliding_window=128,
+    )
+    total_vram = 16 * GIB
+    # Deliberately NOT the 11.28 GiB gpt-oss Q8_0 case: at the 0.70 yellow
+    # target that file needs 16.11 GiB of budget for weights alone on a 16 GiB
+    # card, so `recommend_max_model_len` correctly returns None -- there is no
+    # context at which it is comfortable, only contexts at which it is tight.
+    file_size = int(9 * GIB)
+
+    rec = recommend_max_model_len(
+        **common, total_vram=total_vram, gpu_memory_utilization=1.0,
+        file_size=file_size,
+    )
+    assert rec is not None and rec > 0
+
+    # Feed the recommendation back through the reserve and confirm the
+    # verdict it produces is actually the yellow band it aimed for.
+    kv = kv_reserve_bytes(**common, max_model_len=rec)
+    budget = weights_budget_bytes(total_vram, 1.0, kv)
+    assert classify_fit(file_size, budget) in ("green", "yellow")

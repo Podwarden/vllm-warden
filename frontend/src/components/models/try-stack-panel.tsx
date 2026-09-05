@@ -22,6 +22,7 @@
 import { useEffect, useMemo, useState } from "react";
 import useSWR from "swr";
 import { authFetch, authFetchJSON } from "@/lib/auth-fetch";
+import { useBackendCapability } from "@/lib/system-backends";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Combobox, type ComboboxSuggestion } from "@/components/ui/combobox";
@@ -122,22 +123,13 @@ interface EngineVersionsResponse {
   error: string | null;
 }
 
-// #177: the active engine driver's capability. Under the in-container
-// subprocess driver the engine version is fixed by the warden image and an
-// engine-version pin is silently discarded (and now refused by the backend),
-// so the version selector must be disabled + explained.
-interface EngineInfo {
-  driver: string;
-  supports_version_select: boolean;
-  vllm_version: string | null;
-}
-
 export function TryStackPanel({
   modelId,
   hfRepo,
   maxModelLen,
   tensorParallelSize,
   modelStatus,
+  backend,
 }: {
   modelId: string;
   hfRepo: string;
@@ -147,6 +139,11 @@ export function TryStackPanel({
   // so the operator can't fire /load while the engine is already starting,
   // running, or shutting down.
   modelStatus: ModelStatus;
+  // The row's own backend. This panel is vLLM's image catalogue, so which
+  // engine serves the row decides whether it renders at all — the model detail
+  // page makes that call via versionPinControlApplies(); here it only selects
+  // WHICH capability row to read the disabled-reason from.
+  backend: string | null | undefined;
 }) {
   const key = `/api/models/${modelId}/try-stack`;
   const { data, mutate } = useSWR<TryStackResponse>(key, authFetchJSON);
@@ -172,12 +169,21 @@ export function TryStackPanel({
     (v) => ({ value: v, label: v }),
   );
 
-  // #177: whether this deployment's engine driver can honor a version pin.
-  // While loading (engineInfo === undefined) we do NOT disable — the common
-  // case is the capable docker driver, and disabling-then-enabling would
-  // flash the controls. We only lock the selector once we KNOW it's false.
-  const { data: engineInfo } = useSWR<EngineInfo>("/api/system/engine", authFetchJSON);
-  const versionSelectDisabled = engineInfo?.supports_version_select === false;
+  // #177: whether this deployment can honour a version pin FOR THIS ROW'S
+  // ENGINE. Was /api/system/engine, which answers only for vLLM and only about
+  // the driver; /api/system/backends answers per backend, resolved against the
+  // active driver, and carries the sentence explaining a refusal.
+  //
+  // While loading (capability === undefined) we do NOT disable — the common
+  // case is the capable docker driver, and disabling-then-enabling would flash
+  // the controls. We only lock the selector once we KNOW it's false.
+  const capability = useBackendCapability(backend);
+  const versionSelectDisabled = capability?.version_pin_available === false;
+  // Rendered verbatim. The client cannot write this sentence: one boolean does
+  // not say whether the obstacle is the driver or the backend, and the two have
+  // different remedies (routes_engine.py::_version_pin_obstacle).
+  const versionSelectReason = capability?.version_pin_reason ?? null;
+  const engineVersion = capability?.version ?? null;
 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -346,12 +352,10 @@ export function TryStackPanel({
 
   return (
     <div className="space-y-3">
-      {versionSelectDisabled && (
+      {versionSelectDisabled && versionSelectReason && (
         <p className="text-xs text-amber-300" data-testid="try-stack-driver-note">
-          This deployment runs the in-container engine
-          {engineInfo?.vllm_version ? ` (vLLM ${engineInfo.vllm_version})` : ""}; the
-          engine version is fixed by the image. Version selection requires the docker
-          engine driver.
+          {versionSelectReason}
+          {engineVersion ? ` Running ${engineVersion}.` : ""}
         </p>
       )}
       <div className="flex flex-wrap items-end gap-2">
@@ -375,12 +379,20 @@ export function TryStackPanel({
           <span className="block text-xs text-slate-400">vLLM version</span>
           {/* #177: typeable dropdown of published image-resolving versions.
               Stays free-text so an operator can still enter an unpublished
-              version or a pinned digest the catalog won't list. */}
+              version or a pinned digest the catalog won't list.
+
+              The placeholder was the literal "0.20.0" -- the template
+              registry's hardcoded default, which nothing on a running
+              deployment has any reason to match. It rendered one line under a
+              note reading "(vLLM 0.26.0)", so the panel stated two different
+              engine versions about itself, and on the subprocess driver the
+              field is disabled, so the operator could not correct it. Show
+              what the deployment actually runs, or show nothing. */}
           <Combobox
             suggestions={versionSuggestions}
             value={version}
             onChange={setVersion}
-            placeholder="0.20.0"
+            placeholder={engineVersion ?? ""}
             className="w-32"
             ariaLabel="vLLM version"
             data-testid="try-stack-version"

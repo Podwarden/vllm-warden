@@ -26,17 +26,36 @@ FileKind = Literal[
     "safetensors_single",
     "safetensors_sharded",
     "gguf",
+    # New in sub-project C. A multimodal projector is a GGUF, but it is not
+    # WEIGHTS: llama.cpp takes it via --mmproj alongside -m. Classifying it as
+    # `gguf` puts it in the wizard's weights-file radio list, where selecting it
+    # produces a load failure that reads like a corrupt download.
+    "mmproj",
     "pytorch_bin",
     "config",
     "tokenizer",
     "other",
 ]
 
+# Upstream's convention for a projector file, PREFIX-anchored so a weights file
+# whose name merely contains the substring ("model-with-mmproj-support-Q4.gguf")
+# is not misfiled.
+_MMPROJ_RE = re.compile(r"^mmproj([.\-_]|\.gguf$)", re.IGNORECASE)
+
 # The config.json keys we surface to the FE wizard. #82 committed to the
 # first six (VRAM-fit math); #176 adds ``quantization_config`` so the
 # capability-warning layer (and the AWQ KV-cache heuristic in suggest.py)
 # can read ``quantization_config.quant_method`` instead of relying solely on
 # repo-name / filename markers. Anything else stays opaque.
+#
+# The last three are the KV-shape keys. They are here because the fit math is
+# this projection's whole reason to exist and it was wrong without them: with
+# only the original six, the route could not tell that gpt-oss-20b declares
+# ``head_dim: 64`` (rather than the 2880//64 = 45 the derivation gives) or
+# that 12 of its 24 layers use a 128-token sliding window. Between them those
+# two are worth about 2x on the KV term. Widening the projection is the only
+# way to fix that -- the route reads ``discovery["config"]``, so a key absent
+# here is a key the math cannot see.
 _CONFIG_KEYS = (
     "hidden_size",
     "num_hidden_layers",
@@ -45,6 +64,9 @@ _CONFIG_KEYS = (
     "max_position_embeddings",
     "torch_dtype",
     "quantization_config",
+    "head_dim",
+    "sliding_window",
+    "layer_types",
 )
 
 _TOKENIZER_NAMES = {
@@ -184,6 +206,11 @@ def _classify(filename: str) -> FileKind:
     if base in _TOKENIZER_NAMES:
         return "tokenizer"
     if base.endswith(".gguf"):
+        # Checked INSIDE the .gguf branch, so nothing that is not a GGUF can be
+        # classified as a projector -- --mmproj takes a GGUF, and the kind is
+        # about the file, not about the name.
+        if _MMPROJ_RE.match(base):
+            return "mmproj"
         return "gguf"
     if _SAFETENSORS_SHARD_RE.match(base):
         return "safetensors_sharded"
@@ -354,7 +381,7 @@ def _default_config_fetcher(
 
 
 def _select_config_keys(raw: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Reduce a raw ``config.json`` to the six keys the FE wizard needs.
+    """Reduce a raw ``config.json`` to the keys the FE wizard needs.
 
     Returns None if input is None. Returns a dict with every key (defaulting
     to None when absent) so the FE can assume the shape.

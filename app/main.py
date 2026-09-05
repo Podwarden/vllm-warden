@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -9,7 +10,9 @@ from app.db.database import open_db
 from app.db.migrations import apply_migrations
 from app.db.repos.models import ModelRepo
 from app.db.repos.runtime import RuntimeRepo
-from app.runtime.env_builder import warn_if_shm_undersized
+from app.db.repos.stress_runs import StressRunRepo
+from app.runtime.backends.vllm.env import warn_if_shm_undersized
+from app.runtime.boot_reconcile import reconcile_stranded_models
 from app.runtime.port_alloc import PortAllocator
 from app.runtime.supervisor import Supervisor
 
@@ -78,8 +81,6 @@ async def lifespan(app: FastAPI):
 
     async with open_db(settings.db_path) as db:
         await apply_migrations(db)
-        await ModelRepo(db).mark_runtime_dead_on_startup()
-        await RuntimeRepo(db).clear_all()
 
     # #210 — under the local-subprocess driver the vLLM engine inherits this
     # process's /dev/shm. On Kubernetes that is 64 MiB unless the pod spec asks
@@ -93,6 +94,55 @@ async def lifespan(app: FastAPI):
         driver=_build_engine_driver(app.state.settings),
     )
     app.state.port_allocator = PortAllocator(start=10000, end=10999)
+
+    # #236 — a row left in a transient status ('loading'/'unloading'/'pulling')
+    # by a warden that died mid-operation describes an in-process object that
+    # no longer exists, and BOTH routes out of those statuses 409. Demote them
+    # to something an operator can act on before anything else touches the
+    # table.
+    #
+    # ORDER MATTERS TWICE:
+    #   * after the supervisor exists, because "is this load real?" is
+    #     answered by the supervisor holding a handle — at boot it never does,
+    #     nothing has been spawned yet, but keying on the handle is what makes
+    #     the function safe to reuse outside boot;
+    #   * before mark_runtime_dead_on_startup, which would otherwise have
+    #     already swept every transient row into 'failed' and left this with
+    #     nothing to see.
+    # Rows that were genuinely SERVING ('loaded', or a watchdog restore in
+    # flight) are deliberately left to the call below, which records
+    # prior_status so the watchdog restores them.
+    await reconcile_stranded_models(settings, app.state.supervisor)
+
+    async with open_db(settings.db_path) as db:
+        await ModelRepo(db).mark_runtime_dead_on_startup()
+        await RuntimeRepo(db).clear_all()
+        # A stress run is an in-process asyncio task, so it dies with the
+        # warden. A row left 'running' would block the cooldown forever AND
+        # carry a search bracket that was never confirmed -- publishing its
+        # lower bound would understate the limit at full confidence.
+        #
+        # Deliberately AFTER reconcile_stranded_models (#236): a run that died
+        # mid-load leaves both a stress row and a model row stranded, and the
+        # model is the one an operator will look at first.
+        interrupted = await StressRunRepo(db).mark_interrupted_on_startup()
+        if interrupted:
+            logging.getLogger(__name__).warning(
+                "stress: marked %d run(s) interrupted -- the warden restarted "
+                "while they were in progress",
+                interrupted,
+            )
+
+    # The watchdog stands down for a model under a live lease
+    # (``watchdog.wants_restart`` reads ``app_state.stress_leases``), so this
+    # must exist before ``run_watchdog_forever`` starts below. Cleared
+    # explicitly rather than relying on the registry being fresh: leases are
+    # in-memory precisely because nothing that outlives this process may hold
+    # one, and boot is where that is asserted.
+    from app.stress.lease import LeaseRegistry
+
+    app.state.stress_leases = LeaseRegistry()
+    app.state.stress_leases.clear_all()
 
     from app.proxy.tokenizers import TokenizerCache
 
@@ -155,22 +205,65 @@ async def lifespan(app: FastAPI):
     pruner_task = asyncio.create_task(run_pruner_forever(settings))
     watchdog_task = asyncio.create_task(run_watchdog_forever(settings, app.state))
 
+    # Chat2 (2026-08-23) — orphan/TTL/LRU collector for attachments (spec §3).
+    # Same "log and keep going" shape as the other background loops above.
+    from app.chat2.gc import run_gc_forever
+
+    gc_task = asyncio.create_task(run_gc_forever(settings))
+    app.state.chat2_gc_task = gc_task
+
     try:
         yield
     finally:
         sampler_task.cancel()
         pruner_task.cancel()
         watchdog_task.cancel()
+        gc_task.cancel()
         await asyncio.gather(
             sampler_task,
             pruner_task,
             watchdog_task,
+            gc_task,
             return_exceptions=True,
         )
 
+        # Chat2 detached turns — cancel still-running turn runners FIRST so
+        # their CancelledError path persists an 'aborted' tail (shielded, so
+        # this really waits for the persist) and releases the chat locks
+        # while the loop is still alive. Runs before the _BACKGROUND grace
+        # below because the runners live in that same set.
+        live_turns = getattr(app.state, "chat2_live_turns", None)
+        if live_turns is not None:
+            await live_turns.shutdown()
+
+        # Chat2 (2026-08-23) review finding — the turn endpoint's fire-and-forget
+        # persistence tasks (app.chat2.routes_turn._BACKGROUND) are kept alive by
+        # a strong ref specifically so they survive their originating request's
+        # cancellation (see that module's docstring). Nothing else awaits them,
+        # so without this the app can shut down mid-persist and drop an
+        # assistant row/ledger entry. Give them a short grace period to finish
+        # instead of hanging shutdown on them forever. Note `asyncio.wait_for`
+        # DOES cancel what it is waiting on when the timeout fires: a task
+        # still running after 5s is cancelled, not left alone — the warning
+        # below is the record that a persist may have been cut short.
+        from app.chat2.routes_turn import _BACKGROUND
+
+        if _BACKGROUND:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*_BACKGROUND, return_exceptions=True),
+                    timeout=5.0,
+                )
+            except TimeoutError:
+                logging.getLogger(__name__).warning(
+                    "chat2: %d background turn-persistence task(s) still running "
+                    "at shutdown after 5s grace period",
+                    len(_BACKGROUND),
+                )
+
 
 def build_app() -> FastAPI:
-    app = FastAPI(title="vllm-warden", lifespan=lifespan)
+    app = FastAPI(title="LLM Warden", lifespan=lifespan)
 
     from app.setup import routes_api as setup_routes_api
 
@@ -183,6 +276,15 @@ def build_app() -> FastAPI:
     from app.models import routes_logs as models_routes_logs
 
     app.include_router(models_routes_logs.router)
+
+    # Model stress test (docs/superpowers/specs/2026-09-03-model-stress-test-design.md).
+    # Shares the /api/models prefix: POST /{id}/stress starts a run,
+    # GET /{id}/capabilities returns the measured record. Operator JWT only --
+    # a run deliberately crashes the engine, so it is not reachable with a /v1
+    # API token (see app/stress/routes_api.py::require_operator).
+    from app.stress import routes_api as stress_routes_api
+
+    app.include_router(stress_routes_api.router)
 
     # #177: engine-version dropdown — GET /api/templates/engine-versions.
     # Backs the try-stack vLLM-version field with the published
@@ -284,14 +386,47 @@ def build_app() -> FastAPI:
 
     app.include_router(landing_routes.router)
 
-    # Middleware registration order matters: in Starlette the LAST-added decorator
-    # is the OUTERMOST wrapper (first to run on every request).
+    # Chat2 (2026-08-23) — T5 image attachments (upload/serve/delete under
+    # /api/chat2/attachments) + T13 chats CRUD/fork/defaults/models/budget
+    # under /api/chat2/chats, /defaults, /models, /budget, /_whoami + T14 the
+    # streaming turn (POST /api/chat2/chats/{id}/turns).
+    from app.chat2 import routes_attachments as chat2_routes_attachments
+    from app.chat2 import routes_chats as chat2_routes_chats
+    from app.chat2 import routes_turn as chat2_routes_turn
+    from app.chat2.body_limit import Chat2BodyLimitMiddleware
+    from app.chat2.budget import AlwaysAllow
+    from app.chat2.live import LiveTurns
+    from app.chat2.locks import TurnLocks
+
+    # In-process singletons — single uvicorn worker, same rationale as
+    # rate_limiter/scheduler above. TurnLocks enforces one turn in flight
+    # per chat; AlwaysAllow is the warden's no-op budget policy (the Hub
+    # wires its rolling-window budget checker in here instead). LiveTurns is
+    # the detached-turn registry (feat/chat2-detached-turns): a turn's SSE
+    # frames live here so a disconnected client can re-attach and the runner
+    # survives navigation/reload.
+    app.state.chat2_turn_locks = TurnLocks()
+    app.state.chat2_budget = AlwaysAllow()
+    app.state.chat2_live_turns = LiveTurns()
+
+    app.include_router(chat2_routes_attachments.router)
+    app.include_router(chat2_routes_chats.router)
+    app.include_router(chat2_routes_turn.router)
+
+    # Middleware registration order matters: in Starlette the LAST-added middleware
+    # (whether via @app.middleware("http") or app.add_middleware() — the decorator
+    # is sugar for the latter) is the OUTERMOST wrapper (first to run on every
+    # request).
     #
     # Desired request-path order:
-    #   ensure_csrf_id  (outer — populates request.state.csrf_id / csrf_token)
-    #   csrf_check      (inner — validates X-CSRF-Token after csrf_id is set)
+    #   Chat2BodyLimitMiddleware (outermost — reject an oversized declared
+    #                             Content-Length on POST /api/chat2/attachments
+    #                             before anything else, including CSRF, runs)
+    #   ensure_csrf_id           (populates request.state.csrf_id / csrf_token)
+    #   csrf_check               (validates X-CSRF-Token after csrf_id is set)
     #
-    # Therefore: csrf_check is added first (→ innermost), ensure_csrf_id last (→ outermost).
+    # Therefore: csrf_check is added first (→ innermost), ensure_csrf_id next,
+    # Chat2BodyLimitMiddleware last (→ outermost).
 
     @app.middleware("http")
     async def _csrf_check(request: Request, call_next):
@@ -300,6 +435,15 @@ def build_app() -> FastAPI:
     @app.middleware("http")
     async def _ensure_csrf_id(request: Request, call_next):
         return await ensure_csrf_id(request, call_next)
+
+    # Chat2 (2026-08-23) — T5 fix round 2: FastAPI resolves route dependencies
+    # (the UploadFile/Form parameters on POST /api/chat2/attachments) by
+    # awaiting Request.form(), which spools the ENTIRE multipart body before
+    # the route function body ever runs — an in-route Content-Length check
+    # alone is too late to stop a huge declared upload from being read onto
+    # disk/into memory. This raw-ASGI middleware runs ahead of FastAPI's
+    # routing entirely, so it can reject on the header alone.
+    app.add_middleware(Chat2BodyLimitMiddleware)
 
     @app.get("/api/csrf")
     async def get_csrf_token(request: Request) -> dict:

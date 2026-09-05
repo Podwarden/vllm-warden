@@ -41,16 +41,19 @@ from app.models.schemas import (
     TryStackRequest,
     TryStackResult,
 )
+from app.models.serialisation import model_detail, model_summary
 from app.models.sharding import shard_glob_for
 from app.models.stack_classifier import classify
 from app.models.suggest import suggest_config
-from app.runtime.cmd_builder import build_vllm_args
-from app.runtime.log_diagnostics import diagnose_engine_log
+from app.runtime.backends import registry
+from app.runtime.backends.paths import ModelFileNotFound, resolve_model_paths
+from app.runtime.backends.registry import DEFAULT_BACKEND
+from app.runtime.backends.vllm.images import UnsupportedChannelError, resolve_image
+from app.runtime.engine.run_marker import tail_since_last_run
 from app.runtime.supervisor import UnloadRefused, wait_for_health
 from app.runtime.warmup_probe import warmup_probe
 from app.templates import store as template_store
 from app.templates.registry import EngineSpec, template_to_dict
-from app.templates.resolver import UnsupportedChannelError, resolve_image
 from app.utils.sse import sse_headers
 
 logger = logging.getLogger(__name__)
@@ -209,11 +212,12 @@ async def discover_model_repo(
     that ``app.models.discovery.DiscoveryResult`` defines; the FE selects a
     file from ``files`` and posts a normal ``POST /api/models`` after.
 
-    ``config`` contains at most six keys: ``hidden_size``,
+    ``config`` is a fixed projection of ``config.json`` — ``hidden_size``,
     ``num_hidden_layers``, ``num_attention_heads``, ``num_key_value_heads``,
-    ``max_position_embeddings``, ``torch_dtype`` — exactly the set that the
-    parent issue #82 commits to. Anything else from ``config.json`` stays
-    opaque so the FE's VRAM-fit math has a stable contract.
+    ``max_position_embeddings``, ``torch_dtype`` (the set #82 commits to),
+    ``quantization_config`` (#176), and the KV-shape keys ``head_dim``,
+    ``sliding_window`` and ``layer_types``. Anything else from ``config.json``
+    stays opaque so the VRAM-fit math has a stable contract.
 
     Gated repos silently reuse ``data_dir/hf-token`` (CTO decision in #84) —
     we do not prompt the user for a second confirmation. Failures map to
@@ -299,6 +303,12 @@ class FitPreviewRequest(BaseModel):
     gpu_indices: list[int] = Field(..., min_length=1)
     max_batch_size: int = Field(default=1, ge=1, le=64)
     gpu_memory_utilization: float = Field(0.9, gt=0, le=1.0)
+    # Which engine the verdict is about. Defaults to vLLM so an older client
+    # that omits it gets exactly the behaviour it got before. `gpu_memory_
+    # utilization` is IGNORED for a backend that declares its own
+    # `vram_cap_fraction`, because for that backend the operator's number
+    # corresponds to no engine flag -- see BackendCapabilities.
+    backend: str = DEFAULT_BACKEND
     # Allow the FE to override max_model_len for the math; when None we fall
     # back to ``config.max_position_embeddings`` (the natural ceiling).
     max_model_len: int | None = Field(default=None, gt=0)
@@ -416,6 +426,26 @@ async def fit_preview(
     torch_dtype = config.get("torch_dtype")
     dtype_bytes = dtype_bytes_from_torch_dtype(torch_dtype)
 
+    # KV shape. `head_dim` is authoritative when declared; kv_reserve_bytes
+    # derives it only when it is absent.
+    declared_head_dim = config.get("head_dim")
+    head_dim = int(declared_head_dim) if declared_head_dim else None
+
+    # Interleaved sliding-window attention, counted from the EXPLICIT
+    # per-layer declaration only. A model that implies sliding attention some
+    # other way keeps the all-full-attention estimate, which over-counts --
+    # the safe direction.
+    layer_types = config.get("layer_types")
+    sliding_layers = 0
+    if isinstance(layer_types, list):
+        sliding_layers = sum(1 for t in layer_types if t == "sliding_attention")
+    raw_window = config.get("sliding_window")
+    sliding_window = int(raw_window) if raw_window else None
+    if sliding_layers and not sliding_window:
+        # Layers say they slide but the window is missing: charge them the
+        # full context rather than inventing a width.
+        sliding_layers = 0
+
     config_complete = bool(
         hidden_size and num_hidden_layers and num_attention_heads and num_kv_heads
     )
@@ -465,9 +495,33 @@ async def fit_preview(
             max_model_len=max_model_len_used,
             dtype_bytes=dtype_bytes,
             max_batch_size=body.max_batch_size,
+            head_dim=head_dim,
+            sliding_layers=sliding_layers,
+            sliding_window=sliding_window,
         )
 
-    budget = weights_budget_bytes(total_vram, body.gpu_memory_utilization, kv_reserve)
+    # Backend-aware VRAM cap. A backend that declares a `vram_cap_fraction`
+    # has no operator-set utilisation flag, so its declared value wins;
+    # otherwise the operator's `gpu_memory_utilization` is a real engine cap
+    # and is honoured. `registry.get` raises UnknownBackendError rather than
+    # falling back, which is the same contract Supervisor.load relies on.
+    try:
+        caps = registry.get(body.backend).capabilities
+    except Exception:
+        raise HTTPException(
+            422,
+            detail={
+                "error_code": "unknown_backend",
+                "message": f"unknown backend {body.backend!r}",
+            },
+        ) from None
+    cap_fraction = (
+        caps.vram_cap_fraction
+        if caps.vram_cap_fraction is not None
+        else body.gpu_memory_utilization
+    )
+
+    budget = weights_budget_bytes(total_vram, cap_fraction, kv_reserve)
     verdict = classify_fit(file_size, budget)
     # Float-zero-denominator safe: classify_fit returns "red" when budget<=0.
     ratio = (file_size / budget) if budget > 0 else float("inf")
@@ -606,6 +660,11 @@ async def create_model(
             else (dict(tpl.extra_env) if tpl else {})
         )
 
+        # Backend axis: explicit body > template > the registry default.
+        # Templates have no backend field in sub-project B, so getattr keeps
+        # this a pass-through until one gains it.
+        backend = body.backend or getattr(tpl, "backend", None) or DEFAULT_BACKEND
+
         # Engine axis: explicit body > template.engine > None (legacy path).
         eng_channel = body.engine_channel or (
             tpl.engine.channel if tpl and tpl.engine else None
@@ -648,6 +707,15 @@ async def create_model(
             engine_channel=eng_channel,
             engine_vllm_version=eng_version,
             engine_image=eng_image,
+            # Sub-project B. Templates carry no backend field yet, so this is a
+            # straight pass-through of the body's default; it is merged here
+            # anyway, with the same "explicit body wins" rule as hf_repo, so
+            # sub-project C does not have to find this site again.
+            backend=backend,
+            # Sub-project C (migration 0028). llama.cpp only; templates have no
+            # field for either, so both are straight body pass-throughs.
+            mmproj_filename=body.mmproj_filename,
+            n_gpu_layers=body.n_gpu_layers,
         ))
     return {"id": model_id, "served_model_name": body.served_model_name, "status": "registered"}
 
@@ -657,23 +725,12 @@ async def list_models(request: Request, _user: str = Depends(require_jwt)):
     settings = request.app.state.settings
     async with open_db(settings.db_path) as db:
         rows = await ModelRepo(db).list_all()
-    return {
-        "models": [
-            {
-                "id": r.id,
-                "served_model_name": r.served_model_name,
-                "hf_repo": r.hf_repo,
-                "hf_revision": r.hf_revision,
-                "gpu_indices": r.gpu_indices,
-                "tensor_parallel_size": r.tensor_parallel_size,
-                "status": r.status,
-                "pulled_bytes": r.pulled_bytes,
-                "pulled_total": r.pulled_total,
-                "last_error": r.last_error,
-            }
-            for r in rows
-        ]
-    }
+    # Both read paths serialise through app/models/serialisation.py. They used
+    # to hand-build their dicts, which is how migrations 0027/0028 could persist
+    # `backend`, `mmproj_filename` and `n_gpu_layers` correctly while both
+    # responses dropped all three -- surfacing to the operator as
+    # "Engine: vllm" on a model that was running llama-server.
+    return {"models": [model_summary(r) for r in rows]}
 
 
 @router.get("/{model_id}")
@@ -683,36 +740,7 @@ async def get_model(model_id: str, request: Request, _user: str = Depends(requir
         row = await ModelRepo(db).get(model_id)
     if not row:
         raise HTTPException(404, "not found")
-    return {
-        "id": row.id,
-        "served_model_name": row.served_model_name,
-        "hf_repo": row.hf_repo,
-        "hf_revision": row.hf_revision,
-        "gpu_indices": row.gpu_indices,
-        "tensor_parallel_size": row.tensor_parallel_size,
-        "dtype": row.dtype,
-        "max_model_len": row.max_model_len,
-        "gpu_memory_utilization": row.gpu_memory_utilization,
-        "trust_remote_code": row.trust_remote_code,
-        "extra_args": row.extra_args,
-        "extra_env": row.extra_env,
-        "status": row.status,
-        "pulled_bytes": row.pulled_bytes,
-        "pulled_total": row.pulled_total,
-        "last_error": row.last_error,
-        "filename": row.filename,
-        "parallelism_strategy": row.parallelism_strategy,
-        "max_batch_size": row.max_batch_size,
-        "hf_config_repo": row.hf_config_repo,
-        "tokenizer_repo": row.tokenizer_repo,
-        "engine": (
-            None if not row.engine_channel else {
-                "channel": row.engine_channel,
-                "vllm_version": row.engine_vllm_version,
-                "image": row.engine_image,
-            }
-        ),
-    }
+    return model_detail(row)
 
 
 @router.post("/{model_id}/try-stack", status_code=201)
@@ -884,15 +912,15 @@ class EffectiveArgvResponse(BaseModel):
     argv: list[str] = Field(
         ...,
         description=(
-            "The exact ``vllm serve`` argv that the supervisor would build "
-            "for this row at next load — minus the leading ['vllm', 'serve'] "
-            "pair, since those are constants. Includes overrides resolved "
-            "from extra_args, parallelism_strategy, GGUF quant tag, etc."
+            "The exact argv that the supervisor would invoke for this row at "
+            "next load, INCLUDING argv[0] and its subcommand (for the vLLM "
+            "backend, ``vllm serve``). Includes overrides resolved from "
+            "extra_args, parallelism_strategy, GGUF quant tag, etc."
         ),
     )
 
 
-# Placeholder port used purely so build_vllm_args produces a stable argv for
+# Placeholder port used purely so the backend produces a stable argv for
 # display. The real port comes from PortAllocator at load time; surfacing
 # 10000 here is a tell to the operator that the argv is for preview only.
 _EFFECTIVE_ARGV_PREVIEW_PORT = 10000
@@ -906,8 +934,9 @@ async def get_effective_argv(
 ) -> EffectiveArgvResponse:
     """Return the argv that ``vllm serve`` would be invoked with for this model.
 
-    Calls :func:`app.runtime.cmd_builder.build_vllm_args` against the
-    persisted row exactly as the supervisor would at load time, using a
+    Asks the row's backend for a :class:`~app.runtime.backends.LaunchPlan`
+    against the persisted row exactly as the supervisor would at load time,
+    so the returned argv includes argv[0] and its subcommand, using a
     fixed placeholder port (the real port comes from the supervisor's
     PortAllocator at load time and would jitter on every refresh).
     Includes ``extra_args``, parallelism flag, GGUF quant tag, tokenizer
@@ -929,12 +958,30 @@ async def get_effective_argv(
     # driver-dependent now (loopback for local, 0.0.0.0 for docker), so a
     # preview that omitted this would render --host 127.0.0.1 on a docker
     # deployment and disagree with what actually launches. Display-only.
-    argv = build_vllm_args(
+    backend = registry.get(getattr(row, "backend", None))
+    driver_name = getattr(settings, "engine_driver", "local")
+    # The preview shows the argv this row would ACTUALLY launch with, which for
+    # llama.cpp includes the resolved -m path. If the file is not pulled yet,
+    # say so rather than 500-ing: the preview is a diagnostic and an operator
+    # will reach for it precisely when a row will not load.
+    # Same capability gate as Supervisor.load, and for the same reason: a vLLM
+    # preview must not scan the model cache. This route is a read-only
+    # diagnostic, so it would be an especially poor place to acquire a
+    # filesystem failure mode.
+    resolved = None
+    if backend.capabilities.needs_local_model_path:
+        try:
+            resolved = resolve_model_paths(row, hf_cache_dir=settings.hf_cache_dir)
+        except ModelFileNotFound as exc:
+            raise HTTPException(409, str(exc)) from None
+    plan = backend.plan(
         row,
         port=_EFFECTIVE_ARGV_PREVIEW_PORT,
-        driver=getattr(settings, "engine_driver", "local"),
+        bind_host=backend.bind_host(driver_name),
+        resolved=resolved,
+        engine_driver=driver_name,
     )
-    return EffectiveArgvResponse(argv=argv)
+    return EffectiveArgvResponse(argv=plan.argv)
 
 
 @router.post("/{model_id}/pull", status_code=202)
@@ -1086,33 +1133,49 @@ async def _gather_preflight_inputs(
 
 
 def _read_engine_log_tail(settings, model_id: str, *, max_lines: int = 200) -> str:
-    """Read the last ``max_lines`` of the engine log for ``model_id``.
+    """Read THIS RUN's engine-log tail for ``model_id`` (at most ``max_lines``).
 
-    The log lives at ``{settings.logs_dir}/{model_id}.log`` (written by the
-    local-subprocess driver). Defensive: returns ``""`` if the file is missing
-    or unreadable — the diagnostics parser then returns None and the caller
-    keeps its generic ``last_error``.
+    The log lives at ``{settings.logs_dir}/{model_id}.log``. It is appended
+    across every load attempt, so a plain last-``max_lines`` read straddles run
+    boundaries and lets a PREVIOUS attempt's traceback be diagnosed as this
+    attempt's cause — reported to the operator as a confident, specific and
+    wrong answer that replaces the accurate generic message (#234). Drivers
+    therefore stamp a run sentinel into the log at spawn and we start from the
+    last one; ``tail_since_last_run`` falls back to the whole-tail behaviour for
+    logs written before sentinels existed.
+
+    Defensive: returns ``""`` if the file is missing or unreadable — the
+    diagnostics parser then returns None and the caller keeps its generic
+    ``last_error``.
     """
     log_path = settings.logs_dir / f"{model_id}.log"
     try:
         text = log_path.read_text(errors="replace")
     except (FileNotFoundError, OSError):
         return ""
-    lines = text.splitlines()
-    return "\n".join(lines[-max_lines:])
+    return tail_since_last_run(text, max_lines=max_lines)
 
 
-def _diagnose_or(settings, model_id: str, fallback: str) -> str:
+def _diagnose_or(
+    settings, model_id: str, fallback: str, backend_name: str | None = None
+) -> str:
     """Return an actionable diagnosis from the engine-log tail, else ``fallback``.
 
     Used by the three load-failure paths (subprocess exit, health timeout,
     warmup failure) to upgrade the generic ``last_error`` into something the
     operator can act on when the engine log reveals a recognised failure mode
     (KV overflow, OOM, trust_remote_code). Never raises.
+
+    Sub-project C: the grammar comes from the ROW'S BACKEND, because llama.cpp's
+    failures are different failures with different strings. Routing every log
+    through the vLLM grammar would at best say nothing and at worst produce a
+    confident vLLM-flavoured explanation for a llama.cpp fault. ``None`` resolves
+    to vLLM through registry.get -- decision D6, and exactly today's behaviour
+    for a call site that has no row in scope.
     """
     try:
         tail = _read_engine_log_tail(settings, model_id)
-        diag = diagnose_engine_log(tail)
+        diag = registry.get(backend_name).diagnose(tail)
     except Exception:  # noqa: BLE001 — diagnostics must never mask the real failure
         logger.exception("engine-log diagnosis failed for %s", model_id)
         return fallback
@@ -1139,6 +1202,7 @@ async def start_engine(settings, sup, port_alloc, model, port, overrides=None):
                     settings,
                     model_id,
                     f"vllm subprocess exited unexpectedly (rc={rc})",
+                    backend_name=getattr(row, "backend", None),
                 )
                 # Always carry the rc so operators can correlate with the log.
                 if not last_error.endswith(f"(rc={rc})"):
@@ -1187,7 +1251,10 @@ async def start_engine(settings, sup, port_alloc, model, port, overrides=None):
             # If the engine log reveals WHY it never came up (KV overflow, OOM,
             # trust_remote_code), surface that instead of the bare timeout.
             generic = "health timeout; subprocess still holding GPUs — force-unload to release"
-            diagnosed = _diagnose_or(settings, model_id, generic)
+            diagnosed = _diagnose_or(
+                settings, model_id, generic,
+                backend_name=getattr(model, "backend", None),
+            )
             last_error = (
                 generic
                 if diagnosed == generic
@@ -1215,7 +1282,10 @@ async def start_engine(settings, sup, port_alloc, model, port, overrides=None):
                 f"{probe_result.detail}; subprocess still holding "
                 f"GPUs — force-unload to release"
             )
-            diagnosed = _diagnose_or(settings, model_id, generic)
+            diagnosed = _diagnose_or(
+                settings, model_id, generic,
+                backend_name=getattr(model, "backend", None),
+            )
             last_error = (
                 generic
                 if diagnosed == generic
@@ -1369,6 +1439,27 @@ async def load_model(model_id: str, request: Request, _user: str = Depends(requi
     return body
 
 
+def _unloadable_statuses(force: bool) -> tuple[str, ...]:
+    """Which model statuses ``POST /{id}/unload`` accepts.
+
+    #236 — ``force=true`` has to mean force. The transient statuses are
+    precisely the ones an operator needs it for: a warden that died mid-load
+    leaves a row in 'loading' whose engine no longer exists anywhere, and the
+    plain guard below refused exactly that ("cannot unload from status
+    'loading'"), so the ONLY way out was editing SQLite by hand. A force
+    unload kills whatever the supervisor still holds (nothing, after a
+    restart) and writes a terminal status unconditionally.
+
+    'pulling' is deliberately NOT here: no engine is involved in a download,
+    and the terminal status this route writes is 'pulled' — a lie for a
+    half-finished pull. Boot reconciliation
+    (app/runtime/boot_reconcile.py) is what recovers those.
+    """
+    if force:
+        return ("loaded", "failed", "loading", "unloading")
+    return ("loaded", "failed")
+
+
 @router.post("/{model_id}/unload", status_code=202)
 async def unload_model(
     model_id: str,
@@ -1383,10 +1474,14 @@ async def unload_model(
         model = await ModelRepo(db).get(model_id)
         if not model:
             raise HTTPException(404, "not found")
-        if model.status not in ("loaded", "failed"):
+        if model.status not in _unloadable_statuses(force):
             raise HTTPException(409, f"cannot unload from status '{model.status}'")
         rt = await RuntimeRepo(db).get(model_id)
-        port = rt.port if rt else None
+        # The runtime row only exists once a load reached 'loaded'. Forcing a
+        # model out of 'loading' therefore finds nothing there, while the
+        # allocator DOES hold the port this process handed the spawn — ask the
+        # supervisor before giving up on releasing it (#236).
+        port = (rt.port if rt else None) or sup.get_port(model_id)
     # #166 — surface the refusal SYNCHRONOUSLY (the state check is instant),
     # but run the engine teardown itself in a background task. A large
     # multi-GPU engine can take many seconds to terminate; doing that inline

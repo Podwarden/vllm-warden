@@ -1,7 +1,7 @@
 // Unit tests for the shared copyToClipboard helper (lib/utils.ts).
 //
-// Issue #149: on the d5 deployment the warden UI is served over plain
-// HTTP via Tailscale/LAN (http://10.10.0.187:8080), where
+// Issue #149: on a real deployment the warden UI is served over plain
+// HTTP via a VPN or the LAN (http://192.0.2.10:8080), where
 // `navigator.clipboard` is undefined. The "Copy" buttons on the
 // freshly-minted token modal therefore always landed on the
 // "select manually" fallback. The helper now tries the async API
@@ -66,7 +66,7 @@ describe('copyToClipboard', () => {
   });
 
   it('falls back to execCommand when navigator.clipboard is undefined and resolves on success', async () => {
-    // Drop the clipboard API entirely — this is the d5 / non-secure
+    // Drop the clipboard API entirely — this is the non-secure
     // production case we are actually fixing.
     vi.stubGlobal('navigator', { ...navigator, clipboard: undefined } as unknown as Navigator);
     const execSpy = vi.spyOn(document, 'execCommand').mockReturnValue(true);

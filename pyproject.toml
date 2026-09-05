@@ -12,8 +12,9 @@ select = ["E", "F", "W", "I", "B", "UP", "ASYNC"]
 ignore = ["E501"]
 
 [tool.ruff.lint.flake8-bugbear]
-# fastapi.Depends() is always safe in function-parameter defaults.
-extend-immutable-calls = ["fastapi.Depends", "Depends"]
+# fastapi.Depends()/File()/Form() are always safe in function-parameter
+# defaults -- File/Form added for chat2 attachment multipart uploads (T5).
+extend-immutable-calls = ["fastapi.Depends", "Depends", "fastapi.File", "File", "fastapi.Form", "Form"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -22,6 +23,7 @@ pythonpath = ["."]
 addopts = "-ra --strict-markers"
 markers = [
     "integration: requires real subprocess + filesystem",
+    "fresh_db: the `client` fixture must let the lifespan migrate an empty DB instead of copying the pre-migrated template",
 ]
 
 [tool.mypy]

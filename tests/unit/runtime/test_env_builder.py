@@ -1,6 +1,6 @@
 import pytest
 
-from app.runtime.env_builder import build_subprocess_env
+from app.runtime.backends.vllm.env import build_subprocess_env
 
 
 @pytest.fixture

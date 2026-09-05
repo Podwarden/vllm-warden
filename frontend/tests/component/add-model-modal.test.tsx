@@ -458,8 +458,22 @@ describe("AddModelModal — GGUF soft-warn", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: /discover/i }));
 
+    await screen.findByTestId("file-table");
+
+    // Sub-project C: this banner is a statement about VLLM's loader ("verify
+    // the inferred arch matches a vLLM-known family"), so it is now gated on
+    // the vLLM backend. A .gguf pre-selects llama.cpp (D6), where the banner
+    // would be false and confusing, so it starts hidden...
+    expect(screen.queryByTestId("gguf-warn")).toBeNull();
+
+    // ...and reappears the moment the operator puts the model back on vLLM,
+    // which is exactly when it becomes true again. What this test has always
+    // protected -- that the banner is INFORMATIONAL and never blocks submit --
+    // is unchanged.
+    fireEvent.change(screen.getByTestId("backend-select"), {
+      target: { value: "vllm" },
+    });
     expect(await screen.findByTestId("gguf-warn")).toBeInTheDocument();
-    // Submit must NOT be disabled — the banner is informational only.
     const submitBtn = screen.getByRole("button", { name: /^add$/i });
     expect(submitBtn).not.toBeDisabled();
   });

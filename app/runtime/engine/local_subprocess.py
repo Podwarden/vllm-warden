@@ -1,7 +1,7 @@
 """In-container subprocess engine driver — the default, identical in
-behaviour to the pre-#160 inline Supervisor logic. Spawns `vllm serve`
-(or an injected binary, for tests) in a new session, logs to a per-model
-file, and stops it via process-group SIGTERM->SIGKILL.
+behaviour to the pre-#160 inline Supervisor logic. Spawns the backend's argv
+in a new session, logs to a per-model file, and stops it via process-group
+SIGTERM->SIGKILL.
 
 Behaviour note (deviation from plan): ``spec.env`` is passed to the child
 *verbatim*, NOT merged over ``os.environ``. This preserves the pre-#160
@@ -19,6 +19,7 @@ import signal
 from pathlib import Path
 
 from app.runtime.engine import EngineSpec
+from app.runtime.engine.run_marker import format_run_sentinel
 
 log = logging.getLogger(__name__)
 
@@ -46,10 +47,7 @@ class LocalSubprocessDriver:
     # refuse an engine-version pin instead of launching the wrong version.
     supports_engine_image = False
 
-    def __init__(
-        self, *, binary: str = "vllm", log_dir: str, log_max_bytes: int = 0
-    ) -> None:
-        self._binary = binary
+    def __init__(self, *, log_dir: str, log_max_bytes: int = 0) -> None:
         self._log_dir = Path(log_dir)
         self._log_max_bytes = log_max_bytes
 
@@ -72,17 +70,35 @@ class LocalSubprocessDriver:
             # Rotation is housekeeping; never let it stop an engine starting.
             log.warning("could not rotate %s", log_path, exc_info=True)
 
+    def _write_run_sentinel(self, log_fd: int) -> None:
+        """Delimit this spawn in the append-only log (#234).
+
+        Without a boundary the diagnosis reader's 200-line window straddles
+        runs and reports the PREVIOUS attempt's failure as this one's cause.
+        Written before the child is exec'd so it is strictly the first byte of
+        the run, and preceded by a newline when the file already has content so
+        an un-terminated final chunk from the last run cannot swallow it.
+
+        Best-effort: a log we cannot annotate must never stop an engine
+        starting -- the reader falls back to the old whole-tail behaviour.
+        """
+        try:
+            prefix = "" if os.fstat(log_fd).st_size == 0 else "\n"
+            os.write(log_fd, f"{prefix}{format_run_sentinel()}\n".encode())
+        except OSError:
+            log.warning("could not write run sentinel to engine log", exc_info=True)
+
     async def spawn(self, spec: EngineSpec) -> LocalHandle:
         self._log_dir.mkdir(parents=True, exist_ok=True)
         log_path = self._log_dir / f"{spec.model_id}.log"
         self._rotate(log_path)
         log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         try:
-            # `vllm serve` for the real binary; tests inject /bin/sh and pass
-            # the subcommand inside args, so only prepend "serve" for vllm.
-            head = [self._binary] + (["serve"] if self._binary == "vllm" else [])
+            self._write_run_sentinel(log_fd)
+            # argv[0] comes from the backend's LaunchPlan. This driver decides
+            # WHERE a process runs, never WHICH program it is.
             proc = await asyncio.create_subprocess_exec(
-                *head, *spec.args,
+                *spec.argv,
                 env=dict(spec.env),
                 stdout=log_fd, stderr=log_fd,
                 start_new_session=True,

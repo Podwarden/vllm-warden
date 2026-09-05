@@ -1,11 +1,1132 @@
 # Changelog
 
-All notable changes to vLLM Warden are documented here. Format follows
+All notable changes to LLM Warden are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once the first
 release ships.
 
 ## [Unreleased]
+
+## [v2026.09.05.2] - 2026-09-05
+
+### Changed
+
+- **`@podwarden/chat-ui` bumped 0.1.8 -> 0.1.23, so the public snapshot is
+  installable.** The pin was one day older than the package's public npm
+  mirror, which only goes back to 0.1.19 — so `github.com/Podwarden/vllm-warden`
+  would have shipped a dependency nobody outside could resolve, and
+  `publish:github` failed closed on the internal registry hostname before it
+  could. The two registries are not divergent lineages: the GitLab registry
+  carries a continuous 0.1.0 -> 0.1.23 and public npm mirrors the recent tail,
+  now within about a minute of each other. Confirmed identical rather than
+  assumed — the 0.1.23 tarball is byte-for-byte the same on both
+  (sha1 `6296e1db…`), and the dependency set is unchanged across all fifteen
+  versions, so nothing but the package itself moves.
+
+## [v2026.09.05.1] - 2026-09-05
+
+### Added
+
+- **`GET /v1/models` now reports `max_model_len`, so clients stop guessing the
+  context window.** OpenAI has never specified a context field on this
+  endpoint, so every OpenAI-compatible client either hardcodes a number or
+  carries a catalog keyed by model name — neither of which can know what a
+  private warden was launched with. vLLM answers this upstream by putting
+  `max_model_len` on the model card (vllm-project/vllm#4643); warden was
+  building its entries from the database and emitting only `id`/`object`/
+  `owned_by`, so that answer never reached the client. The field is additive
+  and clients that do not know it ignore it. It sits at the top level rather
+  than inside `warden`, because it is a CONFIGURED fact known the moment the
+  engine loads, whereas the `warden` block is gated on a stress run that most
+  wardens never have — gating a known ceiling behind an optional measurement
+  is what left clients guessing in the first place. The value is the engine's
+  own resolution order, not the row's: a live override first (a
+  reload-with-config or a stress sweep leaves the row untouched), then the
+  row, then the model's `max_position_embeddings` — because for a NULL row
+  that config value *is* the window both engines derive, not a guess about
+  it. When no source states one the key is omitted rather than sent as null,
+  so a client can still tell "unknown" apart from a real ceiling.
+
+### Fixed
+
+- **Installer: a free-disk preflight, and the documented image size was the
+  compressed one.** `install.sh` checked Docker, Compose and the NVIDIA
+  runtime and never free space, so a 30 GB VM passed every check and then
+  died partway through `docker compose pull` with "no space left on device"
+  (#249). The api image is 9.2 GB compressed on the wire — the figure
+  `docs/backends.md` quoted — but 28.9 GB as Docker stores it: 19.7 GB
+  unpacked, plus the compressed layers that the containerd image store keeps
+  alongside. The installer now measures free space on the Docker data root
+  (not `/`; they are often different filesystems), says the number, warns
+  under the 40 GB the stack wants and refuses a first pull under 20 GB, where
+  the image cannot even be unpacked — but only a first pull: a release already
+  in the store shares its layers, and `--no-pull` has nothing to refuse. A
+  check that cannot run (no data root from `docker info`, a `df` it could not
+  parse) says so and carries on, the way the toolkit preflight does. The
+  README states the disk requirement next to Docker, Compose and the GPU, with
+  what models add on top. Also: the override log line printed `${VERSION}`
+  and `${WARDEN_PORT}` literally and labelled the GPU index list "GPUs: 0",
+  which on a one-GPU host reads as no GPU at all; it now prints the values and
+  a count first ("GPUs: 1 (index 0)"). The model-pull runbook now says in as
+  many words that `/pull/progress` is an SSE stream, not JSON to poll.
+
+
+## [v2026.09.04.2] - 2026-09-04
+
+### Added
+
+- **Stress test: apply the measured setting and reload.** A run could tell you
+  `max_model_len` should be 32,768 and then leave you to set it by hand. The
+  results screen now offers **Apply and reload** beside the recommendation,
+  and only when the recommendation actually differs from what is running —
+  reloading to arrive at the setting already in force costs the model its
+  availability and changes nothing. It is one server-side operation rather than
+  three calls from the browser, because the settings patch refuses to touch a
+  loaded model: applying means unload, persist, load, and a client that closes
+  its tab midway would leave the model unloaded with nobody to finish. Refused,
+  with a reason, when the run never finished, produced no recommendation, was
+  measured under a different hardware fingerprint, or when a stress run
+  currently holds the model. The response says plainly that the measurement
+  described the configuration just replaced — applying invalidates its own
+  evidence, which is why it is offered rather than done automatically.
+
+### Fixed
+
+- **The prebuilt CI dependency image is tagged per architecture, so an
+  Apple-silicon workstation stops emulating.** The tag was a digest of the
+  requirements pair and nothing else. `make deps-image` pulls before it builds,
+  the CI builder runs on amd64 runners, so the registry held an amd64-only tag
+  — and `docker pull` on an arm64 Mac fetches that quite happily and runs it
+  under QEMU. The pull therefore *succeeded*, the local native build never ran,
+  and every `make test-unit` / `lint` / `typecheck` was emulated. The prebuilt
+  image, whose entire purpose was to make local runs fast, was making them
+  slower than having no image at all. Measured on an M-series Mac, same suite,
+  same command: **`make test-unit` 2743 s → 44 s**, `make lint` minutes → 1.5 s.
+  The tag now carries `-amd64` / `-arm64`, so the arm64 pull misses and falls
+  through to a local build — native, about as long as the pip install it
+  replaces (69 s), and `make deps-image` now pushes what it built, so the next
+  workstation pulls in ~10 s instead of rebuilding. The tag is content-addressed
+  (requirements digest plus architecture), which is what makes pushing from a
+  workstation safe: it is a shared cache, idempotent, and can only ever add the
+  image someone else would have built identically. CI is unaffected beyond
+  rebuilding its image once under the new tag, and still does not build arm64 —
+  on an amd64 runner that would mean emulating the thing this change avoids.
+
+- **`make typecheck` is green on a clean checkout and CI now runs it.** (#243)
+  `mypy --strict app/` had 322 errors in 57 files on `develop` and nothing in
+  `.gitlab-ci.yml` invoked it, so the Makefile advertised a check that was red
+  for everyone and gated nowhere; on 2026-09-03 five agents each spent a full
+  Docker mypy run proving the failure was not theirs. The errors are now
+  recorded in `mypy-baseline.txt` (mypy's own output minus line numbers, plus
+  the offending source line, sorted, human-readable) and
+  `scripts/mypy-baseline.py` fails when the tree drifts from it in either
+  direction: an error not in the baseline is a regression; a baseline entry
+  mypy no longer reports is a stale baseline that `make typecheck-baseline`
+  shrinks. mypy's configuration is unchanged (`strict = true`), no module is
+  `ignore_errors`'d, and the mechanical `no-untyped-def`/`type-arg` debt stays
+  visible as a to-do list rather than being silenced. A new `typecheck:mypy`
+  CI job runs the same script in the same prebuilt dependency container as
+  `lint`. `.mypy_cache/` is gitignored.
+
+## [v2026.09.04.1] - 2026-09-04
+
+### Fixed
+
+- **Stress test: a probe is only retired after failing the baseline twice.**
+  Excluding a probe used to rest on a single sample, and only two probes judge
+  the context ladder — so two unlucky readings abort the whole run while four
+  other probes may be answering perfectly. That contradicted the argument the
+  rest of the search is built on: every ladder verdict is replicated because one
+  sample near a threshold is a coin flip, while the baseline, which shapes the
+  entire run, decided on one. A dropped stream alone trips `abrupt` through a
+  missing `finish_reason`, and that was enough to cost the run an oracle
+  permanently. The re-check costs one extra probe per failing probe, at the
+  baseline, which is the cheapest place in the run — and when the second
+  reading is clean it becomes the reference, since a reference taken from a
+  failed probe would libel every later verdict measured against it.
+
+- **Stress test: the probe budget follows the engine's real context, not a
+  floor.** Three runs on the same model aborted with `aborted_no_baseline`
+  because `models.max_model_len` was NULL — nobody has to set it — so every
+  budget fell back to the unknown-context floor of 1,024 tokens and the needle
+  probe starved at exactly that. The engine's own `/props` was reporting
+  `n_ctx: 131072` throughout: the harness had 131k available and used 1k. It
+  now asks the engine what context it will accept, for both engine shapes
+  (llama.cpp `/props`, vLLM `/v1/models`), and the reference prompt is
+  re-clamped once that answer arrives. This is deliberately the opposite policy
+  to the model-ceiling resolver, which refuses the same number: that asks *how
+  far can this model go*, where a running engine only echoes our own
+  `--ctx-size` back; this asks *what will the engine accept right now*, where
+  that configured value is exactly the authority.
+
+## [v2026.09.03.9] - 2026-09-03
+
+### Changed
+
+- **Stress test: nothing about the probe budget is tuned to a particular
+  model.** The escalation ladder stopped at a hardcoded 1,024 tokens, chosen
+  because it suited the model in front of us. On `gpt-oss-20b-gguf` the needle
+  probe reached that ceiling and the run aborted with `aborted_no_baseline` —
+  and raising the constant would have fixed that one model while mis-sizing
+  every other, since a 2k-context model cannot spend 1,024 tokens reasoning
+  about a 1.5k prompt and a 262k model can spend far more. The ceiling is now
+  the arithmetic that holds for every model: the answer must fit in the context
+  alongside the prompt, using the engine's own token count. The same applies to
+  the reference condition — a 1,024-token baseline is a harness default, not a
+  fact about any model, and it is now clamped for models that cannot hold it
+  rather than reporting our default as their limit — which also means the
+  length ladder now always has somewhere to climb, since the reference prompt
+  can no longer fill the whole context. The remaining constants are bounds on
+  run cost, and are documented as such.
+
+- **CI pins the pytest-xdist worker count instead of using `-n auto`.**
+  Investigating why jobs were queueing 400-440 s to do 3-85 s of work
+  (vllm-warden#246) turned up two things, neither of them the suspected
+  "someone reset `concurrent` to 2". Both `bigdisk` runners are configured as
+  documented, `concurrent = 4` on 12 cores. But `concurrent` is a per-**host**
+  cap shared by every runner registered on it, and runner01 has four
+  registrations — one of which serves a different project entirely — so our
+  jobs compete for those slots with someone else's builds. And `-n auto` is
+  one worker per CPU, so a single `unit-tests` job claimed all 12; four
+  concurrent jobs would have put 48 pytest workers on 12 cores. Raising
+  `concurrent` without fixing that would have made contention worse rather
+  than better. CI now runs `-n ${VW_XDIST_WORKERS:-4}`, leaving room for the
+  rest of the DAG, which since the stage-to-DAG change all becomes runnable at
+  once. `make test-unit` keeps `-n auto` locally, where the suite is the only
+  thing on the machine.
+
+### Added
+
+- **Chat: `reasoning_effort` is a per-chat setting.** (#241) Current Qwen chat
+  templates take `reasoning_effort` next to `enable_thinking` and default to
+  the most expensive level (`xhigh`), and nothing could set it. `SettingsPatch`
+  now accepts `reasoning_effort` (a bounded string; `""` returns to the engine
+  default) and the turn route forwards it as
+  `chat_template_kwargs.reasoning_effort` while thinking is on. The level is
+  passed **verbatim in the model's own vocabulary**, never mapped: the catalog
+  reads each loaded model's chat template and publishes the values its
+  membership test accepts as `ModelInfo.reasoning_efforts` (Qwen3.8:
+  `xhigh`/`medium`/`low`), and the turn route only ever sends a value that
+  list contains — a validating template `raise_exception`s on an unknown
+  level rather than ignoring it, so a level chosen for one model can never
+  reach a model with a different vocabulary, and a model whose template we
+  cannot read gets no key at all. The settings panel control lands in
+  `@podwarden/chat-ui` and renders whatever list the backend publishes.
+
+### Fixed
+
+- **Chat: every chat envelope says whether its model is servable.** (#240)
+  `GET /chats`, `GET /chats/{id}`, `POST /chats`, `PATCH /chats/{id}` and
+  `POST /chats/{id}/fork` now carry `model_loaded: bool` — the same
+  `get_model_info` check the turn route 404s on. A chat pins its model by name
+  and nothing constrains that name to the loaded set, while the catalog lists
+  loaded models only; the settings panel's `<select>` therefore had a value
+  matching no option and the browser showed the first loaded model instead,
+  indistinguishable from a real selection, until the turn failed with
+  `Model "X" is not loaded.` on a model the operator could not see anywhere.
+  Three chats on a client install were found in this state on 2026-09-03 and
+  had to be repaired with `PATCH /api/chat2/chats/{id}` from outside the UI.
+  The panel fix — the chat's own model always listed, marked unavailable when
+  unloaded, with a one-click switch to a loaded model — is in
+  `@podwarden/chat-ui` 0.1.8, which this change pins (superseding 0.1.7,
+  whose control hard-coded Qwen3.8's level names for every reasoning model).
+
+## [v2026.09.03.8] - 2026-09-03
+
+### Added
+
+- **Stress test: the running modal now says what it is doing, and when it will
+  be done.** A run in flight showed "0 probe(s)", "No probes recorded yet", and
+  a bar rendered FULL — which reads as *finished*, the worst of the three
+  possible wrong answers. Observations are only written when a run ends, and a
+  thorough run takes hours. Each phase now reports its name, what it is
+  probing, how far through it is, and an ETA, persisted by the heartbeat that
+  already ticks for the lease. The ETA is that phase's own measured pace
+  applied to its own remainder, never extrapolated across phases — a length
+  rung is one HTTP probe while a sweep candidate is an engine reload of up to
+  ten minutes — and a phase that cannot bound its remainder reports no ETA
+  rather than a guess. The indeterminate bar is now a narrow pulsing segment
+  instead of a full one.
+
+- **Stress test: "Wipe and run again", beside a finished run's results.** The
+  published record deliberately falls back past a run that measured nothing, so
+  a failed run cannot withdraw a good older measurement. An operator who has
+  read the results and decided to replace them is the opposite case, and only
+  they can tell the two apart — so it is offered, never taken automatically. It
+  returns to the confirm screen rather than starting immediately: having read a
+  result does not imply acknowledging that the next run can take the engine
+  down.
+
+## [v2026.09.03.7] - 2026-09-03
+
+### Added
+
+- **An installer that ships in the repository.** Until now the only documented
+  install path was a script rendered on demand by the PodWarden Hub from a
+  catalog row, so an Apache-2.0 product could not be installed without the
+  vendor's server, air-gapped installs were impossible, and the repository and
+  the real install drifted silently -- on 2026-09-03 the shipped compose
+  reserved every GPU on `api` while the Hub-rendered override gave GPUs to
+  `caddy`, and because Compose appends sequences the merged stack asked for 3
+  GPUs on a 2-GPU host. `git clone && ./install.sh` now produces a running
+  stack with no access to podwarden.com. `install.sh` (POSIX sh, works piped
+  from curl, every prompt on /dev/tty; `--dir`, `--gpus`, `--origin`, `--port`,
+  `--version`, `--no-generate-secrets`, `--no-pull`, `--yes`, `--check`,
+  `GPU_TOOLKIT_INSTALL=yes|no`) preflights Docker, Compose 2.24+ and -- the
+  check that broke the client install -- whether `docker info` lists the
+  `nvidia` runtime, not merely whether `nvidia-smi` works; it offers to install
+  the NVIDIA Container Toolkit, lets you pick GPUs, generates the secrets, and
+  writes `.env` plus a `docker-compose.override.yml` whose device list carries
+  the `!override` tag so it replaces the base reservation instead of appending
+  to it. `.env.example` is committed and is the single source of truth for the
+  env contract; `make/operator.mk` (included by the root Makefile, shipped
+  verbatim as an install's Makefile) adds `start` / `stop` / `restart` /
+  `logs` / `status` / `pull` / `config` / `preflight` / `uninstall` and the
+  air-gapped transport targets `save-images` / `load-images` /
+  `export-hf-cache` / `import-hf-cache`; the README documents the offline path
+  (pin `VERSION`, `docker save`/`load` all three images, pre-seed the HF cache
+  volume, `HF_HUB_OFFLINE=1`). CI now runs `scripts/check-env-contract.sh`
+  (every `${VAR}` in compose or the installer is described in `.env.example`,
+  every knob is consumed, defaults agree with `app/config.py`), a stubbed
+  self-test of the installer under dash and busybox, an allow-failure drift
+  check against the env contract the Hub currently renders, and
+  `installer:stack-up`, which runs the real installer against the repo's own
+  compose on a bigdisk runner and asserts every service reaches healthy
+  (#242).
+
+### Fixed
+
+- **Stress test: a longer run is no longer refused because a shorter one just
+  finished.** Asking for a longer mode straight after a `conservative` run
+  returned `200 reused` naming that run. The cooldown asked "is there a recent
+  measurement for this fingerprint?" and never "does it answer THIS request?".
+  The modes are not interchangeable: `thorough` confirms 7/7 rather than 5/5,
+  probes three needle offsets rather than one, and is the only mode that runs
+  the configuration sweep — so it is the only mode that can produce a
+  `recommended_config` at all. A cached run is now reused only when its mode is
+  at least as demanding as the one requested.
+
+- **Stress test: the published context limit was our own token budget again.**
+  The first successful run on `gpt-oss-20b-gguf` confirmed 1,616 tokens and
+  published 1,454 as `measured`, `confirmed` — for a model that had filled
+  128k earlier the same day. Every failure from 1,664 upward carried
+  `abrupt + reasoning_only + wrong`, the starvation signature: the needle
+  probe's budget settled at 96 tokens against the 1k baseline, and a reasoning
+  model's chain grows with the input, so longer rungs starved. Escalation ran
+  once, at the baseline, and the ladder ignored `starved` thereafter. The
+  ladder and the limit suite now re-calibrate on that signature instead of
+  recording it as a gate failure. Budgets only ever grow and are carried
+  forward, so a later rung is never judged under a smaller budget than an
+  earlier one.
+
+## [v2026.09.03.6] - 2026-09-03
+
+### Changed
+- **CI: one pipeline per push, a DAG instead of stages, and dependencies baked
+  into a prebuilt image.** Measured over 23 pipelines / 181 jobs, most of the
+  wall clock was not build or test work. Every push ran **two** full pipelines
+  — a branch pipeline and an MR pipeline on the same SHA (verified pairs
+  20317/20316, 20307/20306, 20301/20300, 20295/20294) — so half of all runner
+  load was duplicate; a `workflow:` block now suppresses the redundant push
+  pipeline when the branch already has an open MR. `npm ci` stalled 5-7 minutes
+  in 12 of 21 frontend jobs, while the one job using a glibc image with
+  `--no-audit --no-fund` stalled 0 of 21 (same install: `added 690 packages in
+  7m` on alpine vs `in 10s` on slim), so the frontend jobs moved to
+  `node:20-slim`. Gate-rejected MRs still ran their whole job set — 1245-1685
+  runner-s each after the gate failed in 4-15 s — so every job now `needs:` the
+  gate. `cleanup-stale-caches` did 1-5 s of work but queued 627 s median /
+  1737 s max in stage 1, gating everything behind it; it is deleted, because
+  `get_sources` already removes those directories at checkout. Finally,
+  `pip install` ran 22-55 s in each of four jobs: `scripts/ci-deps-image.sh`
+  resolves an image tagged with a hash of both requirements files, built only
+  when they change, and falls back to `pip install` when the tag is absent so a
+  cold cache degrades rather than fails. The same resolver backs the Makefile,
+  so local `make` targets stop reinstalling from PyPI on every invocation.
+
+### Fixed
+- **Stress test: three defects found by a code review of the day's fixes.**
+  `current_for` fetched only the newest run before asking whether it had
+  measured anything, so a newer valueless run hid a valid older measurement —
+  which was then republished as `provenance: stale` with "the hardware
+  changed", when nothing had. `has_measurement` counted an axis the runner
+  explicitly withholds (`invalid_reason: prefix_cache_not_defeated` sits beside
+  a positive `raw_confirmed`). And the stress lease guarded
+  `restore_after_warden_restart` and `restart_crashed_models` but not
+  `check_once` — the path a stress run actually provokes, since a wedged engine
+  leaves the row reading `loaded` and `wants_restart` is never consulted.
+
+- **Stress test: a run that measured nothing no longer blocks the retest.**
+  `current_for`'s docstring calls its result "the newest publishable
+  measurement" and lists four conditions — none of which asked whether the run
+  measured anything. A run that completed having confirmed no value satisfied
+  all four and held the six-hour cooldown, so pressing **Stress test** returned
+  `200 reused` naming the dead run: no new run, no error, and no way out,
+  because the UI reveals its `force` control only on a `409`. Completing and
+  measuring are now distinct: a run must carry a recommendation or a positive
+  `raw_confirmed` on some axis to hold the slot. A real measurement is still
+  reused, so the cooldown continues to protect hours of GPU time.
+
+- **Stress test: a probe that fails at the baseline no longer vetoes the whole
+  run.** With the budget fix in, `gpt-oss-20b-gguf` calibrated a clean baseline
+  and still confirmed nothing: `needle` passed at 1,024, 960, 896 and 8,192
+  while `summary` tripped `repeating` at **every** length, the baseline
+  included, so every rung failed. Asked the same question directly the model
+  answered in two clean sentences — but the argument does not rest on that. A
+  gate that reads the same at the reference length as at the axis maximum
+  cannot locate a threshold on that axis; it only hides one. Probes that trip a
+  gate at the baseline are now excluded from the ladder and reported as
+  `excluded_probes`, so "summary was dropped because it tripped repeating at
+  the baseline" reaches the operator instead of a silent zero. When every
+  ladder probe is excluded the run aborts rather than publishing the axis
+  maximum on no evidence. `gates.py` already refused to judge against a
+  degenerate baseline for the SHORT gate; this applies the same rule to the
+  rest.
+
+- **Stress test: the runner's bookkeeping no longer poses as a measurement.**
+  `neighbours` and `baseline` were rendered as MEASURED LIMITS cards, each with
+  a "measured" badge and a value of "—". They are the runner's own notes. A
+  badge that appears on scratch notes is worth nothing on a real number.
+
+- **The unit suite runs in 31 s instead of 388 s, and three real bugs it was
+  hiding are fixed.** Same assertions, same counts (2033 passed, 2 skipped
+  before and after), zero production changes. bcrypt at the production cost
+  factor was ~65% of the runtime on its own — ~640 `hashpw`/`checkpw` calls at
+  ~370 ms each, because every `seed_admin_user` hashes and every `jwt_login`
+  verifies — so an autouse fixture lowers the *test* cost factor to bcrypt's
+  minimum; the hash format, the verify path and production defaults are
+  untouched. Schema migrations now run once into a session template that each
+  test copies, rather than 28 fsync'd transactions per test. What the speed
+  exposed matters more than the speed: unit tests were reaching
+  **huggingface.co** for `AutoTokenizer.from_pretrained`, now forced offline
+  into the character-estimate fallback the cache already implements; the
+  watchdog's first tick was racing the proxy tests' patched
+  `httpx.AsyncClient.send` and becoming `calls[0]` — invisible while bcrypt was
+  slow, then failing 4 runs in 12 once it was fast; and two tests calling
+  `importlib.reload()` in `finally` while `monkeypatch.setenv` was still live
+  were baking `VW_ENGINE_NETWORK=""` into the module for every later test,
+  which passed serially only because the victim happens to run before the
+  culprit.
+
+## [v2026.09.03.5] - 2026-09-03
+
+### Fixed
+
+- **Stress test: a reasoning model no longer fails every probe.** The first
+  production run failed all six probes at the baseline on
+  `gpt-oss-20b-gguf` — `["abrupt", "reasoning_only", "wrong"]` on every one —
+  and correctly published nothing. The model was healthy throughout. The suite
+  budgets `max_tokens` at ~4x each probe's ANSWER (16 for arithmetic), which is
+  sound for a model that answers directly and impossible for one that reasons
+  first: measured against the live engine, the same prompt returned
+  `content=''` with a truncated chain at `max_tokens=16` and `'42'` at 64, and
+  gpt-oss needs 56 completion tokens to add two numbers. Every gate then fired
+  truthfully about an artefact of our own configuration. The baseline now
+  detects the one signature that can only mean a starved budget — no content,
+  reasoning present, `finish_reason: "length"` — and escalates 4x up to 1024
+  tokens until the model can answer, once, carrying the settled budget through
+  the sweep and into the concurrency probe. This is measured rather than read
+  from `models.supports_reasoning`, which is tri-state and was NULL for the
+  very model that exposed the bug while being 1 for another. A model that
+  answers within its budget is unaffected, and `REASONING_ONLY` still fires on
+  a model that genuinely reasons without answering.
+
+- **A run that cannot establish a baseline now says so.** Previously it
+  completed with `invalid_reason: no_confirmed_value`, which reads as a verdict
+  on the model rather than on the harness — after spending the whole sweep to
+  reach it. It now aborts immediately with `aborted_no_baseline`.
+
+- **Stress test: a completed run now shows what it measured.** Every finished
+  run rendered *"No recommendation. Nothing met the bar for publication."* —
+  successful ones included. `GET /capabilities` returns `limits` and
+  `recommended_config` at the top level, while `runs[]` carries only
+  `_run_summary`, which omits both; the result screen reads them off the run
+  object, so they were always `undefined`. The modal now attaches the published
+  record to the run it came from. The attribution is guarded on a new
+  `record_run_id`, because the record is keyed on the FINGERPRINT rather than
+  on the latest run: after a run that published nothing, an earlier run's
+  numbers are still standing, and presenting those as the finished run's own
+  findings would be exactly the confidently-wrong output this feature exists to
+  prevent.
+
+## [v2026.09.03.4] - 2026-09-03
+
+### Added
+
+- **Stress test: measure what a model can actually do here.** A model's real
+  limits depend on the card it landed on, not on its model card, and until now
+  the only way to find them was to raise a setting and wait for something to
+  break. A **Stress test** button on the model page runs a sweep and answers
+  the operator's actual question — *what should `max_model_len` be for this
+  model on this hardware?* Failure is defined by output, not by exit code: a
+  run fails when the model goes empty, abrupt, repeating, short against its own
+  baseline, reasoning-only, or wrong on a graded probe, because a model
+  degrades long before an engine dies — and an engine still dies when a run
+  induces OOM, which is measured too. Every published number is measured; a
+  bound that was never confirmed is not published at all, and a measurement
+  taken on different hardware is flagged stale rather than reused. Results
+  reach API clients as an additive `warden` block on `GET /v1/models`, which
+  carries the measured limits for the configuration the engine is actually
+  running and never a recommendation for one it is not. The watchdog stands
+  down for a model under a live stress lease, so a run that crashes an engine
+  on purpose no longer races the recovery loop for the restart budget.
+
+### Fixed
+
+- **`VW_WARMUP_PROBE_TIMEOUT_S` default raised again, `300.0` → `600.0`.**
+  The `60 → 300` bump in v2026.09.03.3 removed the worst of the cliff but not
+  the failure mode. Deploying that release to the same two-GPU client host
+  recreated the `api` container; the watchdog auto-restored
+  `nvidia/Qwen3.6-35B-A3B-NVFP4` (TP=2, NVFP4, multimodal) and it took roughly
+  **8 minutes** to reach `loaded` — the third such measurement on that box,
+  after 4m17s and 8.5min for two different models. The install only survived
+  because `.env` carried a hand-set `600.0`. The cost of this value is
+  asymmetric: a subprocess that dies is reported at once by the `on_exit`
+  callback in `start_engine` no matter what the timeout is, and a probe that
+  cannot connect returns immediately — so a larger budget only extends how
+  long a *live* engine is allowed to finish starting, while too small a budget
+  marks a healthy engine `failed` while it keeps running and holding the GPUs.
+  A fixed budget is still a guess about hardware we do not control; starting
+  the probe clock only once `/health` passes is tracked as #235 part 2.
+
+## [v2026.09.03.3] - 2026-09-03
+
+### Fixed
+- **#235 — `VW_WARMUP_PROBE_TIMEOUT_S` default raised `60.0` → `300.0`.**
+  Measured live on a client install (two RTX 5060 Ti, vLLM 0.26.0, TP=2):
+  `unsloth/Qwen3.8-27B-NVFP4` reported `init engine (profile, create kv
+  cache, warmup model) took 123.13 s` and did not accept connections until
+  roughly 4m17s after spawn; `nvidia/Qwen3.6-35B-A3B-NVFP4` took about 8.5
+  minutes to reach `loaded`. Both are structural, not pathological: NVFP4/FP8
+  kernel autotuning (FlashInfer autotunes `fp4_gemm`/`fp8_gemm` on first
+  start), multimodal vision-tower profiling, tensor-parallel NCCL/shm
+  startup, and hybrid-attention page-size reconciliation all blow through a
+  60s budget on their own. A model that loaded and served perfectly was
+  marked `failed` while its engine kept running and holding both GPUs. This
+  change only raises the default (`app/config.py`, `docs/operating.md` env
+  table); the probe still counts startup time against its budget rather
+  than starting the clock once `/health` passes — tracked separately as
+  #235 part 2.
+
+- **`GET /api/models` and `GET /api/models/{id}` no longer drop engine
+  settings and capability flags.** (#237) On a two-GPU install, `PATCH
+  /api/models/{id}/settings {"supports_reasoning": true}` returned `{"ok":
+  true}`, the DB really updated, and neither read endpoint showed it —
+  confirmable only by opening SQLite directly. The detail endpoint omitted
+  `supports_tools` / `supports_vision` / `supports_reasoning` entirely (not
+  `null` — absent), and the list endpoint additionally dropped
+  `max_model_len`, `gpu_memory_utilization` and `extra_args`, so a list view
+  had no way to show engine sizing at all. Both routes now serialise through
+  one function in `app/models/serialisation.py` (`model_detail` and
+  `model_summary` are thin wrappers around it), so the two responses are
+  field-for-field identical and a future migration cannot add a column that
+  reaches one route but not the other. The three capability columns are
+  tri-state in the DB (`1` = operator said yes, `0` = operator said no,
+  `NULL` = nobody has said, and `app/chat2/catalog.py` auto-detects vision
+  only while the column is `NULL`), so they serialise as `true` / `false` /
+  `null` rather than being coerced to a boolean, which would have silently
+  turned "nobody has said" into "operator said no".
+
+- **Load-failure diagnosis no longer reports the PREVIOUS run's fault.** The
+  engine log (`{logs_dir}/{model_id}.log`) is appended across every load
+  attempt, and the diagnoser was handed its last 200 lines — a window that
+  straddles run boundaries. An earlier attempt's recognised traceback was
+  matched and reported as the current attempt's cause, *replacing* the accurate
+  generic message with a confident, specific, wrong one. Seen twice live on a
+  two-GPU client install: a run that got all the way through profiling
+  (`Available KV cache memory: 2.31 GiB`, `init engine … took 123.13 s`) was
+  reported as "GPU ran out of memory loading the model", and a run at
+  `max_model_len=32768` that reached a 269,633-token KV cache was reported with
+  the previous run's "wants 262144 tokens" verbatim — advice that would have the
+  operator lower `max_model_len` a second time for nothing. Every engine driver
+  now stamps a run-boundary sentinel
+  (`===== vllm-warden run <uuid> started <iso-ts> =====`) into the log when it
+  opens it for a spawn, and the diagnoser reads only from the last sentinel on
+  (still capped at 200 lines). The full history stays in the file — comparing
+  attempt N-1 with attempt N is exactly why we delimit rather than truncate —
+  and logs written before sentinels existed fall back to the old whole-tail
+  read, so no install loses diagnosis on upgrade. (#234)
+
+- **A model can no longer be stranded in `loading` forever.** Restarting the
+  `api` container mid-load left the row at `status='loading'` with no engine
+  anywhere, and every route out was closed: `load` refuses from `loading`,
+  and so did `unload` — `?force=true` included. The only escape was editing
+  SQLite by hand, which an operator without a shell on the container does not
+  have (observed on a client install, 2026-09-03). Two fixes, either of which
+  removes the dead end:
+  - Boot reconciliation (`app/runtime/boot_reconcile.py`) now demotes every
+    row left in a transient status (`loading`, `unloading`, `pulling`) whose
+    engine the supervisor does not hold: to `pulled` when the weights are
+    complete in the HF cache, `registered` when they are not, with
+    `last_error` saying the status was recovered after a restart. It runs
+    before `mark_runtime_dead_on_startup`, and deliberately leaves both
+    `loaded` rows and a watchdog restore in flight to that call, which
+    records the `prior_status` the automatic restore keys on.
+  - `POST /api/models/{id}/unload?force=true` now succeeds from `loading` and
+    `unloading`: it tears down whatever the supervisor still holds (nothing,
+    after a restart) and writes a terminal status unconditionally. Plain
+    `unload` keeps its guard, and force still refuses from `pulling` — no
+    engine is involved in a download, and this route's terminal status would
+    be a lie for a half-finished pull.
+
+- **#238 — the HF cache reported roughly twice the disk it was using.** On a
+  client install `GET /api/cache/models` claimed 46.9 GB for a repo that `du`
+  measured at 22 GiB, and listed every repo twice; the reported total was
+  52.2 GB against a real 28.6 GB. Two mechanisms, both reproduced in a fixture
+  tree before fixing. The scan deduplicated by resolved directory path, so a
+  repo split across `<cache>/models--org--name` (where the weights live) and
+  `<cache>/hub/models--org--name` (HF's own layout) became two rows. And the
+  size walk used `os.walk(followlinks=False)` — correct — but then `os.stat`,
+  which *does* follow symlinks, on every name it yielded: HF's
+  `snapshots/<rev>/file` is a symlink into `blobs/<sha>`, so each blob was
+  counted once as itself and again as its symlink. Directories are now grouped
+  by decoded repo id and every file counted once, keyed on `(st_dev, st_ino)`.
+  This is the number an operator sizes a disk against and the one the reclaim
+  view shows before a delete.
+
+- **#239 — the chat's "Enable thinking" toggle was invisible on every new
+  model.** `@podwarden/chat-ui` renders the control only when the catalog says
+  `supports_reasoning`, and that column defaults to `NULL`, which
+  `app/chat2/catalog.py` collapsed to `False`. Unlike `supports_vision` it had
+  no auto-detection, so the toggle stayed hidden until an operator discovered —
+  unprompted — that they had to `PATCH` the flag by hand. Everything behind it
+  already worked. While the column is `NULL` the flag is now inferred from the
+  model's chat template, which is decisive for this family: a template that
+  branches on `enable_thinking` belongs to a model that reasons. Detection
+  reads the standalone `chat_template.jinja` first — newer repos ship it as its
+  own file and leave `tokenizer_config.json` without the key — and falls back
+  to the tokenizer config. An explicit operator `1`/`0` still wins, and a
+  missing or unreadable cache degrades to `False` rather than raising on the
+  chat's hot path.
+
+## [v2026.09.03.2] - 2026-09-03
+
+### Added
+- **Chat: LaTeX-style math renders.** Models write display math as `\[ ... \]`
+  and inline math as `\( ... \)`; those reached the screen as plain bracketed
+  text. Bump `@podwarden/chat-ui` to 0.1.6: balanced LaTeX delimiters are
+  rewritten to the `$`-forms before parsing and render through the existing
+  sanitized KaTeX pipeline. Code fences and inline code are never touched, and
+  a half-streamed `\[` stays literal until its `\]` arrives.
+
+### Fixed
+
+- **The fit preview knows which engine the verdict is about.** An operator
+  picking `gpt-oss-20b-Q8_0.gguf` (11.28 GiB) for **llama.cpp** on a 16 GiB
+  card was told "won't fit". Three errors compounded to produce it, and each
+  is fixed:
+  - `POST /api/models/fit-preview` had no `backend` field at all, so it
+    always applied vLLM's `gpu_memory_utilization` — 0.9, hiding 10% of the
+    card. llama-server has no such flag (`--help` in the shipped b10731 image
+    offers only `-ngl`, a layer count), so the operator's number corresponds
+    to nothing. Backends now declare `vram_cap_fraction`: `None` for vLLM,
+    meaning the operator's flag is a real cap and is honoured; `1.0` for
+    llama.cpp, meaning no engine-imposed fraction. The headroom judgement
+    stays where it was — the verdict ladder already calls 0.80–1.0 "tight" —
+    rather than being applied twice via an invented safety margin. Declared
+    on `BackendCapabilities` rather than branched on the backend name, for
+    the reason `needs_local_model_path` already documents.
+  - `head_dim` was always derived as `hidden_size // num_attention_heads`.
+    gpt-oss-20b declares `head_dim: 64`; the derivation gives `2880 // 64 =
+    45`, a 30% undercount of the entire KV term — the direction
+    `dtype_bytes_from_torch_dtype` already names as dangerous, because it
+    turns a red row green.
+  - Every layer was charged the full context. gpt-oss-20b runs interleaved
+    sliding-window attention: 12 of its 24 layers hold a 128-token window,
+    not 131072 tokens. Counted only from an explicit `config.layer_types`,
+    so a model that implies sliding attention some other way keeps today's
+    over-counting estimate rather than inviting a per-family guess that could
+    silently under-count.
+  Net for the reported case: KV 4.22 GiB → 3.00 GiB, and the verdict goes
+  from **"won't fit"** to **"tight"** (ratio 0.87) on llama.cpp. It is
+  genuinely tight — 11.28 GiB of weights on a 16 GiB card at full 131k
+  context — so "tight" is the honest answer, not "fits".
+  `recommend_max_model_len` moves in lockstep; it is the inverse of the
+  reserve, and a recommendation computed from a different KV shape would
+  paste in a context that produces a different verdict. The discovery config
+  projection widens by `head_dim`, `sliding_window` and `layer_types` —
+  the route reads `discovery["config"]`, so a key absent there is a key the
+  math cannot see. `GET /api/system/backends` now returns
+  `vram_cap_fraction` so the dialog's client-side budget recompute uses the
+  same cap the server did, and switching engine drops the cached verdicts
+  instead of showing the previous engine's answer.
+
+## [v2026.09.03.1] - 2026-09-03
+
+### Fixed
+
+- **The GGUF architecture warning no longer fires on llama.cpp, and its link
+  no longer 404s.** `gguf_arch_unsupported` is measured against
+  `KNOWN_GGUF_ARCHES`, which is *vLLM's* GGUF-loader allowlist. It was
+  rendered with no backend gate, so picking a GGUF for llama.cpp produced
+  "Architecture … is not in the vLLM-known GGUF allowlist — load is likely to
+  fail" about the one file format llama.cpp is built around. Reported against
+  a live install serving `ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF` on llama.cpp
+  while sitting outside that allowlist. The gate goes on
+  `warningsByFilename`, the single path a warning takes to either render
+  site, so neither `ShardFamilyRows` nor `FileRow` needs a new prop.
+  The banner also linked to `/docs/operating.md#supported-gguf-architectures`
+  — a repo-relative path used as a browser href. Nothing has ever served
+  `/docs`: the Caddyfile has no `handle /docs*` and the Dockerfile never
+  copies `docs/` into the image, so it 404'd in every deployment. It was the
+  only `/docs/` href in the frontend, so rather than add a docs subsystem for
+  one link the banner now carries the remedy directly — switch the engine to
+  llama.cpp. `docs/operating.md` says the same, having been written when vLLM
+  was the only backend.
+  The two #101 tests covering this banner were asserting the defect: both
+  pick a `.gguf`, `backendForFilename` maps that to llama.cpp, and they then
+  required the vLLM banner to be present. They now select vLLM first.
+
+## [v2026.09.02.3] - 2026-09-02
+
+### Changed
+
+- **The product is now called LLM Warden.** Two engines ship, so a name that
+  claims one of them was wrong: the nav wordmark, the landing page title and
+  copy, the login and setup-wizard headings, the browser tab titles, the
+  FastAPI/OpenAPI title, the engine-pin error message, the Hub catalogue's
+  display name and stack label, and the READMEs all read "LLM Warden". Prose
+  that framed the product as *being* vLLM was corrected with it — the README's
+  opening paragraph and the landing hero now say the warden wraps an engine
+  rather than that it wraps vLLM, and `docs/backends.md` no longer claims vLLM
+  is the only backend.
+  This is a **display-only** rename, deliberately: nothing an identifier
+  depends on moved. The `vllm-warden` catalogue slug and `app_family`, the
+  `vw_`/`VW_` token, cookie and env prefixes, the `pw-vllm-warden` namespace,
+  `/data/vllm-warden.db`, image and container names, the `vllm_warden` module
+  path and the repository itself are all unchanged, so no deployment, token,
+  bookmark or install script breaks. Bare "vLLM" is also untouched wherever it
+  means the *inference engine* — "vLLM version", `vllm/vllm-openai`, live vLLM
+  logs — because that text is correct and renaming it would make the product
+  lie about what it is running.
+  `tests/unit/test_product_name.py` is the guard: it scans every user-visible
+  surface for the two-word name with a whitespace separator, and asserts that
+  the bare engine name and the hyphenated identity slug still pass.
+- **Choose which models the stats cover.** `/stats`, `/stats/live` and
+  `/godmode` share one model selection — all models, one, or any combination —
+  and at least one always stays selected: the last checkbox is *disabled*
+  rather than silently re-ticking, because a click that appears to do nothing
+  leaves the operator unable to tell whether it registered. `GET
+  /api/stats/v2/overview` gained `?models=`; absent still means the whole
+  deployment, an *empty* selection is a 400 (it could mean "all" or "none", and
+  guessing turns a client bug into a wrong number), and an unknown id is a 400
+  rather than a silently narrower answer. What "narrows" means differs by
+  series and the page says so: tokens are per model, while VRAM, GPU
+  utilisation and power have no model dimension anywhere and resolve to the
+  cards the selection occupies.
+- **llama.cpp's real knobs are controls, not free text.** Flash attention and
+  the two KV cache types (`--flash-attn`, `--cache-type-k`, `--cache-type-v`)
+  had no first-class field, so the only way to set them was to hand-type a flag
+  into Extra args. They are now selects on the model settings page, backed by
+  `extra_args` rather than by new columns — which is where a hand-typed flag
+  already goes, so no migration, no schema growth per flag, and precedence
+  unchanged. A managed flag has exactly one home: it is read out of Extra args
+  into its control, so setting one can never duplicate or contradict the same
+  flag typed by hand. Leaving a control on "default" omits the flag, so the
+  launch command of an untouched row is byte-identical to before. Values were
+  read off `llama-server --help` in the shipped image, not from upstream docs:
+  `--flash-attn` takes `on|off|auto` in this build rather than being a bare
+  switch. `--split-mode`, `--main-gpu` and `--tensor-split` deliberately stay
+  derived (decision D4) and the section says so instead of offering a control
+  that would compete with the GPU selection.
+- **The header named one model while two were serving.** `_active_model` ended
+  in `LIMIT 1` under a comment asserting the supervisor enforces single-model
+  loading, so the second engine never reached the frontend at all. The header
+  metrics frame gained `active_models` and the chip renders one entry per
+  model, each with its own dot; two inline and the rest folded into a `+N`
+  counter so its width stays bounded at any fleet size, with every model named
+  in the tooltip and the accessible label. The cluster's accent colour now
+  summarises the *worst* status, so three healthy engines cannot paint over a
+  fourth that crashed. The two aggregates were checked and left as they were —
+  pooled VRAM and busiest-card GPU utilisation are both whole-box questions —
+  but the GPU readout now says "on the busiest card", which with one card it
+  never had to.
+- **The live stats view showed one engine on a two-engine box**, and which one
+  was whatever SQLite returned first. `/api/stats/live` now carries a block per
+  loaded model, with rate state tracked per model — two engines' cumulative
+  counters share no origin, and one snapshot would have produced a rate for the
+  second model computed against the first model's totals. The per-model block is
+  byte-identical to before, so the eleven panels reading it field by field are
+  untouched. Where several models' figures ARE combined, an unreported metric is
+  skipped rather than counted as zero, and the tile says "1 of 2 models report
+  this"; a metric no selected engine reports renders an em dash, never `0`.
+  Latency percentiles and KV fractions are deliberately not combined at all.
+  llama.cpp model.** There is no llama.cpp image resolver, so honouring such a
+  pin would have resolved a *vLLM* image and launched vLLM under the operator's
+  model name. The card is now absent for a backend with no image catalogue, and
+  visible-but-disabled where only the *driver* is the obstacle — hide what an
+  engine has no concept of, disable and explain what this deployment merely
+  cannot do. `GET /api/system/backends` gained `version_pin_reason_code`
+  (`engine` / `driver` / `backend`) so a client can branch without
+  string-matching a human sentence, and the panel now renders the server's
+  sentence verbatim instead of hardcoding one about the in-container driver.
+- `version_pin_reason` blamed the *driver* for llama.cpp on the deployment we
+  run. Both obstacles apply there, and the driver was checked first — a true
+  sentence about vLLM and a false promise about llama.cpp, whose pin no driver
+  can make available. An operator acting on it would have migrated a deployment
+  to unlock a control that would still be dead.
+- **"Why is Extra args empty but Effective argv has so many arguments?"** The
+  distinction was correct and entirely invisible. Extra args is now labelled as
+  the operator's own additions and the Effective argv panel says it is the whole
+  generated command.
+
+## [v2026.09.02.2] - 2026-09-02
+
+### Added
+
+- The Add Model wizard names the model already serving from a GPU you pick, and
+  stops offering GPUs outside the deployment's `allowed_gpu_indices`. An
+  occupied GPU stays selectable — co-locating two small models on one card is a
+  legitimate thing to do on purpose; the warning is there so it is not done by
+  accident. `GET /api/system/gpus` gained `allowed_indices` to make the second
+  half possible: the allowlist was enforced with a 400 on create but published
+  nowhere, so the wizard learned about it only by being refused.
+- The Add Model wizard offers an engine version, disabled where the deployment
+  cannot honour a pin and carrying the server's explanation of why. `GET
+  /api/system/backends` gained `version_pin_reason`, non-null exactly when
+  `version_pin_available` is false — the frontend sees one boolean and cannot
+  tell whether the obstacle is the driver (fixable: run the docker engine
+  driver) or the backend (llama.cpp has no image catalogue to pin against).
+
+### Fixed
+
+- **Every model reported `Engine: vllm`**, including one demonstrably served by
+  `llama-server`. The data was never wrong: both model read paths built their
+  responses as dict literals, so the columns migrations 0027 and 0028 added
+  (`backend`, `mmproj_filename`, `n_gpu_layers`) had to be remembered at a
+  second site and were not. `GET /api/models` and `GET /api/models/{id}` now
+  serialise through one place that starts from the whole row and subtracts, so
+  the next migration cannot silently drop a column — a test fails first.
+- The model detail page applied no per-backend field visibility, so a llama.cpp
+  model advertised a `Tensor parallel size` and a `gpu_memory_utilization` it
+  has no concept of, and printed a blank `n_gpu_layers`. The table that already
+  did this on the model settings page is now shared by both pages.
+- The Try stack panel stated two engine versions at once: its capability note
+  read the real one while the version field's placeholder was a hardcoded
+  `0.20.0` left over from the built-in template default — and uncorrectable,
+  since the field is disabled on the shipped driver.
+- GPU **indices** were labelled "GPUs: 1", which reads as a count. Now "GPU
+  index: 1" / "GPU indices: 0, 1", on both the detail page and the model card.
+
+## [v2026.09.02.1] - 2026-09-02
+
+### Added
+
+- **llama.cpp is available as a second inference backend.** `llama-server` is
+  baked into the warden image and launched by the existing subprocess driver, so
+  no new infrastructure is required. Pick it per model in the Add Model wizard;
+  selecting a `.gguf` file pre-selects it, and the choice is always overridable —
+  a GGUF that vLLM can also serve stays available to vLLM for throughput. The
+  persisted default is unchanged: existing models, and new models that do not
+  choose, stay on vLLM.
+
+  It is **not** a superset of vLLM. llama.cpp's multi-GPU mode is a layer split,
+  not tensor parallelism; for a model too large for one card, vLLM is still the
+  right answer. See `docs/backends.md`.
+
+- GGUF models can now carry a multimodal projector (`mmproj_filename`), pulled
+  alongside the weights and passed to llama.cpp as `--mmproj`, so vision GGUFs
+  work. A vision model started without its projector loads, serves, and silently
+  ignores every image, so a set-but-missing projector is refused before any
+  process starts.
+- `n_gpu_layers` allows deliberate partial CPU offload for a model that does not
+  fit the card. It is slow, and it is never chosen for you: blank means
+  llama.cpp sizes its own offload.
+- `GET /api/system/backends` reports each backend's own version. It previously
+  reported vLLM's for everything, which becomes a lie with two backends.
+- The live-stats SSE frame carries a `backend` field, so the dashboard can say
+  *which* engine does not report a metric rather than showing a blank tile of
+  unknown provenance.
+
+### Changed
+
+- Live-stats metric parsing is **per backend**. The frame's shape is unchanged;
+  a metric the running engine does not publish is now reported as absent and
+  rendered as such, rather than as zero. Three panels previously showed `0` for a
+  metric that was simply not measured: generation/prompt tokens-per-second fell
+  back to `0` in the headline number *and* pushed a flat line into the sparkline;
+  KV-cache usage rendered `0%` against an empty meter — "plenty of headroom" when
+  the truth is "not measured"; and the sleep-state chip printed the literal
+  string `sleep null`.
+- Model settings hides, rather than disables, fields belonging to a backend other
+  than the row's. A greyed-out box for a knob the engine has never heard of is an
+  invitation to wonder what it does.
+- `extra_env` on a llama.cpp model accepts `GGML_*` only. `LLAMA_*` is refused:
+  every llama.cpp flag has an environment twin, so allowing the prefix would let
+  a model row re-bind the engine's unauthenticated API, swap its weights, move
+  its port out from under the health probe, or switch metrics off. The five worst
+  names are hard-locked globally, so they are refused loudly at write time rather
+  than dropped silently.
+
+### Fixed
+
+- Requests to a model whose HuggingFace repo contains **only** GGUF files no
+  longer fail with a 500. That repo shape ships no `tokenizer.json`, so token
+  accounting raised on the proxy's hot path — before the request ever reached an
+  engine that was ready to answer it. Accounting now uses `tokenizer_repo` when
+  set (exact, local, free) and falls back to a character estimate rather than
+  raising. The estimate is logged once per repo and reported through
+  `TokenizerCache.estimating()`, because it also drives the per-token rate limit.
+
+### Notes
+
+- Warden image size: 9,174,592,443 B → 9,221,778,635 B — **+47.2 MB (+0.51%)** as
+  docker reports it, **+85.3 MB (+0.93%)** counting the files the new layer adds.
+  Build time 4m02s, up from 2m51s. Measured on `bonus` against the real base
+  image, 2026-09-02.
+- llama.cpp's version is fixed by the warden image (`b10731`); bumping it is a
+  warden release, not a per-model choice.
+- Acceptance: `ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF` (IQ3_XXS + mmproj) serves
+  on a single RTX A4000 with verdict **`supported`** — coherent multi-turn,
+  correct arithmetic, exact format compliance, and a correct description of a
+  known test image. Evidence in `docs/tested-stacks.md`.
+
+### Changed (sub-project B, which the above builds on)
+
+> The next entry says vLLM is the only backend. That was true when B landed;
+> sub-project C above is the second one.
+
+- **Backend abstraction (sub-project B).** `app/runtime/backends/` introduces a
+  `Backend` axis above the existing engine driver: a driver answers *where* a
+  process runs, a backend answers *which program, with what argv, env, health
+  probe, log grammar and capabilities*. vLLM is the only backend and **runtime
+  behaviour is unchanged** — the same argv, the same env, the same bind host,
+  the same diagnoses, proven by a 25-case golden corpus captured before the
+  refactor, three of whose cases are transcribed from live production rows and
+  checked against the argv those installs actually produced. `cmd_builder`,
+  `env_builder`, `log_diagnostics`, `templates/resolver` and
+  `templates/engine_versions` moved under `app/runtime/backends/vllm/` as pure
+  renames.
+- `GET /api/models/{id}/effective-argv` now returns the **full** argv including
+  `["vllm", "serve"]`. It previously omitted the leading pair; the field
+  description said so and now describes what is actually returned.
+
+### Added
+
+- `GET /api/system/backends` — available backends, their advertised
+  capabilities, and what the active driver lets each of them do.
+  `GET /api/system/engine` is unchanged and kept as a deprecated alias.
+- `models.backend` (migration 0027) — nullable, no backfill. `NULL` means
+  `vllm`, so no existing row changes behaviour.
+- `ModelCreate.backend`, defaulted to `"vllm"`. A client that never sends it
+  behaves exactly as before.
+- `PYTHONPATH` and `LD_PRELOAD` join `HARD_LOCKED_ENV_KEYS`. Neither was on any
+  allowlist, so nothing an operator can do changes; the lock documents why they
+  can never be added.
+- `docs/backends.md` — the backend/driver matrix, how to add a backend, and why
+  version pinning is reported as two separate fields.
+
+## [v2026.09.01.1] - 2026-09-01
+
+### Fixed
+- **Chat: typing can no longer go nowhere.** Scrolling or clicking the thread
+  moved focus to the scroller or `<body>`, after which keystrokes landed in no
+  visible field. Bump `@podwarden/chat-ui` to 0.1.5: the composer takes focus
+  on mount / chat switch / re-enable (never stealing from the sidebar filter
+  or another editable field), and stray printable keys and Backspace are
+  routed to the message box unless a dialog is open or a modifier is held.
+
+## [v2026.08.31.1] - 2026-08-31
+
+### Fixed
+- **First-run setup: a browser Back out of the wizard no longer strands the
+  install.** Reaching a later step and then pressing Back (or reloading)
+  rendered the welcome page whose only button was rejected with `not at
+  welcome step`, with no control anywhere to move forward. `POST
+  /api/setup/welcome` is now idempotent past welcome (returns the real current
+  step with 200), and the wizard layout syncs the URL to the server's
+  canonical step on every load, so Back and reload self-heal on every step.
+  Adds `frontend/src/lib/setup-steps.ts` mapping server steps to route
+  segments; the login funnel now points at the current step instead of a
+  hard-coded `/setup/welcome`. The forward-only state machine and its
+  data-carrying guards are unchanged.
+- **Auth: accept the origin this deployment is actually served on.** Behind a
+  reverse proxy with `VW_FRONTEND_ORIGIN` unset, `load_settings` fell back to
+  `http://localhost:3000`, so `require_matching_origin` 403'd every request
+  carrying a real browser Origin — every page reload logged the operator out
+  because `POST /api/auth/refresh` was rejected before it could read the
+  cookie. The origin is now derived from the request
+  (`derive_origin_from_request` in `app/config.py` + `app/auth/origin.py`),
+  the same Host-vs-Origin argument PodWarden Core uses for its OIDC redirect
+  base. ADDITIVE: the localhost default stays, because local development is
+  genuinely cross-origin (frontend dev server on :3000, API on :8080).
+
+## [v2026.08.26.1] - 2026-08-26
+
+### Changed
+- Bump `@podwarden/chat-ui` to 0.1.4 (additive: URLs inside code blocks and
+  inline code are now clickable, plus prose autolink fixes; no behaviour
+  change for Warden).
+
+## [v2026.08.25.1] - 2026-08-25
+
+### Changed
+- **`/chat2` is now the shared `@podwarden/chat-ui` component (0.1.2), consumed
+  over the GitLab package registry; the in-tree copy is gone and 19 private
+  dependencies are no longer direct dependencies (still installed transitively
+  through the package). No behaviour change.** The route is a thin host
+  shell: Warden supplies auth (`authFetch`), theme, capabilities and the
+  initial chat id from `?c=`; the package owns the rest. 60 source and test
+  files deleted. `react-virtuoso` deliberately STAYS a direct dependency — it
+  was never chat2-only, `models/log-stream.tsx` and `godmode/godmode-viewer.tsx`
+  both render their rows through it. Chat-ui theme tokens are mapped onto
+  retro/retro-dark.
+
+### Added
+- `GET /api/chat2/_whoami` reports `contract`; `settings.scope` is accepted
+  opaque; the budget window is now an object.
+- the chat-ui conformance kit runs against the backend in CI. `make
+  conformance` (and the `conformance:chat2` job) boots the real app with only
+  the model upstream faked and runs `@podwarden/chat-ui`'s own contract suite
+  against it over HTTP; `tests/conformance/test_contract_routes.py` checks the
+  same package's OpenAPI slice against our route table in the same job.
+
+## [v2026.08.23.5] - 2026-08-24
+
+### Changed
+- **chat2 lightbox: natural zoom & pan gestures.** Plain vertical scroll
+  (wheel / two-finger trackpad) zooms continuously around the cursor; holding
+  the left button and moving pans in both axes. The +/- buttons still snap to
+  fixed levels, and the viewport stays keyboard-scrollable.
+
+### Fixed
+- **chat2 layout: several utility classes silently generated no CSS.** The
+  Tailwind content globs only scanned `src/components` and `src/app`, so any
+  class used exclusively under `src/features/` (all of chat2) was purged from
+  the build. Casualties: the chat root's `-m-6` (the page scrolled and the
+  composer sat below the fold instead of the chat being exactly
+  viewport-height), jump-to-latest's `-translate-x-1/2` (the button rendered
+  on the left instead of centered), and the sidebar list's own scrollbar. The
+  globs now cover `src/features` and `src/lib`, with a contract test pinning
+  them.
+
+## [v2026.08.23.4] - 2026-08-24
+
+### Added
+- **chat2 turns keep streaming server-side if you navigate away or reload;
+  reopening the chat re-attaches to the live answer.** The turn now runs on a
+  detached backend task registered in an in-process live-turn registry
+  (`app/chat2/live.py`); the HTTP response is just a replayable subscriber, so
+  a dropped connection no longer aborts generation — the full assistant row,
+  usage, ledger entry and titles are always persisted. `GET /chats/{id}`
+  exposes `live_turn`, `GET /chats/{id}/turn/live` replays the stream
+  byte-identically and follows it, and stopping an answer is now an explicit
+  `POST /chats/{id}/turn/abort` (which the Stop button and the
+  send-while-streaming path call).
+
+## [v2026.08.23.3] - 2026-08-23
+
+### Changed
+- **The old `/chat` playground page is retired.** `/chat` now permanently
+  redirects to `/chat2`; the nav has a single "Chat" entry pointing there. The
+  playground backend endpoints (`/api/chat/playground/ensure`,
+  `/api/chat/completions`) are unchanged — only the UI is gone.
+
+### Fixed
+- **chat2: streaming no longer makes code blocks flicker.** Fenced code was
+  re-highlighted asynchronously on every token, flashing an unstyled frame
+  (font/colour swap) many times a second; blocks now highlight synchronously
+  in render once the highlighter has loaded, so the only unstyled frame left
+  is the very first code block of a session while Shiki loads.
+- **chat2 sidebar: a long previous auto-title could hide the current one.**
+  Title and the "(was: …)" hint now share one clamping container — up to two
+  lines, title first — so clipping can only ever cut the hint's tail.
+- **chat2: a just-pasted image no longer flashes “image expired”.** The
+  optimistic user row referenced the attachment immediately, but the thread's
+  attachment map only filled from the post-turn reload — so the image showed
+  the expired placeholder for the whole stream (reopening the chat “fixed”
+  it). `send()` now seeds the map from the composer's uploaded rows.
+- **chat2: the attachment lightbox gained zoom.** Zoom buttons and
+  ctrl/cmd+wheel step through 100–400%; when zoomed, scrolling pans the image.
+
+## [v2026.08.23.2] — 2026-08-23
+
+### Added
+- **chat2 auto-titles are reassessed as a chat grows.** A chat used to be
+  named once, from its first exchange, so a thread that wandered kept its
+  opening-question title forever and the sidebar stopped being a usable index.
+  The title is now re-derived on the first user turn and then every fourth one
+  while the title is still `auto`, from the last six user/assistant messages
+  rather than just the opening pair, asking the chat's own model for a 2–5 word
+  topic title at the lowest proxy priority. Migration `0026` adds
+  `chats.title_prev`, which records the title a reassessment displaced (and is
+  cleared when the user renames the chat) so the rename can be surfaced and
+  undone rather than silently swapping the sidebar entry. The swap is a single
+  `UPDATE ... AND title_source = 'auto'`, so a user rename racing the
+  (queued, lowest-priority) title call always wins.
+- **Per-chat `enable_thinking` setting.** Reasoning models spend most of a
+  turn's token budget on a preamble; chat2 had no way to decline. Setting it to
+  `false` sends vLLM `chat_template_kwargs = {"enable_thinking": false}`. `true`
+  or absent sends nothing at all, which is the only safe "on" for chat
+  templates that have never heard of the flag. The internal title call now
+  always disables thinking, since a 16-token budget spent on a preamble
+  produced no title at all on exactly the models people most want titles for.
+- **`supports_vision` is auto-detected from the on-disk HF config.** A
+  genuinely multimodal model served every pasted image as `[image omitted]`
+  because nothing had ever written `models.supports_vision` and the chat2
+  catalog read NULL and 0 as the same `False`. The column is tri-state: 1/0 is
+  an operator's explicit answer and always wins, NULL now means "ask the
+  config" — a `vision_config` key or a `...ForConditionalGeneration`
+  architecture counts as evidence, `hf_config_repo` is honoured when set, and
+  an unreadable config still reads as `False`. Configs are cached per
+  (path, mtime, size) so the 60s models poll stops re-parsing them.
+  `supports_tools` / `supports_reasoning` stay manual.
+
+### Changed
+- **`PATCH /api/models/{id}/settings` documents and enforces the capability-flag
+  contract.** `supports_tools` / `supports_vision` / `supports_reasoning`
+  accept `true` / `false` (and their case-insensitive string spellings) or
+  `null` to reset to auto-detection; an omitted key is left untouched. Anything
+  else is now a 400 instead of being coerced — `"no"` used to be stored as an
+  explicit *yes*. A body containing only capability flags is also exempt from
+  the endpoint's unload-first 409: those columns are inert metadata, and the
+  loaded model is exactly the one an operator is looking at when they notice a
+  flag is wrong.
+
+
+## [v2026.08.23.1] — 2026-08-23
+
+### Added
+- **chat2 page (#232).** New `/chat2` full-page chat on the chat2 backend:
+  persisted per-user chats with a date-grouped sidebar (rename, fork, delete
+  one/all, keyboard navigation), markdown + sanitized inline HTML with KaTeX
+  and Shiki code blocks, collapsed reasoning and tool-call blocks, option
+  buttons (`present_options` tool and a narrowed trailing-list heuristic),
+  image attachments by drop/paste with signed URLs and expired placeholders,
+  context-window / response-token / budget bars, per-chat settings with
+  "save as my defaults", fork-at-message and edit-and-fork. The old `/chat`
+  playground is unchanged. Renderer: `react-markdown` + Shiki, chosen over a
+  spiked `streamdown` alternative — **Streamdown rejected**, it failed two of
+  the spike's six portability checks under this codebase's Tailwind 3.4 /
+  React 19 constraints (see
+  `docs/superpowers/specs/2026-08-23-chat2-renderer-decision.md`). New
+  dependencies: `react-markdown`, `shiki`, `remark-gfm`, `remark-math`,
+  `rehype-katex`, `rehype-sanitize`, `rehype-raw` (added after the spike so
+  sanitized inline HTML has raw markup to sanitize in the first place).
+- **chat2 backend (#232).** `/api/chat2/*`: per-user persisted chats with
+  linear messages and fork-to-new-chat, image attachments (PNG/JPEG/WebP,
+  re-encoded, sha256-deduplicated on `/data/chat2`, per-user quota + free-space
+  floor, TTL/LRU eviction that keeps rows and marks them expired), per-user
+  defaults, a model catalog that resolves the context window and capability
+  flags, an append-only usage ledger with rate cards, and a streaming turn
+  endpoint that normalises the proxy's SSE into typed `ChatEvent`s (reasoning,
+  tool calls, usage, guard/timeout outcomes) with one-turn-in-flight and
+  idempotent `request_id`. Spec: `docs/superpowers/specs/2026-08-23-chat2-design.md`.
+  The old `/chat` playground is unchanged.
+- Per-user defaults include a `tool_policy` setting alongside model/sampling
+  defaults, and the idempotent `request_id` used to dedupe a retried turn is
+  stored namespaced per user, so two different users can never collide on
+  the same client-generated id.
+- New env knobs for chat2 attachment storage: `VW_CHAT_QUOTA_USER_BYTES`
+  (default 2147483648 — 2 GiB per user across distinct `(user_id, sha256)`
+  files), `VW_CHAT_QUOTA_FREE_FLOOR_BYTES` (default 5368709120 — 5 GiB of free
+  space on `VW_DATA_DIR`; **below the floor every upload is refused with 413
+  `quota_exceeded`, by design**, so the warden can never fill the disk it also
+  writes its DB to) and `VW_CHAT_ATTACHMENT_TTL_DAYS` (default 90 — the
+  collector unlinks attachment files whose newest referencing row is older
+  than this, keeping the rows so chats stay readable).
+- New runtime dependency: **Pillow 11.0.0** (`requirements.txt`), used to
+  sniff, size-check and re-encode uploaded images so EXIF, ancillary chunks
+  and polyglot payloads never reach disk.
 
 ## [v2026.08.22.2] — 2026-08-22
 

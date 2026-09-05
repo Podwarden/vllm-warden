@@ -29,7 +29,7 @@ import sqlite3
 from types import SimpleNamespace
 
 from app.header.routes_api import (
-    _active_model,
+    _active_models,
     _get_cache,
     _interval_seconds,
     _payload,
@@ -131,7 +131,7 @@ def test_header_metrics_ticket_mint_succeeds_with_jwt(tmp_data_dir, client):
 def test_payload_emits_all_required_fields_with_no_loaded_model():
     """``_payload`` derives the eight FE-consumed fields correctly and
     surfaces ``active_model: null`` when no model is loaded."""
-    out = _payload(SNAP_TWO_GPUS, active_id=None, active_name=None)
+    out = _payload(SNAP_TWO_GPUS, [])
     assert out["active_model"] is None
     assert out["active_model_id"] is None
     assert out["probe_error"] is None
@@ -151,9 +151,7 @@ def test_payload_emits_all_required_fields_with_no_loaded_model():
 def test_payload_surfaces_active_model_when_supplied():
     """When the active-model tuple is non-null, ``_payload`` echoes
     both ``active_model_id`` and ``active_model`` into the frame."""
-    out = _payload(
-        SNAP_TWO_GPUS, active_id="m-loaded", active_name="gpt-oss-20b"
-    )
+    out = _payload(SNAP_TWO_GPUS, [("m-loaded", "gpt-oss-20b", "loaded")])
     assert out["active_model"] == "gpt-oss-20b"
     assert out["active_model_id"] == "m-loaded"
 
@@ -162,7 +160,7 @@ def test_payload_with_empty_snapshot_surfaces_probe_error():
     """An empty GPU snapshot with a probe_error string surfaces through
     the payload so the FE can degrade gracefully."""
     snap = GpuSnapshot(gpus=[], apps=[], probe_error="nvidia-smi unavailable")
-    out = _payload(snap, active_id=None, active_name=None)
+    out = _payload(snap, [])
     assert out["probe_error"] == "nvidia-smi unavailable"
     assert out["gpus"] == []
     assert out["vram_total_mib"] == 0
@@ -180,8 +178,8 @@ async def test_active_model_returns_none_when_no_loaded_row(
     db_path = tmp_data_dir / "vllm-warden.db"
     _seed_done(db_path)
     settings = client.app.state.settings
-    out = await _active_model(settings.db_path)
-    assert out == (None, None, None)
+    out = await _active_models(settings.db_path)
+    assert out == []
 
 
 async def test_active_model_returns_tuple_when_loaded_row_present(
@@ -209,8 +207,8 @@ async def test_active_model_returns_tuple_when_loaded_row_present(
         db.commit()
 
     settings = client.app.state.settings
-    out = await _active_model(settings.db_path)
-    assert out == ("m-loaded", "gpt-oss-20b", "loaded")
+    out = await _active_models(settings.db_path)
+    assert out == [("m-loaded", "gpt-oss-20b", "loaded")]
 
 
 async def test_active_model_skips_loaded_row_without_runtime(
@@ -233,8 +231,8 @@ async def test_active_model_skips_loaded_row_without_runtime(
         db.commit()
 
     settings = client.app.state.settings
-    out = await _active_model(settings.db_path)
-    assert out == (None, None, None)
+    out = await _active_models(settings.db_path)
+    assert out == []
 
 
 async def test_get_cache_reuses_system_gpus_cache(client):
@@ -328,8 +326,8 @@ async def test_active_model_surfaces_loading_row_without_runtime(
         db.commit()
 
     settings = client.app.state.settings
-    out = await _active_model(settings.db_path)
-    assert out == ("m-loading", "qwen3.8-27b", "loading")
+    out = await _active_models(settings.db_path)
+    assert out == [("m-loading", "qwen3.8-27b", "loading")]
 
 
 async def test_active_model_prefers_loaded_over_loading(tmp_data_dir, client):
@@ -361,19 +359,19 @@ async def test_active_model_prefers_loaded_over_loading(tmp_data_dir, client):
         db.commit()
 
     settings = client.app.state.settings
-    out = await _active_model(settings.db_path)
-    assert out == ("m-loaded", "serving", "loaded")
+    out = await _active_models(settings.db_path)
+    assert out[0] == ("m-loaded", "serving", "loaded")
+    # Both rows surface now -- the header shows every model, not the first.
+    # What "prefers" means is ORDER: the serving row leads, so the legacy
+    # singular fields (and any client that renders only one chip) still name
+    # the live engine rather than a neighbour that just started loading.
+    assert len(out) == 2
 
 
 def test_payload_surfaces_active_model_status():
     """``_payload`` echoes the status so the frontend can pick the label
     and dot colour without re-deriving state from the name alone."""
-    out = _payload(
-        SNAP_TWO_GPUS,
-        active_id="m-loading",
-        active_name="qwen3.8-27b",
-        active_status="loading",
-    )
+    out = _payload(SNAP_TWO_GPUS, [("m-loading", "qwen3.8-27b", "loading")])
     assert out["active_model"] == "qwen3.8-27b"
     assert out["active_model_id"] == "m-loading"
     assert out["active_model_status"] == "loading"
@@ -382,9 +380,7 @@ def test_payload_surfaces_active_model_status():
 def test_payload_active_model_status_is_null_when_idle():
     """No model at all → the status field is present but null, so the
     frontend never has to distinguish "absent key" from "nothing loaded"."""
-    out = _payload(
-        SNAP_TWO_GPUS, active_id=None, active_name=None, active_status=None
-    )
+    out = _payload(SNAP_TWO_GPUS, [])
     assert out["active_model"] is None
     assert out["active_model_status"] is None
 
@@ -411,8 +407,8 @@ async def test_active_model_surfaces_failed_row(tmp_data_dir, client):
         db.commit()
 
     settings = client.app.state.settings
-    out = await _active_model(settings.db_path)
-    assert out == ("m-failed", "crashed-model", "failed")
+    out = await _active_models(settings.db_path)
+    assert out == [("m-failed", "crashed-model", "failed")]
 
 
 async def test_active_model_prefers_loading_over_failed(tmp_data_dir, client):
@@ -439,8 +435,9 @@ async def test_active_model_prefers_loading_over_failed(tmp_data_dir, client):
         db.commit()
 
     settings = client.app.state.settings
-    out = await _active_model(settings.db_path)
-    assert out == ("m-loading", "incoming", "loading")
+    out = await _active_models(settings.db_path)
+    assert out[0] == ("m-loading", "incoming", "loading")
+    assert len(out) == 2
 
 
 async def test_active_model_prefers_loaded_over_failed(tmp_data_dir, client):
@@ -471,5 +468,215 @@ async def test_active_model_prefers_loaded_over_failed(tmp_data_dir, client):
         db.commit()
 
     settings = client.app.state.settings
-    out = await _active_model(settings.db_path)
-    assert out == ("m-loaded", "serving", "loaded")
+    out = await _active_models(settings.db_path)
+    assert out[0] == ("m-loaded", "serving", "loaded")
+    # Both rows surface now -- the header shows every model, not the first.
+    # What "prefers" means is ORDER: the serving row leads, so the legacy
+    # singular fields (and any client that renders only one chip) still name
+    # the live engine rather than a neighbour that just started loading.
+    assert len(out) == 2
+
+
+# ===========================================================================
+# N loaded models -> N status entries.
+#
+# The header chip named ONE model. ``_active_model`` ended in LIMIT 1, under a
+# comment reading "the supervisor enforces single-model loading, so multiple
+# 'loaded' rows would be a defect we don't paper over here". That stopped being
+# true: the operator runs llama-3.1-8b on vLLM/GPU 1 and qwen3.8-27b on
+# llama.cpp/GPU 0 at the same time, and the header showed only qwen3.8-27b.
+#
+# LIMIT 1 was not a display choice, it was a load-bearing assumption baked into
+# SQL. Removing it is the fix; the ORDER BY is what stays, because with several
+# rows the order decides which one the legacy singular fields name.
+# ===========================================================================
+
+
+def _insert_model(db, mid, name, status, gpu="[0]"):
+    db.execute(
+        "INSERT INTO models(id, served_model_name, hf_repo, hf_revision, "
+        "gpu_indices, tensor_parallel_size, dtype, max_model_len, "
+        "gpu_memory_utilization, trust_remote_code, extra_args, status) "
+        f"VALUES ('{mid}', '{name}', 'o/r', 'main', '{gpu}', 1, "
+        f"NULL, NULL, 0.9, 0, '[]', '{status}')"
+    )
+
+
+async def test_two_loaded_models_produce_two_entries(tmp_data_dir, client):
+    """The operator's actual fleet. Two engines, two cards, two entries."""
+    client.get("/healthz")
+    db_path = tmp_data_dir / "vllm-warden.db"
+    _seed_done(db_path)
+    with sqlite3.connect(db_path) as db:
+        _insert_model(db, "m-vllm", "llama-3.1-8b", "loaded", "[1]")
+        _insert_model(db, "m-lcpp", "qwen3.8-27b", "loaded", "[0]")
+        db.execute(
+            "INSERT INTO model_runtime(model_id, pid, port) "
+            "VALUES ('m-vllm', 1, 11000)"
+        )
+        db.execute(
+            "INSERT INTO model_runtime(model_id, pid, port) "
+            "VALUES ('m-lcpp', 2, 11001)"
+        )
+        db.commit()
+
+    out = await _active_models(client.app.state.settings.db_path)
+    assert len(out) == 2
+    assert {row[1] for row in out} == {"llama-3.1-8b", "qwen3.8-27b"}
+
+
+async def test_n_loaded_models_produce_n_entries(tmp_data_dir, client):
+    """The same property at N, because two is not a design.
+
+    A fix that returned "the first two" would pass the test above. The header
+    has to be built for however many the operator loads, so the invariant under
+    test is the count, not the number two.
+    """
+    client.get("/healthz")
+    db_path = tmp_data_dir / "vllm-warden.db"
+    _seed_done(db_path)
+    n = 5
+    with sqlite3.connect(db_path) as db:
+        for i in range(n):
+            _insert_model(db, f"m{i}", f"model-{i}", "loaded", f"[{i}]")
+            db.execute(
+                "INSERT INTO model_runtime(model_id, pid, port) "
+                f"VALUES ('m{i}', {100 + i}, {11000 + i})"
+            )
+        db.commit()
+
+    out = await _active_models(client.app.state.settings.db_path)
+    assert len(out) == n
+    assert [row[1] for row in out] == [f"model-{i}" for i in range(n)]
+
+
+async def test_active_models_order_is_stable_across_calls(tmp_data_dir, client):
+    """The chip repaints every 2 seconds. If the order came out of the
+    database's whim, a two-model header would visibly reshuffle on every tick.
+
+    Within a status class the tiebreak is served_model_name, not updated_at:
+    updated_at moves under a running fleet, and an order that changes when a
+    model is merely touched is the same flicker with a slower period.
+    """
+    client.get("/healthz")
+    db_path = tmp_data_dir / "vllm-warden.db"
+    _seed_done(db_path)
+    with sqlite3.connect(db_path) as db:
+        _insert_model(db, "m-z", "zeta", "loaded", "[0]")
+        _insert_model(db, "m-a", "alpha", "loaded", "[1]")
+        db.execute(
+            "INSERT INTO model_runtime(model_id, pid, port) VALUES ('m-z', 1, 1)"
+        )
+        db.execute(
+            "INSERT INTO model_runtime(model_id, pid, port) VALUES ('m-a', 2, 2)"
+        )
+        db.commit()
+
+    settings = client.app.state.settings
+    first = await _active_models(settings.db_path)
+    second = await _active_models(settings.db_path)
+    assert first == second
+    assert [row[1] for row in first] == ["alpha", "zeta"]
+
+
+async def test_a_failed_model_does_not_hide_a_serving_one(tmp_data_dir, client):
+    """Both are reported, and the serving one leads.
+
+    With one slot this was a choice between two truths. With N slots it stops
+    being a choice: the operator sees that one engine is serving AND that
+    another is dead, which is what they need to act on.
+    """
+    client.get("/healthz")
+    db_path = tmp_data_dir / "vllm-warden.db"
+    _seed_done(db_path)
+    with sqlite3.connect(db_path) as db:
+        _insert_model(db, "m-bad", "crashed", "failed", "[0]")
+        _insert_model(db, "m-ok", "serving", "loaded", "[1]")
+        db.execute(
+            "INSERT INTO model_runtime(model_id, pid, port) VALUES ('m-ok', 1, 1)"
+        )
+        db.commit()
+
+    out = await _active_models(client.app.state.settings.db_path)
+    assert out == [("m-ok", "serving", "loaded"), ("m-bad", "crashed", "failed")]
+
+
+def test_payload_carries_every_active_model():
+    out = _payload(
+        SNAP_TWO_GPUS,
+        [
+            ("m-vllm", "llama-3.1-8b", "loaded"),
+            ("m-lcpp", "qwen3.8-27b", "loaded"),
+        ],
+    )
+    assert out["active_models"] == [
+        {"id": "m-vllm", "served_model_name": "llama-3.1-8b", "status": "loaded"},
+        {"id": "m-lcpp", "served_model_name": "qwen3.8-27b", "status": "loaded"},
+    ]
+
+
+def test_payload_legacy_singular_fields_mirror_the_first_entry():
+    """A UI pod can outrun its api pod, and vice versa.
+
+    active_model / active_model_id / active_model_status predate this change
+    and are still the only fields an older bundle reads. They keep naming the
+    leading model rather than disappearing, so a stale UI shows one correct
+    model instead of "idle" while two engines serve.
+    """
+    out = _payload(
+        SNAP_TWO_GPUS,
+        [
+            ("m-vllm", "llama-3.1-8b", "loaded"),
+            ("m-lcpp", "qwen3.8-27b", "loaded"),
+        ],
+    )
+    assert out["active_model"] == "llama-3.1-8b"
+    assert out["active_model_id"] == "m-vllm"
+    assert out["active_model_status"] == "loaded"
+
+
+def test_payload_active_models_is_an_empty_list_when_idle():
+    """Never null. A client that maps over it must not have to null-check
+    first -- the same reason active_model_status is always present."""
+    out = _payload(SNAP_TWO_GPUS, [])
+    assert out["active_models"] == []
+    assert out["active_model"] is None
+
+
+def test_vram_pct_pools_the_whole_box_and_stays_meaningful_for_n_models():
+    """VRAM% is a question about the BOX, not about a model, so N models
+    change nothing about what it means: used across all cards over total
+    across all cards. Two models on two cards fill one pool."""
+    out = _payload(SNAP_TWO_GPUS, [])
+    assert out["vram_used_mib"] == 12550
+    assert out["vram_total_mib"] == 32752
+    assert out["vram_pct"] == 38
+
+
+def test_gpu_util_is_the_busiest_card_never_an_average():
+    """The readout is a MAX, and with several cards that has to stay a max.
+
+    An average would report 50% for a box with one card pinned at 90 and one
+    at 10 -- a number that describes neither card and reads as "comfortable"
+    while a model saturates its GPU. The max answers the question a header
+    chip is actually asked: is anything hot right now? The per-card breakdown
+    is one hover away in the tooltip.
+    """
+    snap = GpuSnapshot(
+        gpus=[
+            GpuLive(
+                index=0, uuid="GPU-a", name="A",
+                memory_total_mib=100, memory_used_mib=1,
+                memory_free_mib=99, utilization_pct=10,
+            ),
+            GpuLive(
+                index=1, uuid="GPU-b", name="B",
+                memory_total_mib=100, memory_used_mib=1,
+                memory_free_mib=99, utilization_pct=90,
+            ),
+        ],
+        apps=[],
+        probe_error=None,
+    )
+    out = _payload(snap, [])
+    assert out["gpu_util_pct"] == 90

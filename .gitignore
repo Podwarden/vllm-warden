@@ -4,6 +4,9 @@
 *.out
 
 # Local config / data
+# `.env` holds live tokens on developer machines (NPM_TOKEN for the chat-ui
+# registry, smoke-test credentials) — never committed.
+.env
 /data/
 *.db
 *.db-journal
@@ -25,6 +28,7 @@
 # Python tooling
 __pycache__/
 .pytest_cache/
+.mypy_cache/
 *.py[cod]
 
 # CI artifact: live OpenAPI schema dump from typecheck:api-types
@@ -44,3 +48,7 @@ __pycache__/
 /node_modules/
 /test-results/
 
+
+# Scratch install directory the installer CI job (installer:stack-up) and
+# scripts/installer-selftest.sh write into. Never a source of truth.
+/.ci-install/

@@ -28,6 +28,7 @@
 // classification (401/403/404) matches `useEventSource` semantics.
 import { useEffect, useState } from 'react';
 import { authFetch, isLoginRedirectInFlight } from './auth-fetch';
+import type { HeaderActiveModel, HeaderModelStatus } from './header-models';
 
 const STREAM_PATH = '/api/header/metrics/stream';
 const TICKET_PATH = '/api/auth/sse-ticket';
@@ -45,17 +46,24 @@ export interface HeaderMetricsGpu {
 export interface HeaderMetricsFrame {
   ts: string;
   gpus: HeaderMetricsGpu[];
+  /** Pooled across every card: used / total. A whole-box question. */
   vram_used_mib: number;
   vram_total_mib: number;
   vram_pct: number;
+  /** The BUSIEST card, not an average — see app/header/routes_api.py. */
   gpu_util_pct: number;
+  // Every model the box is serving, starting, or has crashed, most
+  // significant first. Optional at the type level for the same skew reason as
+  // active_model_status below: a UI newer than its API must still render, and
+  // an API that predates multi-model sends only the singular fields.
+  active_models?: HeaderActiveModel[];
   active_model: string | null;
   active_model_id: string | null;
   // Optional at the type level on purpose: the UI and API ship as separate
   // images and can skew, so a UI newer than its API must still render. When
   // the key is absent the widget falls back to deriving 'loaded' from a
   // non-null active_model — the old contract's only meaning.
-  active_model_status?: 'loaded' | 'loading' | 'failed' | null;
+  active_model_status?: HeaderModelStatus | null;
   probe_error: string | null;
 }
 

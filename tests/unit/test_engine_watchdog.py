@@ -714,3 +714,84 @@ async def test_restart_repairs_state_when_the_spawn_fails(monkeypatch, tmp_path)
         "recoverable set and never retries"
     )
     assert alloc.released == [10000], "the port must not leak on a failed spawn"
+
+
+@pytest.mark.asyncio
+async def test_restart_keeps_the_restart_flag_lit_while_the_spawn_is_in_flight(
+    monkeypatch, tmp_path
+):
+    """#236 -- the SUCCESS path must put prior_status straight back after its
+    'loading' write, not only in the except branch the test above drives.
+
+    ``ModelRepo.update_status('loading')`` clears prior_status by design, so
+    without the re-assert the row spends the whole spawn as 'loading' with no
+    flag -- indistinguishable from an operator's first-ever load, which boot
+    reconciliation now demotes to 'pulled'. A warden restart mid-restore would
+    then quietly park a model that WAS serving instead of restoring it.
+
+    Asserted from INSIDE start_engine, against a real ModelRepo on a real DB:
+    a fake repo would have to mirror exactly what update_status clears, and
+    the moment it drifted this test would pass for the wrong reason.
+    """
+    from app.db.database import open_db
+    from app.db.migrations import apply_migrations
+    from app.db.repos.models import ModelRepo, ModelRow
+    from app.runtime import watchdog
+
+    settings = FakeSettings(data_dir=tmp_path)
+    async with open_db(settings.db_path) as db:
+        await apply_migrations(db)
+        await ModelRepo(db).insert(
+            ModelRow(
+                id="m1",
+                served_model_name="m1",
+                hf_repo="org/m",
+                hf_revision="main",
+                gpu_indices=[0],
+                tensor_parallel_size=1,
+                dtype=None,
+                max_model_len=None,
+                gpu_memory_utilization=0.9,
+                trust_remote_code=False,
+                extra_args=[],
+                extra_env={},
+                status="failed",
+                pulled_bytes=0,
+                pulled_total=None,
+                last_error="process not running after restart (was loaded)",
+            )
+        )
+        # What mark_runtime_dead_on_startup / on_exit leave behind for the sweep.
+        await ModelRepo(db).set_prior_status("m1", "loaded")
+
+    seen = {}
+
+    async def fake_start_engine(settings, sup, port_alloc, model, port, overrides=None):
+        async with open_db(settings.db_path) as db:
+            row = await ModelRepo(db).get("m1")
+        seen["during_spawn"] = (row.status, row.prior_status)
+        # The shared load path's success write.
+        async with open_db(settings.db_path) as db:
+            await ModelRepo(db).update_status("m1", "loaded")
+
+    class FakeAlloc:
+        def allocate(self): return 10000
+        def release(self, p): pass
+
+    monkeypatch.setattr(watchdog, "reap_orphan_gpu_holders", lambda pids: [])
+    monkeypatch.setattr("app.models.routes_api.start_engine", fake_start_engine)
+    app_state = type("S", (), {"supervisor": FakeSup(), "port_allocator": FakeAlloc()})()
+
+    out = await watchdog._restart(settings, app_state, "m1", None)
+
+    assert seen["during_spawn"] == ("loading", "loaded"), (
+        "while start_engine is in flight the row must read 'loading' AND still carry "
+        "prior_status='loaded'; without the flag a warden restart mid-restore demotes "
+        f"it to 'pulled' and auto-restore is silently off (saw {seen['during_spawn']})"
+    )
+    assert out == "loaded"
+    async with open_db(settings.db_path) as db:
+        row = await ModelRepo(db).get("m1")
+    assert row is not None and row.prior_status is None, (
+        "reaching 'loaded' retires the flag -- it must be lit only for the attempt"
+    )

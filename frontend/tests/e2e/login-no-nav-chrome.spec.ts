@@ -1,7 +1,7 @@
 // Login-flow e2e — pins the contract that the unauthenticated /login
 // page renders without any nav chrome:
 //
-//   - no brand block (`vLLM Warden`)
+//   - no brand block (the `LLM Warden` link to /models)
 //   - no live header-metrics widget (`[data-testid=header-metrics]`)
 //   - no menu hamburger
 //
@@ -26,11 +26,13 @@ test('login page has no nav chrome; post-login page surfaces the header widget',
 
   await page.goto('/login');
 
-  // Negative side — no chrome on /login. The brand link uses the text
-  // node "vLLM Warden"; the widget exposes data-testid="header-metrics".
-  // Both should be absent — if either is visible, NavBar's hide gate
-  // regressed.
-  await expect(page.getByText('vLLM Warden')).toHaveCount(0);
+  // Negative side — no chrome on /login. Match the brand by ROLE, not by
+  // text: /login has its own <h1>LLM Warden</h1>, so a bare getByText
+  // would find the heading and fail even with the nav correctly hidden.
+  // The brand is the only LINK carrying that name (it points at /models).
+  // The widget exposes data-testid="header-metrics". Both should be
+  // absent — if either is visible, NavBar's hide gate regressed.
+  await expect(page.getByRole('link', { name: 'LLM Warden' })).toHaveCount(0);
   await expect(page.getByTestId('header-metrics')).toHaveCount(0);
   await expect(page.getByRole('button', { name: /open menu/i })).toHaveCount(0);
 
@@ -43,7 +45,7 @@ test('login page has no nav chrome; post-login page surfaces the header widget',
   await expect(page).toHaveURL(/\/models/);
 
   // Positive side — both the brand and the widget should surface now.
-  await expect(page.getByText('vLLM Warden')).toBeVisible();
+  await expect(page.getByRole('link', { name: 'LLM Warden' })).toBeVisible();
   // The widget is responsive-hidden under md (`hidden md:inline-flex`).
   // Playwright's default viewport is 1280×720 so the md breakpoint is
   // satisfied; the element should be both present AND visible.

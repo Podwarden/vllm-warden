@@ -19,6 +19,8 @@ from pathlib import Path
 
 import pytest
 
+from app.runtime.backends.metrics import EngineReading
+from app.runtime.backends.vllm import VllmBackend
 from app.stats.live_engine import (
     Metrics,
     RateState,
@@ -42,6 +44,18 @@ def sample_text() -> str:
 @pytest.fixture
 def metrics(sample_text: str) -> Metrics:
     return Metrics(parse_prometheus(sample_text))
+
+
+@pytest.fixture
+def reading(sample_text: str):
+    """Sub-project C: build_frame consumes an EngineReading, not a Metrics.
+
+    The vLLM metric NAMES moved into app/runtime/backends/vllm/metrics.py, so
+    the frame tests below go through the backend to get there. The parser tests
+    above still use ``metrics`` directly -- the parser changed module, not
+    behaviour.
+    """
+    return VllmBackend().parse_metrics(sample_text)
 
 
 # --------------------------------------------------------------------------- #
@@ -113,9 +127,9 @@ def test_hist_mean():
 # --------------------------------------------------------------------------- #
 
 
-def test_first_frame_shape_and_derivations(metrics: Metrics):
+def test_first_frame_shape_and_derivations(reading):
     frame, state = build_frame(
-        metrics,
+        reading,
         model="qwopus3.6-27b-coder-fp8-model",
         model_id="90b6c566e02afa8f",
         max_model_len=224800,
@@ -164,7 +178,7 @@ def test_first_frame_shape_and_derivations(metrics: Metrics):
     assert state.prefix_hits == 1100.0
 
 
-def test_second_frame_rates(metrics: Metrics):
+def test_second_frame_rates(reading):
     # Previous frame two seconds earlier with lower cumulative counters.
     prev = RateState(
         monotonic=98.0,
@@ -175,7 +189,7 @@ def test_second_frame_rates(metrics: Metrics):
         prefix_queries=1800.0,
     )
     frame, _ = build_frame(
-        metrics,
+        reading,
         model="m",
         model_id="id",
         max_model_len=224800,
@@ -189,7 +203,7 @@ def test_second_frame_rates(metrics: Metrics):
     assert frame["cache"]["prefix_hit_rate"] == pytest.approx(0.5)
 
 
-def test_counter_reset_yields_null_rate(metrics: Metrics):
+def test_counter_reset_yields_null_rate(reading):
     # Engine restarted: previous counters were HIGHER than current → refuse the
     # spurious negative-rate spike, emit null.
     prev = RateState(
@@ -201,7 +215,7 @@ def test_counter_reset_yields_null_rate(metrics: Metrics):
         prefix_queries=None,
     )
     frame, _ = build_frame(
-        metrics, model="m", model_id="id", max_model_len=1, prev=prev, scrape_monotonic=100.0
+        reading, model="m", model_id="id", max_model_len=1, prev=prev, scrape_monotonic=100.0
     )
     assert frame["throughput"]["generation_tokens_per_s"] is None
     assert frame["engine"]["preemptions_per_s"] is None
@@ -214,9 +228,9 @@ def test_counter_reset_yields_null_rate(metrics: Metrics):
 
 def test_missing_metrics_map_to_null():
     # A near-empty engine (only one gauge exposed) must build a frame, not raise.
-    m = Metrics(parse_prometheus("vllm:num_requests_running{model_name=\"x\"} 1.0\n"))
+    r = VllmBackend().parse_metrics('vllm:num_requests_running{model_name="x"} 1.0\n')
     frame, _ = build_frame(
-        m, model="x", model_id="id", max_model_len=None, prev=None, scrape_monotonic=0.0
+        r, model="x", model_id="id", max_model_len=None, prev=None, scrape_monotonic=0.0
     )
     assert frame["engine"]["num_requests_running"] == 1
     assert frame["engine"]["kv_cache_usage_perc"] is None
@@ -231,9 +245,9 @@ def test_missing_metrics_map_to_null():
 
 def test_kv_used_null_when_info_missing():
     # Usage% present but cache_config_info absent → can't derive absolute tokens.
-    m = Metrics(parse_prometheus("vllm:kv_cache_usage_perc{model_name=\"x\"} 0.87\n"))
+    r = VllmBackend().parse_metrics('vllm:kv_cache_usage_perc{model_name="x"} 0.87\n')
     frame, _ = build_frame(
-        m, model="x", model_id="id", max_model_len=None, prev=None, scrape_monotonic=0.0
+        r, model="x", model_id="id", max_model_len=None, prev=None, scrape_monotonic=0.0
     )
     assert frame["engine"]["kv_cache_usage_perc"] == pytest.approx(0.87)
     assert frame["engine"]["kv_tokens_total"] is None
@@ -249,24 +263,28 @@ def test_metrics_cache_dedups_within_ttl():
     calls = {"n": 0}
     clock = {"t": 0.0}
 
-    async def fake_fetch(host, port, at):
+    async def fake_fetch(host, port, at, backend):
         calls["n"] += 1
-        return ScrapeResult(metrics=Metrics([]), error=None, monotonic=at)
+        # Sub-project C: the cache hands the backend to the fetch so the
+        # metrics PATH and the metric DIALECT both come from it.
+        assert backend.capabilities.name == "vllm"
+        return ScrapeResult(metrics=EngineReading(), error=None, monotonic=at)
 
+    backend = VllmBackend()
     cache = _MetricsCache(ttl=1.5, clock=lambda: clock["t"], fetch=fake_fetch)
 
     async def scenario():
         # Three hits inside the TTL window → one fetch.
-        await cache.get("model-a", "127.0.0.1", 8001)
-        await cache.get("model-a", "127.0.0.1", 8001)
-        await cache.get("model-a", "127.0.0.1", 8001)
+        await cache.get("model-a", "127.0.0.1", 8001, backend)
+        await cache.get("model-a", "127.0.0.1", 8001, backend)
+        await cache.get("model-a", "127.0.0.1", 8001, backend)
         assert calls["n"] == 1
         # Advance past the TTL → a fresh fetch.
         clock["t"] = 2.0
-        await cache.get("model-a", "127.0.0.1", 8001)
+        await cache.get("model-a", "127.0.0.1", 8001, backend)
         assert calls["n"] == 2
         # A different model_id keys a separate entry → its own fetch.
-        await cache.get("model-b", "127.0.0.1", 8002)
+        await cache.get("model-b", "127.0.0.1", 8002, backend)
         assert calls["n"] == 3
 
     asyncio.run(scenario())

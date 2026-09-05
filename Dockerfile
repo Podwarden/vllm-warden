@@ -1,3 +1,10 @@
+# syntax=docker/dockerfile:1
+# ^ Must be the FIRST line — a parser directive is only recognised before any
+# other comment or instruction. Pins the Dockerfile frontend so `RUN --mount=
+# type=cache` below means the same thing on every runner instead of depending
+# on whichever BuildKit the host's pw-builder happens to ship. Same directive,
+# same reason, as frontend/Dockerfile.
+#
 # TODO(release): replace the digest in VW_BASE_DIGEST below by running
 # `docker pull vllm/vllm-openai:v0.26.0` and copying the sha256 from
 # `docker images --digests vllm/vllm-openai`.
@@ -15,7 +22,89 @@
 # (vllm-warden#208). Inlining it would let the Dockerfile and the cleanup drift,
 # and a cleanup that reads a stale digest deletes the base you are still using.
 ARG VW_BASE_DIGEST=sha256:ffb2d59b1c059a5bd8d781320c9f5189de8293693b7d95da54befddaa54abf52
+
+# llama.cpp build, pinned. Sub-project C, decision D2: llama-server is baked
+# into this image and launched by the existing in-container subprocess driver,
+# so its version is a WARDEN release, not a per-model choice. Bumping it means
+# bumping this ARG and cutting a release -- and re-capturing
+# tests/fixtures/llamacpp/, whose README records the tag this must match.
+# tests/unit/system/test_llamacpp_version.py fails if the two drift.
+#
+# Declared as a greppable ARG for the same reason VW_BASE_DIGEST above is: it is
+# the SINGLE place the pin lives, so CI and the docs cannot read a stale value.
+#
+# WHY WE BUILD RATHER THAN COPY. ghcr.io/ggml-org/llama.cpp:server-cuda is
+# mainline and prebuilt, and it does not work here: it is built on Ubuntu 24.04
+# and needs GLIBC_2.38 / GLIBCXX_3.4.32, while this base is Ubuntu 22.04 (glibc
+# 2.35, GLIBCXX_3.4.30). Its `server-cuda` tag is also CUDA 12.8 against this
+# image's CUDA 13.0.2, so its libggml-cuda.so wants libcudart.so.12 sonames we
+# do not ship; carrying the CUDA 12.8 runtime to satisfy it would add ~2.4 GiB.
+# Building in the base image itself makes glibc, libstdc++ and CUDA match by
+# construction. Nothing about the source is modified -- spec §2 -- this is
+# upstream's own CMake on an upstream tag.
+ARG LLAMACPP_BUILD=b10731
+
+FROM vllm/vllm-openai@${VW_BASE_DIGEST} AS llamacpp-build
+ARG LLAMACPP_BUILD
+# nvcc, the CUDA headers, libcublas-dev, build-essential and g++ are ALREADY in
+# this image: vLLM's own Dockerfile re-adds the CUDA development toolchain to
+# its vllm-base stage for runtime JIT (FlashInfer, DeepGEMM) and it survives
+# into the published image. Only these are missing.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake git libssl-dev ca-certificates && rm -rf /var/lib/apt/lists/*
+# A full clone, not --depth 1: llama.cpp derives its build NUMBER from
+# `git rev-list --count HEAD` (cmake/build-info.cmake), so a shallow clone bakes
+# a wrong version into --version and into every log line.
+RUN git clone https://github.com/ggml-org/llama.cpp /src && \
+    git -C /src checkout ${LLAMACPP_BUILD}
+# -DCMAKE_CUDA_ARCHITECTURES="75-real;86-real": exactly the two cards this
+#   deployment has -- Quadro RTX 5000 (sm_75, Turing) and RTX A4000 (sm_86,
+#   Ampere) -- as native SASS. Upstream's default would compile seven
+#   architectures and emit sm_75 as PTX only, which costs a multi-second JIT on
+#   first load and needs a writable ~/.nv cache. CUDA 13 still supports Turing;
+#   it dropped Maxwell, Pascal and Volta.
+# -DCMAKE_INSTALL_RPATH='$ORIGIN:/opt/llamacpp' + BUILD_WITH_INSTALL_RPATH: the
+#   binary finds its own .so files with no env var and from any working
+#   directory. Upstream's published images instead rely on a build-tree RUNPATH
+#   whose empty trailing element resolves against the CWD, which works only under
+#   their WORKDIR /app; our engine is launched by a supervisor from elsewhere.
+#
+#   BOTH entries, and the second is not redundant. argv[0] is the bare name
+#   `llama-server`, which PATH resolves to the SYMLINK /usr/local/bin/llama-server.
+#   An exec of that symlink works on $ORIGIN alone -- the kernel sets
+#   /proc/self/exe to the real path, so $ORIGIN is /opt/llamacpp -- but `ldd` and
+#   `ld.so --list` expand $ORIGIN from the path they are GIVEN, so they report
+#   libllama-server-impl.so as "not found" through the symlink while the binary
+#   runs perfectly. Depending on that asymmetry is how a subtle loader bug hides;
+#   the absolute entry costs nothing, is a path we own, and makes every tool
+#   agree with reality.
+# GGML_STATIC is deliberately NOT set: it adds a global `-static` link on UNIX,
+#   which is incompatible with the dlopen'd backends, and libcublas_static.a
+#   alone is 119 MB. Dynamic costs zero extra bytes here because this image
+#   already ships libcudart.so.13, libcublas.so.13 and libcublasLt.so.13.
+RUN cmake -S /src -B /build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DGGML_NATIVE=OFF -DGGML_CUDA=ON -DGGML_BACKEND_DL=ON \
+      -DCMAKE_CUDA_ARCHITECTURES="75-real;86-real" \
+      -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
+      -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON \
+      -DCMAKE_INSTALL_RPATH='$ORIGIN:/opt/llamacpp' \
+      -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON && \
+    cmake --build /build -j"$(nproc)" --target llama-server
+# Collect exactly what llama-server needs into one flat directory. The other
+# *-impl.so files are for llama-cli, llama-bench and friends, which this product
+# never launches. The ldd runs from / on purpose -- that is the condition a
+# CWD-relative RUNPATH would fail under, and the supervisor's cwd is not here.
+RUN mkdir -p /opt/llamacpp && \
+    cp /build/bin/llama-server /opt/llamacpp/ && \
+    cp -a /build/bin/*.so* /opt/llamacpp/ && \
+    rm -f /opt/llamacpp/libllama-cli-impl.so* \
+          /opt/llamacpp/libllama-bench-impl.so* && \
+    cd / && ldd /opt/llamacpp/llama-server > /opt/llamacpp/.ldd.txt && \
+    ! grep -q 'not found' /opt/llamacpp/.ldd.txt
+
 FROM vllm/vllm-openai@${VW_BASE_DIGEST}
+ARG LLAMACPP_BUILD
 
 WORKDIR /app
 
@@ -28,7 +117,14 @@ WORKDIR /app
 # 0.20.0 base (#107/#108/#115, upstream vllm PR #38140 — still OPEN) are gone
 # with it. Qwen3.5/3.6 GGUF loadability under the plugin is UNVERIFIED — if a
 # Qwen3.x GGUF row regresses, that is the first place to look.
-RUN pip install --no-cache-dir vllm-gguf-plugin==0.0.4
+# --mount=type=cache instead of --no-cache-dir: the wheel cache lives in a
+# BuildKit cache mount, so it is NOT written into the layer (same size result
+# --no-cache-dir gave) but IS reused when this step has to re-run — a base
+# digest bump, or a plugin version bump. sharing=locked because pip's cache
+# is not concurrency-safe and the two buildx builds in publish:images can
+# overlap on the same runner.
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    pip install vllm-gguf-plugin==0.0.4
 
 # vLLM 0.25.1's ModelConfig init calls override_quantization_method(quant_cfg,
 # user_quant, hf_config=self.hf_config) for EVERY registered quantization method
@@ -107,12 +203,39 @@ RUN rm -rf /usr/local/lib/python3.12/dist-packages/nixl_ep* && \
 # from this package -- do NOT "verify" with torch.cuda.nccl.version(), which
 # reports the version torch was COMPILED against (still 2.28.9) and happily
 # reports success on a machine where nothing was upgraded.
-RUN pip install --no-cache-dir "nvidia-nccl-cu13==2.30.4" && \
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    pip install "nvidia-nccl-cu13==2.30.4" && \
     python3 -c "import importlib.metadata as m, torch; v = m.version('nvidia-nccl-cu13'); assert v == '2.30.4', 'nccl wheel is ' + v; libs = [l.split()[-1] for l in open('/proc/self/maps') if 'libnccl.so' in l]; assert libs, 'torch mapped no libnccl'; assert 'dist-packages/nvidia/nccl' in libs[0], 'torch loads libnccl from ' + libs[0] + ' -- the upgraded wheel is NOT the runtime library'; print('nccl runtime lib:', libs[0], v)"
 
 COPY requirements.txt /app/
-RUN pip install --no-cache-dir -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    pip install -r requirements.txt
 
+# llama.cpp, from the build stage above. On PATH because the backend's argv[0]
+# is the bare name `llama-server` (app/runtime/backends/llamacpp/__init__.py),
+# and the subprocess env's PATH is /usr/local/bin:/usr/bin:/bin.
+COPY --from=llamacpp-build /opt/llamacpp /opt/llamacpp
+# The `cd /` is not decoration: it runs the binary from a directory that is NOT
+# its own, which is exactly the condition that exposes a broken rpath. A wrong
+# rpath fails the build here instead of failing one operator's load six weeks
+# later, from some working directories and not others.
+RUN ln -s /opt/llamacpp/llama-server /usr/local/bin/llama-server && \
+    cd / && llama-server --version && \
+    ldd /usr/local/bin/llama-server | tee /tmp/ldd.txt && \
+    ! grep -q 'not found' /tmp/ldd.txt && rm -f /tmp/ldd.txt
+ENV VW_LLAMACPP_BUILD=${LLAMACPP_BUILD}
+
+# Application source LAST, because it is the ONLY input that changes on a
+# typical commit. Everything above -- the base, the gguf-plugin patch, the
+# nixl_ep strip, the NCCL bump, requirements.txt and the whole llama.cpp
+# compile -- is keyed on pinned versions, so with a warm BuildKit cache a
+# source-only change re-runs nothing and re-pushes exactly this one layer.
+#
+# It used to sit BEFORE the `COPY --from=llamacpp-build` and the rpath/ldd
+# verification that now precede it, which made every app edit invalidate and
+# re-run both. Moving it down is filesystem-identical -- nothing above reads
+# /app/app, and nothing below writes into it -- it only changes which layers a
+# source edit has to rebuild.
 COPY app /app/app
 
 # Build-time identity (spec 2026-05-13 §Version surfacing, P1-9). The CI

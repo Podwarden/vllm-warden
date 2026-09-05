@@ -2,6 +2,7 @@
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { Button } from '@/components/ui/button';
+import { pathForStep } from '@/lib/setup-steps';
 
 export default function WelcomePage() {
   const router = useRouter();
@@ -22,7 +23,11 @@ export default function WelcomePage() {
         setError(body.detail ?? 'Failed to start setup');
         return;
       }
-      router.push('/setup/gpus');
+      // The server reports the step to resume at: "gpus" on a fresh start,
+      // or the actual current step if setup was already in progress
+      // (idempotent re-entry after Back/reload).
+      const body = await r.json().catch(() => ({}));
+      router.push(pathForStep(body.step));
     } finally {
       setBusy(false);
     }
@@ -30,7 +35,7 @@ export default function WelcomePage() {
 
   return (
     <section className="space-y-4">
-      <h1 className="text-2xl font-semibold">Welcome to vllm-warden</h1>
+      <h1 className="text-2xl font-semibold">Welcome to LLM Warden</h1>
       <p className="text-sm text-slate-400">
         This wizard will configure your GPUs, HuggingFace token, and admin account.
       </p>

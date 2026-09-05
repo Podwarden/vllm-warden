@@ -10,10 +10,12 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:conformance": "vitest run -c vitest.conformance.config.ts",
     "generate:api-types": "openapi-typescript ../openapi.json -o src/lib/api-types.generated.ts",
     "analyze": "ANALYZE=true next build"
   },
   "dependencies": {
+    "@podwarden/chat-ui": "0.1.23",
     "ansi_up": "6.0.6",
     "class-variance-authority": "0.7.1",
     "clsx": "2.1.1",

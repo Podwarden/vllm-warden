@@ -127,6 +127,48 @@ def test_empty_repo_name_is_silently_skipped(tmp_path: Path) -> None:
     assert [r.repo for r in out] == ["Good/Repo"]
 
 
+def test_merges_root_and_hub_layouts_for_same_repo(tmp_path: Path) -> None:
+    """vllm-warden#238: a repo split across ``<root>/`` (real weights) and
+    ``<root>/hub/`` (HF's own hub layout, metadata only) must be reported
+    as ONE row whose size is the real on-disk total — not two rows
+    summing to roughly double it.
+
+    Fixture mirrors the bug report exactly: ``<root>/models--org--name``
+    holds the actual weight file directly (no symlinks — this is
+    vllm-warden's own download layout), while
+    ``<root>/hub/models--org--name`` has a proper HF ``blobs/`` +
+    ``snapshots/`` layout where the snapshot entry is a REAL symlink
+    into ``blobs/``. Before the fix, ``os.stat`` on that symlink summed
+    the blob's bytes on top of the blob itself (double-counting the hub
+    side) AND the two layouts were never merged (duplicate row).
+    """
+    weights_dir = tmp_path / "models--nvidia--Qwen3.6-35B-A3B-NVFP4"
+    weights_dir.mkdir(parents=True)
+    weight_file = weights_dir / "model.safetensors"
+    weight_file.write_bytes(b"w" * 7_000_000)
+
+    hub_repo = tmp_path / "hub" / "models--nvidia--Qwen3.6-35B-A3B-NVFP4"
+    blobs = hub_repo / "blobs"
+    snapshot = hub_repo / "snapshots" / "deadbeef"
+    blobs.mkdir(parents=True)
+    snapshot.mkdir(parents=True)
+    blob = blobs / "cafef00d"
+    blob.write_bytes(b"c" * 26_000)
+    # Real symlink into blobs/, exactly like the HF library writes.
+    os.symlink(os.path.relpath(blob, snapshot), snapshot / "config.json")
+
+    real_total = weight_file.stat().st_size + blob.stat().st_size
+
+    out = scan_hf_cache(tmp_path)
+
+    matching = [r for r in out if r.repo == "nvidia/Qwen3.6-35B-A3B-NVFP4"]
+    assert len(matching) == 1, "repo must appear exactly once, not once per layout"
+    assert matching[0].size_bytes == real_total, (
+        "reported size must equal the real byte total counted once "
+        "(blob referenced by a symlink must not be added twice)"
+    )
+
+
 def test_cached_repo_is_frozen() -> None:
     """``@dataclass(frozen=True)`` so route handlers can stash these in
     a dict keyed by path without worrying about mutation."""

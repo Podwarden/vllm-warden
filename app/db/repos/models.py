@@ -3,6 +3,8 @@ from dataclasses import dataclass
 
 import aiosqlite
 
+from app.runtime.backends.registry import DEFAULT_BACKEND
+
 
 @dataclass
 class ModelRow:
@@ -53,6 +55,36 @@ class ModelRow:
     # carry alone. Set on the crash path, cleared once the model is serving
     # again or an operator unloads it. The restart sweep keys on this.
     prior_status: str | None = None
+    # New for migration 0025 (chat2). Capability flags the chat2 catalog
+    # reads to decide what a served model can do -- tool calling, image
+    # input, and reasoning/thinking output.
+    #
+    # TRI-state, and the third state is load-bearing: 1/0 is an operator's
+    # explicit answer (set via PATCH /api/models/{id}/settings, which accepts
+    # true/false/null and is exempt from that endpoint's unload-first 409),
+    # while NULL means nobody has stated one. app/chat2/catalog.py auto-detects
+    # `supports_vision` from the on-disk HF config, and `supports_reasoning`
+    # from the on-disk chat template (True when it references
+    # `enable_thinking`), only while each is NULL -- collapsing NULL into 0
+    # here is what silently served every pasted image as "[image omitted]" on
+    # a model that could read it (#106), and what hid the "Enable thinking"
+    # toggle on every reasoning model until an operator found and set the flag
+    # by hand (#239). `supports_tools` has no auto-detection and reads as
+    # False when NULL.
+    #
+    # Decode these RAW (never `bool(...)`): the distinction is the point.
+    supports_tools: int | None = None
+    supports_vision: int | None = None
+    supports_reasoning: int | None = None
+    # New for migration 0027 (sub-project B). Which backend serves this model.
+    # NULL on every pre-B row and decoded to 'vllm' by _decode_row via
+    # app.runtime.backends.registry -- decision D6, no backfill.
+    backend: str | None = None
+    # New for migration 0028 (sub-project C). Both NULL on every pre-C row and
+    # on every vLLM row. See the migration for why n_gpu_layers=None means
+    # "let mainline choose" rather than "zero layers on the GPU".
+    mmproj_filename: str | None = None
+    n_gpu_layers: int | None = None
 
 
 # Column list shared by insert + every SELECT so we can't drift them.
@@ -65,7 +97,9 @@ _MODEL_COLS = (
     "trust_remote_code, extra_args, status, pulled_bytes, pulled_total, last_error, "
     "extra_env, filename, parallelism_strategy, max_batch_size, "
     "hf_config_repo, tokenizer_repo, updated_at, "
-    "engine_channel, engine_vllm_version, engine_image, prior_status"
+    "engine_channel, engine_vllm_version, engine_image, prior_status, "
+    "supports_tools, supports_vision, supports_reasoning, backend, "
+    "mmproj_filename, n_gpu_layers"
 )
 
 
@@ -87,6 +121,16 @@ def _decode_row(row: tuple) -> ModelRow:
         engine_vllm_version=row[23],
         engine_image=row[24],
         prior_status=row[25],
+        supports_tools=row[26],
+        supports_vision=row[27],
+        supports_reasoning=row[28],
+        # D6: NULL means vLLM. registry.get owns that default so it lives in
+        # exactly one place when a second backend lands.
+        backend=row[29] or DEFAULT_BACKEND,
+        # Migration 0028. NULL on every row that is not a llama.cpp vision
+        # model / does not want partial CPU offload -- see the migration.
+        mmproj_filename=row[30],
+        n_gpu_layers=row[31],
     )
 
 
@@ -102,8 +146,9 @@ class ModelRepo:
                 trust_remote_code, extra_args, status, pulled_bytes, pulled_total, last_error,
                 extra_env, filename, parallelism_strategy, max_batch_size,
                 hf_config_repo, tokenizer_repo,
-                engine_channel, engine_vllm_version, engine_image
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                engine_channel, engine_vllm_version, engine_image,
+                backend, mmproj_filename, n_gpu_layers
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 row.id, row.served_model_name, row.hf_repo, row.hf_revision,
                 json.dumps(row.gpu_indices),
@@ -113,6 +158,7 @@ class ModelRepo:
                 row.filename, row.parallelism_strategy, row.max_batch_size,
                 row.hf_config_repo, row.tokenizer_repo,
                 row.engine_channel, row.engine_vllm_version, row.engine_image,
+                row.backend, row.mmproj_filename, row.n_gpu_layers,
             ),
         )
         await self.db.commit()

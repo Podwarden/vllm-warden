@@ -3,11 +3,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from app.runtime.env_builder import (
-    ALLOWED_ENV_EXACT,
-    ALLOWED_ENV_PREFIXES,
-    HARD_LOCKED_ENV_KEYS,
-)
+from app.runtime.backends import registry
 
 SLUG_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 
@@ -18,6 +14,12 @@ class ModelCreate(BaseModel):
     # enforces presence after merging template + body (explicit body wins).
     hf_repo: str | None = Field(default=None, pattern=r"^[\w.-]+/[\w.-]+$")
     hf_revision: str = "main"
+    # Which inference program serves this model (sub-project B, decision D6).
+    # Defaulted, so a client that never sends it behaves exactly as before.
+    # Sub-project C widens the Literal to include "llamacpp"; the registry is
+    # the source of truth and tests/unit/models/test_schemas.py asserts the two
+    # never drift.
+    backend: Literal["vllm", "llamacpp"] = "vllm"
     # #162 — engine templates. ``template_id`` selects a builtin/user template
     # whose fields prefill the model; the ``engine_*`` trio overrides the
     # template's engine axis (channel, vLLM version, optional pinned image).
@@ -59,6 +61,19 @@ class ModelCreate(BaseModel):
     tokenizer_repo: str | None = Field(
         default=None, pattern=r"^[\w.-]+/[\w.-]+$"
     )
+    # New for migration 0028 (sub-project C) -- llama.cpp only.
+    # ``mmproj_filename`` is the multimodal projector GGUF that sits beside the
+    # weights in the same repo; llama.cpp takes it as a separate --mmproj file
+    # because, unlike vLLM, its vision tower is not inside the checkpoint. Same
+    # length bounds as ``filename``.
+    mmproj_filename: str | None = Field(None, min_length=1, max_length=512)
+    # ``n_gpu_layers`` = None means "omit the flag" and let llama.cpp's own
+    # auto/--fit sizing choose, which is the mainline behaviour and the default
+    # we want. An explicit value is a deliberate PARTIAL offload -- spilling
+    # layers to CPU RAM to fit a model that does not fit the card. 0 is legal
+    # and means "everything on the CPU"; the upper bound is loose because it is
+    # a sanity check, not a model fact.
+    n_gpu_layers: int | None = Field(None, ge=0, le=999)
 
     @field_validator("served_model_name")
     @classmethod
@@ -90,32 +105,6 @@ class ModelCreate(BaseModel):
             raise ValueError("gpu_indices must be >= 0")
         return v
 
-    @field_validator("extra_env")
-    @classmethod
-    def _extra_env_allowlist(cls, v: dict[str, str]) -> dict[str, str]:
-        """Enforce the same allowlist that runs at subprocess-spawn time.
-
-        Defense-in-depth: today _filter_extra_env raises on hard-locked keys and
-        silently drops unknown keys only when load() runs. By enforcing here, the
-        API rejects bad extra_env synchronously at write time so operators get an
-        immediate, descriptive error instead of mysteriously-missing env at load.
-        """
-        for key in v:
-            if key in HARD_LOCKED_ENV_KEYS:
-                raise ValueError(
-                    f"extra_env key '{key}' is hard-locked and cannot be set via API"
-                )
-            if not (
-                any(key.startswith(p) for p in ALLOWED_ENV_PREFIXES)
-                or key in ALLOWED_ENV_EXACT
-            ):
-                raise ValueError(
-                    f"extra_env key '{key}' is not in the allowlist "
-                    f"(prefix one of {sorted(ALLOWED_ENV_PREFIXES)} "
-                    f"or exact match in {sorted(ALLOWED_ENV_EXACT)})"
-                )
-        return v
-
     @model_validator(mode="after")
     def _tp_consistent(self) -> "ModelCreate":
         if self.tensor_parallel_size is None:
@@ -125,6 +114,39 @@ class ModelCreate(BaseModel):
                 f"tensor_parallel_size={self.tensor_parallel_size} "
                 f"must equal len(gpu_indices)={len(self.gpu_indices)}"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _extra_env_allowlist(self) -> "ModelCreate":
+        """Enforce the same allowlist that runs at subprocess-spawn time.
+
+        Defense-in-depth: at load time filter_extra_env raises on hard-locked
+        keys and silently drops unknown ones. Enforcing here means the API
+        rejects bad extra_env synchronously at write time, so operators get an
+        immediate, descriptive error instead of mysteriously-missing env.
+
+        A model_validator rather than a field_validator because the allowlist
+        is now per-backend and ``self.backend`` must already be resolved.
+        HARD_LOCKED_ENV_KEYS stays global -- every key in it is locked for
+        reasons unrelated to which server runs.
+        """
+        from app.runtime.backends.vllm.env import HARD_LOCKED_ENV_KEYS
+
+        caps = registry.get(self.backend).capabilities
+        for key in self.extra_env:
+            if key in HARD_LOCKED_ENV_KEYS:
+                raise ValueError(
+                    f"extra_env key '{key}' is hard-locked and cannot be set via API"
+                )
+            if not (
+                any(key.startswith(p) for p in caps.env_prefixes)
+                or key in caps.env_exact
+            ):
+                raise ValueError(
+                    f"extra_env key '{key}' is not in the allowlist for backend "
+                    f"'{caps.name}' (prefix one of {sorted(caps.env_prefixes)} "
+                    f"or exact match in {sorted(caps.env_exact)})"
+                )
         return self
 
 

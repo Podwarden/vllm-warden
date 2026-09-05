@@ -3,7 +3,7 @@ import logging
 
 import pytest
 
-from app.runtime.env_builder import build_subprocess_env
+from app.runtime.backends.vllm.env import build_subprocess_env
 
 
 def _model(extra_env: dict) -> object:
@@ -194,25 +194,25 @@ def test_hard_locked_keys_set_correctly_even_with_empty_extra_env():
 # ---------------------------------------------------------------------------
 
 def test_dropped_keys_logged_at_info(caplog):
-    """Bypass ModelCreate's validator and assert _filter_extra_env logs drops.
+    """Bypass ModelCreate's validator and assert filter_extra_env logs drops.
 
     DB-level injection / manual SQL / migrations can still produce non-allowlist
     keys in the row even after the API-boundary validator (Fix #1) is in place.
     Operators need a signal when env they configured is silently dropped.
     """
-    with caplog.at_level(logging.INFO, logger="app.runtime.env_builder"):
+    with caplog.at_level(logging.INFO, logger="app.runtime.backends.vllm.env"):
         env = build_subprocess_env(
             _model({"FOO_BAR": "x", "BAZ_QUX": "y", "VLLM_USE_V1": "1"}),
             hf_token="tok", hf_cache_dir="/d",
         )
     assert "VLLM_USE_V1" in env
     assert "FOO_BAR" not in env
-    msgs = [r.getMessage() for r in caplog.records if r.name == "app.runtime.env_builder"]
+    msgs = [r.getMessage() for r in caplog.records if r.name == "app.runtime.backends.vllm.env"]
     assert any("dropped 2" in m and "FOO_BAR" in m and "BAZ_QUX" in m for m in msgs), msgs
 
 
 def test_no_drop_log_when_all_keys_allowed(caplog):
-    with caplog.at_level(logging.INFO, logger="app.runtime.env_builder"):
+    with caplog.at_level(logging.INFO, logger="app.runtime.backends.vllm.env"):
         build_subprocess_env(
             _model({"VLLM_USE_V1": "1", "NCCL_DEBUG": "WARN"}),
             hf_token="tok", hf_cache_dir="/d",
@@ -220,6 +220,58 @@ def test_no_drop_log_when_all_keys_allowed(caplog):
     drop_msgs = [
         r.getMessage()
         for r in caplog.records
-        if r.name == "app.runtime.env_builder" and "dropped" in r.getMessage()
+        if r.name == "app.runtime.backends.vllm.env" and "dropped" in r.getMessage()
     ]
     assert drop_msgs == []
+
+
+# ---------------------------------------------------------------------------
+# Sub-project B: the allowlist becomes per-backend; the hard lock stays global
+# ---------------------------------------------------------------------------
+
+def test_pythonpath_is_hard_locked():
+    """Spec §2 defence-in-depth. PYTHONPATH is on no allowlist today, so this
+    changes nothing an operator can currently do -- it documents WHY the key
+    can never be added: PYTHONPATH is precisely how extra_env would
+    reintroduce runtime patching through the back door."""
+    from app.runtime.backends.vllm.env import HARD_LOCKED_ENV_KEYS
+    assert "PYTHONPATH" in HARD_LOCKED_ENV_KEYS
+
+
+def test_ld_preload_is_hard_locked():
+    from app.runtime.backends.vllm.env import HARD_LOCKED_ENV_KEYS
+    assert "LD_PRELOAD" in HARD_LOCKED_ENV_KEYS
+
+
+@pytest.mark.parametrize("key", ["PYTHONPATH", "LD_PRELOAD"])
+def test_setting_a_newly_locked_key_raises(key):
+    from app.runtime.backends.vllm.env import build_subprocess_env
+    model = _model({key: "/tmp/evil"})
+    with pytest.raises(ValueError, match="hard-locked"):
+        build_subprocess_env(model, hf_token="t", hf_cache_dir="/c")
+
+
+def test_filter_takes_the_allowlist_as_a_parameter():
+    """Per-backend prefixes are a NARROWING. A backend that does not accept
+    VLLM_* must drop them, and the drop must stay silent (never raise) --
+    that half of the contract is what keeps a template portable."""
+    from app.runtime.backends.vllm.env import filter_extra_env
+    out = filter_extra_env(
+        {"VLLM_LOGGING_LEVEL": "DEBUG", "LLAMA_ARG_N_GPU_LAYERS": "99"},
+        prefixes=("LLAMA_",),
+        exact=frozenset(),
+    )
+    assert out == {"LLAMA_ARG_N_GPU_LAYERS": "99"}
+
+
+def test_hard_lock_is_enforced_regardless_of_the_backend_allowlist():
+    """HARD_LOCKED_ENV_KEYS is GLOBAL: every key in it is locked for reasons
+    unrelated to which server runs. A per-backend prefix must never unlock
+    one."""
+    from app.runtime.backends.vllm.env import filter_extra_env
+    with pytest.raises(ValueError, match="hard-locked"):
+        filter_extra_env(
+            {"HF_HUB_CACHE": "/somewhere/else"},
+            prefixes=("HF_",),
+            exact=frozenset(),
+        )

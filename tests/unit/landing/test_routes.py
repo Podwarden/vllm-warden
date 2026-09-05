@@ -20,6 +20,7 @@ shape a browser hitting `https://vllm.example.com/` would make after
 Caddy's rewrite.
 """
 
+import re
 import sqlite3
 from pathlib import Path
 
@@ -93,7 +94,12 @@ def test_landing_html_contains_required_entry_points(client: TestClient) -> None
     point a curious visitor sees.
     """
     body = client.get("/_landing").text
-    assert "vLLM Warden" in body
+    assert "<title>LLM Warden</title>" in body
+    # The product name is engine-neutral (vLLM and llama.cpp both ship), so
+    # the rendered page must not fall back to the old two-word name. The
+    # `vllm-warden` slug in the source-repo URL below is identity, not the
+    # product's name, and stays.
+    assert not re.search(r"vllm\s+warden", body, re.IGNORECASE)
     assert 'href="/ui/"' in body
     assert "github.com/Podwarden/vllm-warden" in body
     assert "podwarden.com" in body

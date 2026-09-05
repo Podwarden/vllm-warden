@@ -16,24 +16,35 @@
 
 // ---- Plane A: GET /api/stats/live (SSE frame) -----------------------------
 
+// Every numeric field here is nullable, and that is a CONTRACT rather than
+// defensive typing. Sub-project C added a second backend: llama.cpp publishes no
+// KV-usage gauge, no cache_config_info, no preemption counter and no sleep
+// state, so those arrive as `null` and must render as ABSENT -- never as 0. A
+// zero here says "plenty of KV headroom" or "the engine is idle"; the truth is
+// "this engine is silent about that", and an operator who acts on the first has
+// been actively misled (design spec §9.3).
+//
+// The six that used to be non-nullable were widened deliberately, so TypeScript
+// would point at every render site that needed fixing. That is the cheapest
+// possible audit, and it found three.
 export interface LiveEngine {
-  num_requests_running: number;
-  num_requests_waiting: number;
+  num_requests_running: number | null;
+  num_requests_waiting: number | null;
   /** Free-form reason → waiting count, e.g. {capacity, deferred}. */
-  waiting_by_reason: Record<string, number>;
-  kv_cache_usage_perc: number; // 0..1
-  kv_tokens_used: number; // derived absolute
-  kv_tokens_total: number; // block_size * num_gpu_blocks
-  engine_sleep_state: number; // 0 = awake
-  preemptions_total: number;
+  waiting_by_reason: Record<string, number | null>;
+  kv_cache_usage_perc: number | null; // 0..1
+  kv_tokens_used: number | null; // derived absolute
+  kv_tokens_total: number | null; // block_size * num_gpu_blocks
+  engine_sleep_state: number | null; // 0 = awake
+  preemptions_total: number | null;
   preemptions_per_s: number | null; // null on the connection's first frame
 }
 
 export interface LiveThroughput {
   prompt_tokens_per_s: number | null;
   generation_tokens_per_s: number | null;
-  prompt_tokens_total: number;
-  generation_tokens_total: number;
+  prompt_tokens_total: number | null;
+  generation_tokens_total: number | null;
 }
 
 export interface LiveCache {
@@ -68,6 +79,13 @@ export interface LiveEngineFrame {
   /** Served model name, or null when no model is loaded (engine idle). */
   model: string | null;
   model_id: string | null;
+  /**
+   * Which engine produced this frame — "vllm" | "llamacpp" (sub-project C's one
+   * additive field). Present so the dashboard can say WHICH engine does not
+   * report a metric rather than showing a blank tile of unknown provenance.
+   * Null only on the frames emitted before any model resolves.
+   */
+  backend: string | null;
   /** From the model row / engine — the denominator for context bars. */
   max_model_len: number | null;
   engine: LiveEngine;
@@ -79,6 +97,125 @@ export interface LiveEngineFrame {
   finished: Record<string, number>;
   /** Non-null string when the /metrics scrape failed this tick. */
   scrape_error: string | null;
+  /**
+   * Every loaded model's block, most significant first.
+   *
+   * Optional at the type level: ui and api ship as separate images, so a
+   * bundle newer than its api pod receives a frame with only the top-level
+   * fields. `liveFramesOf` below turns both shapes into one list.
+   *
+   * The top-level fields on THIS interface mirror `models[0]`; they are what
+   * an api-newer-than-ui pairing keeps reading. Never read both.
+   */
+  models?: LiveEngineFrame[];
+}
+
+/**
+ * Every model block in a frame, however old the API that produced it.
+ *
+ * A pre-multi-model frame IS one block, so it becomes a one-element list
+ * rather than an empty one — otherwise a rollout skew would blank a dashboard
+ * whose engine is serving perfectly well.
+ */
+export function liveFramesOf(
+  frame: LiveEngineFrame | null | undefined,
+): LiveEngineFrame[] {
+  if (!frame) return [];
+  if (Array.isArray(frame.models)) return frame.models;
+  return frame.model_id === null && frame.model === null ? [] : [frame];
+}
+
+// ---- Combining several models' readings -----------------------------------
+//
+// THE RULE, and it is the whole reason this is a named function with tests
+// rather than a `.reduce` at a call site: `null` means "this engine does not
+// report it", NEVER zero. llama.cpp publishes no KV gauge, no preemption
+// counter and no latency histograms; vLLM publishes all of them. Adding a
+// reported number to an unreported one with `?? 0` produces a total that is
+// silently short by an unknown amount and looks authoritative — which is
+// exactly the bug sub-project C fixed for three panels, and a multi-model
+// selection is a fresh chance to reintroduce it once per tile.
+//
+// So a combined value carries its own provenance: the number, and how many of
+// the selected models actually contributed to it. A tile that reads "1 of 2
+// models report this" is honest in a way that any single number cannot be.
+
+export interface CombinedMetric {
+  /** Sum over the models that REPORT it, or null when none of them do. */
+  value: number | null;
+  /** How many selected models reported it. */
+  reporting: number;
+  /** How many models were selected. `reporting < total` means partial. */
+  total: number;
+}
+
+/**
+ * Sum `values`, counting only the ones that are actually reported.
+ *
+ * `null`/`undefined`/`NaN` entries are SKIPPED, not zeroed. When every entry is
+ * absent the result is `null` — "nobody here measures this" — and never `0`,
+ * which would read as "measured, and it is zero".
+ */
+export function sumReported(
+  values: readonly (number | null | undefined)[],
+): CombinedMetric {
+  let sum = 0;
+  let reporting = 0;
+  for (const v of values) {
+    if (v === null || v === undefined || Number.isNaN(v)) continue;
+    sum += v;
+    reporting += 1;
+  }
+  return {
+    value: reporting > 0 ? sum : null,
+    reporting,
+    total: values.length,
+  };
+}
+
+/** True when at least one selected model stayed silent about a reported metric. */
+export function isPartial(m: CombinedMetric): boolean {
+  return m.reporting > 0 && m.reporting < m.total;
+}
+
+export interface CombinedThroughput {
+  prompt_tokens_per_s: CombinedMetric;
+  generation_tokens_per_s: CombinedMetric;
+  prompt_tokens_total: CombinedMetric;
+  generation_tokens_total: CombinedMetric;
+  running: CombinedMetric;
+  waiting: CombinedMetric;
+}
+
+/**
+ * Fleet-wide throughput across the selected models.
+ *
+ * Only additive, same-unit quantities are combined. Latency percentiles, KV
+ * usage fractions and cache hit rates are deliberately NOT here: a p99 across
+ * two engines is not a p99 of anything, and averaging two KV-usage fractions
+ * whose denominators are different cache sizes produces a number with no
+ * referent. Those stay per-model, one panel each, which is also what the
+ * operator needs in order to act on them.
+ */
+export function combineThroughput(
+  frames: readonly LiveEngineFrame[],
+): CombinedThroughput {
+  return {
+    prompt_tokens_per_s: sumReported(
+      frames.map((f) => f.throughput?.prompt_tokens_per_s),
+    ),
+    generation_tokens_per_s: sumReported(
+      frames.map((f) => f.throughput?.generation_tokens_per_s),
+    ),
+    prompt_tokens_total: sumReported(
+      frames.map((f) => f.throughput?.prompt_tokens_total),
+    ),
+    generation_tokens_total: sumReported(
+      frames.map((f) => f.throughput?.generation_tokens_total),
+    ),
+    running: sumReported(frames.map((f) => f.engine?.num_requests_running)),
+    waiting: sumReported(frames.map((f) => f.engine?.num_requests_waiting)),
+  };
 }
 
 // ---- Plane B: GET /api/stats/requests (JSON snapshot) ---------------------
@@ -119,6 +256,57 @@ export interface LiveRequestsSnapshot {
   requests: LiveRequestRow[];
   by_token: LiveByToken[];
   by_ip: LiveByIp[];
+}
+
+/**
+ * Re-derive the by-token / by-IP rollups from a SUBSET of the rows.
+ *
+ * The server computes them from every in-flight row (`_aggregate` in
+ * app/stats/live_requests.py), which is right for the unfiltered view and
+ * wrong the moment the operator narrows to one model: the request list would
+ * shrink while the two panels underneath it kept describing the whole box.
+ * Two views of the same instant disagreeing about which requests exist is
+ * worse than either one alone.
+ *
+ * The server's aggregation is a plain group-by over the same rows, so
+ * recomputing from the filtered rows is exact rather than an approximation —
+ * and passing ALL rows here reproduces the server's own output.
+ */
+export function aggregateRequests(rows: readonly LiveRequestRow[]): {
+  by_token: LiveByToken[];
+  by_ip: LiveByIp[];
+} {
+  const byToken = new Map<string | null, LiveByToken>();
+  const byIp = new Map<string | null, LiveByIp>();
+  for (const r of rows) {
+    const t = byToken.get(r.token_name) ?? {
+      token_name: r.token_name,
+      requests: 0,
+      context_tokens: 0,
+      prompt_tokens: 0,
+      completion_tokens: 0,
+    };
+    t.requests += 1;
+    t.context_tokens += r.context_tokens;
+    t.prompt_tokens += r.prompt_tokens;
+    t.completion_tokens += r.completion_tokens;
+    byToken.set(r.token_name, t);
+
+    const p = byIp.get(r.client_ip) ?? {
+      client_ip: r.client_ip,
+      requests: 0,
+      context_tokens: 0,
+    };
+    p.requests += 1;
+    p.context_tokens += r.context_tokens;
+    byIp.set(r.client_ip, p);
+  }
+  const byContext = <T extends { context_tokens: number }>(a: T, b: T) =>
+    b.context_tokens - a.context_tokens;
+  return {
+    by_token: [...byToken.values()].sort(byContext),
+    by_ip: [...byIp.values()].sort(byContext),
+  };
 }
 
 // ---- Pressure scale -------------------------------------------------------

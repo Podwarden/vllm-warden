@@ -182,7 +182,7 @@ export const MODEL_HINTS: Record<string, FieldHint> = {
   },
   gpu_indices: {
     label: 'GPU indices',
-    hint: 'Which GPUs this model loads on. At least one required. Determines `CUDA_VISIBLE_DEVICES` for the vLLM subprocess.',
+    hint: 'Which GPUs this model loads on. At least one required. Determines `CUDA_VISIBLE_DEVICES` for the engine subprocess, whichever backend serves the model.',
     restart: 'model-reload',
   },
   tensor_parallel_size: {
@@ -192,7 +192,7 @@ export const MODEL_HINTS: Record<string, FieldHint> = {
   },
   gpu_memory_utilization: {
     label: 'GPU memory utilization',
-    hint: 'Fraction of VRAM vLLM may consume per GPU (0.0–1.0, default 0.9). Lower if you hit OOM during paged-attention warmup.',
+    hint: 'vLLM only. Fraction of VRAM vLLM may consume per GPU (0.0–1.0, default 0.9). Lower if you hit OOM during paged-attention warmup. llama.cpp has no equivalent — it sizes its own allocation — so this field is hidden for that backend.',
     restart: 'model-reload',
   },
   dtype: {
@@ -208,6 +208,41 @@ export const MODEL_HINTS: Record<string, FieldHint> = {
   kv_cache_dtype: {
     label: 'KV cache dtype',
     hint: 'One of `auto`, `fp8`, `fp8_e5m2`. `fp8` halves KV cache memory; tiny accuracy impact.',
+    restart: 'model-reload',
+  },
+  n_gpu_layers: {
+    label: 'GPU layers',
+    hint: 'llama.cpp only. Blank lets llama.cpp size the offload itself, which is the right answer almost always. An explicit number is a deliberate PARTIAL offload -- keeping some layers in CPU RAM so a model that does not fit the card still runs. It works, and it is a performance cliff.',
+    restart: 'model-reload',
+  },
+  mmproj_filename: {
+    label: 'Vision projector',
+    hint: 'llama.cpp only. The multimodal projector GGUF beside the weights in the same repo, passed as --mmproj. A vision model started without it loads, serves, and silently ignores every image.',
+    restart: 'model-reload',
+  },
+  // ---- llama.cpp dials stored inside extra_args -------------------------
+  //
+  // No column of their own, deliberately -- see @/lib/llamacpp-args. They are
+  // controls all the same: "no column" was never a reason for "no control",
+  // and hand-typing a flag into Extra args was the only way to reach the three
+  // knobs an operator on a 16 GB card reaches for most.
+  //
+  // Each hint names the trade-off rather than restating the flag, because the
+  // control IS the flag; what is not obvious from `--cache-type-k` is what it
+  // buys and what it costs.
+  flash_attn: {
+    label: 'Flash attention',
+    hint: "llama.cpp only. Unset leaves the engine on its own default ('auto', resolved at load time against the card); 'on' forces it, 'off' is the escape hatch when a model or quantisation trips over it. Written as --flash-attn in Extra args, so a value typed there by hand appears in this control instead of twice.",
+    restart: 'model-reload',
+  },
+  cache_type_k: {
+    label: 'KV cache type (K)',
+    hint: 'llama.cpp only. The main lever for fitting a longer context on a small card: q8_0 roughly halves the K cache against the f16 default, at some quality cost. Unset keeps f16. Written as --cache-type-k in Extra args.',
+    restart: 'model-reload',
+  },
+  cache_type_v: {
+    label: 'KV cache type (V)',
+    hint: 'llama.cpp only. The V half of the same lever; the two are independent flags and quantising only one is a legitimate, if unusual, choice. Unset keeps f16. Written as --cache-type-v in Extra args.',
     restart: 'model-reload',
   },
   max_model_len: {
@@ -240,6 +275,25 @@ export const MODEL_HINTS: Record<string, FieldHint> = {
     hint: 'If true, disable CUDA graphs. Useful for debugging and tiny models; ~5% slower.',
     restart: 'model-reload',
   },
+  // Tri-state capability flags (app/settings/routes_api.py
+  // _MODEL_TRISTATE_FIELDS). "Auto" is a real answer, not a blank: the chat
+  // catalog sniffs the model's own HF config while nobody has stated one.
+  // Read fresh out of the DB on every chat turn, so no reload is needed.
+  supports_vision: {
+    label: 'Vision',
+    hint: 'Whether this model can read images. Auto detects it from the model’s HF config; answer explicitly to override what the config says.',
+    restart: 'none',
+  },
+  supports_tools: {
+    label: 'Tools',
+    hint: 'Whether the chat may offer this model tool calls. Auto uses the built-in default for the architecture.',
+    restart: 'none',
+  },
+  supports_reasoning: {
+    label: 'Reasoning',
+    hint: 'Whether this model emits a thinking preamble. Drives the "Enable thinking" toggle in chat. Auto uses the built-in default.',
+    restart: 'none',
+  },
   trust_remote_code: {
     label: 'Trust remote code',
     hint: 'Required for models that ship Python in their HF repo (e.g. some custom architectures). Off by default for security.',
@@ -251,13 +305,17 @@ export const MODEL_HINTS: Record<string, FieldHint> = {
     restart: 'model-reload',
   },
   extra_args: {
-    label: 'Extra args',
-    hint: 'Free-form list passed to `vllm serve` after the curated flags. One arg per row, e.g. `--worker-use-ray`, `--scheduler-delay-factor`, `0.3`.',
+    label: 'Extra args (yours only)',
+    // The operator's question, verbatim: "why is Extra args empty but
+    // Effective argv has so many arguments?" The distinction was correct and
+    // invisible. This box holds ONLY what they added; everything else in the
+    // command is derived from the fields above and appears in Effective argv.
+    hint: 'Only the args YOU add. The rest of the command is derived from the fields above — see Effective argv at the bottom of this page for the whole thing. Yours are appended last, so they win. One per row: `--worker-use-ray` for vLLM, `--threads 8` for llama.cpp. Flags that have their own control above (flash attention, KV cache types) are edited there and do not appear here.',
     restart: 'model-reload',
   },
   extra_env: {
     label: 'Extra env',
-    hint: 'Free-form env vars passed to the vLLM subprocess. Allowlisted by `app.runtime.env_builder` (prefix `VLLM_`, `HF_`, `TRITON_`, etc.).',
+    hint: 'Free-form env vars passed to the engine subprocess. The allowlist is PER-BACKEND and narrowing: vLLM accepts `VLLM_`, `TRITON_`, `NCCL_`, `PYTORCH_`, `TORCH_`, `OMP_`; llama.cpp accepts `GGML_` only, because every llama.cpp flag has an `LLAMA_ARG_*` env twin and allowing that prefix would let a model row re-bind the unauthenticated engine API. `GET /api/system/backends` reports the exact list per backend.',
     restart: 'model-reload',
   },
 };

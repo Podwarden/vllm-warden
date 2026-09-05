@@ -162,7 +162,7 @@ export function CreateTokenDialog({ open, onClose }: CreateTokenDialogProps) {
     setCopyFailed(false);
     // copyToClipboard (lib/utils.ts) tries navigator.clipboard first then
     // falls back to a hidden-textarea + execCommand("copy") — required
-    // for the d5 deployment (#149) where the UI is served over plain
+    // for a LAN-HTTP deployment (#149) where the UI is served over plain
     // HTTP and navigator.clipboard is undefined. It throws only when
     // BOTH paths fail, so the "select manually" hint stays accurate.
     try {

@@ -43,7 +43,7 @@ async def test_unload_sigterms_then_releases_gpus(tmp_path):
 async def test_unload_releases_gpus_even_when_terminate_raises(tmp_path):
     """A teardown that raises must STILL release the in-memory GPU claim.
 
-    Regression for the #166-adjacent leak observed on d5: when the unload
+    Regression for the #166-adjacent leak observed in production: when the unload
     request was cancelled mid-``terminate()`` (client/proxy disconnect) — or
     when the driver's terminate raises any other exception — the old code
     skipped the trailing ``self.gpus.release()`` and the GPUs stayed

@@ -30,17 +30,27 @@ import { formatTps } from "@/lib/stats-v2";
 import { cn } from "@/lib/utils";
 import { useLiveStats, type LiveStatsState } from "@/lib/live-stats-stream";
 import {
+  aggregateRequests,
+  combineThroughput,
   formatCompact,
   formatElapsed,
   formatFlops,
   formatInt,
   formatLatency,
   formatPct,
+  isPartial,
+  liveFramesOf,
   pressureOf,
+  type CombinedMetric,
+  type LiveByIp,
+  type LiveByToken,
   type LiveEngineFrame,
+  type LiveRequestRow,
   type LiveRequestsSnapshot,
   type Pressure,
 } from "@/lib/live-stats";
+import { useModelSelection } from "@/lib/model-selection";
+import { ModelSelector } from "@/components/stats/model-selector";
 
 // Per-request registry poll. 1.5s matches the spec cadence; pause when the
 // tab is hidden so a background tab doesn't keep the registry read warm.
@@ -64,6 +74,10 @@ const PRESSURE_FILL: Record<Pressure, string> = {
 // Page
 // ===========================================================================
 
+/** Per-model sparkline trails, keyed by model_id. */
+type Trails = { running: number[]; kv: number[]; gen: number[] };
+const EMPTY_TRAILS: Trails = { running: [], kv: [], gen: [] };
+
 export default function LiveStatsPage() {
   const engine = useLiveStats();
   const frame = engine.frame;
@@ -74,30 +88,93 @@ export default function LiveStatsPage() {
     { refreshInterval: reqRefreshInterval, keepPreviousData: true },
   );
 
+  // Every loaded model's block. `liveFramesOf` also reads a pre-multi-model
+  // frame as the one model it describes, so a ui newer than its api still
+  // renders instead of blanking during a rollout.
+  const allFrames = useMemo(() => liveFramesOf(frame), [frame]);
+  const loadedModels = useMemo(
+    () =>
+      allFrames
+        .filter((f) => f.model_id !== null)
+        .map((f) => ({
+          id: f.model_id as string,
+          served_model_name: f.model ?? (f.model_id as string),
+        })),
+    [allFrames],
+  );
+  const modelIds = useMemo(() => loadedModels.map((m) => m.id), [loadedModels]);
+  const selection = useModelSelection(modelIds);
+  const shown = useMemo(
+    () =>
+      allFrames.filter(
+        (f) => f.model_id !== null && selection.selected.includes(f.model_id),
+      ),
+    [allFrames, selection.selected],
+  );
+  const shownNames = useMemo(
+    () => new Set(shown.map((f) => f.model).filter((m): m is string => !!m)),
+    [shown],
+  );
+
+  // Fleet totals across the SELECTED models. Absent metrics are skipped, not
+  // zeroed -- see combineThroughput and CombinedTile below.
+  const combined = useMemo(() => combineThroughput(shown), [shown]);
+
   // Rolling trails for the sparklines, appended once per distinct engine
-  // frame. Kept in state (not a ref) so the sparklines re-render on push.
-  const [hist, setHist] = useState<{
-    running: number[];
-    kv: number[];
-    gen: number[];
-  }>({ running: [], kv: [], gen: [] });
+  // frame, PER MODEL. Kept in state (not a ref) so the sparklines re-render.
+  // One shared trail would have interleaved two engines' samples into a line
+  // that described neither.
+  const [hist, setHist] = useState<Record<string, Trails>>({});
   const lastTs = useRef<string | null>(null);
 
   useEffect(() => {
-    if (!frame || frame.model === null) return;
+    if (!frame) return;
     if (frame.ts === lastTs.current) return;
     lastTs.current = frame.ts;
-    const cap = (arr: number[], v: number) =>
-      [...arr, v].slice(-HIST_LEN);
-    setHist((h) => ({
-      running: cap(h.running, frame.engine.num_requests_running),
-      kv: cap(h.kv, frame.engine.kv_cache_usage_perc * 100),
-      gen: cap(h.gen, frame.throughput.generation_tokens_per_s ?? 0),
-    }));
+    const blocks = liveFramesOf(frame).filter((f) => f.model_id !== null);
+    if (blocks.length === 0) return;
+    // An ABSENT metric must not enter the trail. A `?? 0` draws a flat line at
+    // zero, and a flat line at zero is a CLAIM about throughput -- the
+    // sparkline would tell an operator the engine was idle when the engine
+    // simply does not publish that number (design spec §9.3). Skipping the
+    // sample keeps the trail honest: a backend that never reports the metric
+    // contributes nothing and its sparkline stays empty.
+    const cap = (arr: number[], v: number | null | undefined) =>
+      v === null || v === undefined ? arr : [...arr, v].slice(-HIST_LEN);
+    setHist((h) => {
+      const next: Record<string, Trails> = {};
+      for (const b of blocks) {
+        const id = b.model_id as string;
+        const prev = h[id] ?? EMPTY_TRAILS;
+        next[id] = {
+          running: cap(prev.running, b.engine?.num_requests_running),
+          kv: cap(
+            prev.kv,
+            b.engine?.kv_cache_usage_perc == null
+              ? null
+              : b.engine.kv_cache_usage_perc * 100,
+          ),
+          gen: cap(prev.gen, b.throughput?.generation_tokens_per_s),
+        };
+      }
+      // Trails for models that are gone are dropped with them, so an unload
+      // followed by a reload does not resume against a stale line.
+      return next;
+    });
   }, [frame]);
 
-  const noModel = frame !== null && frame.model === null;
+  const noModel = frame !== null && allFrames.length === 0;
   const showSkeleton = frame === null && engine.status !== "terminal-error";
+
+  // Rows for the SELECTED models only, and the two rollups recomputed from
+  // exactly those rows. The server aggregates over every in-flight request,
+  // which is right unfiltered and wrong the moment the operator narrows: the
+  // list would shrink while the panels below it kept describing the box.
+  const shownRequests = useMemo(() => {
+    const rows = requests.data?.requests ?? [];
+    return shownNames.size === 0 ? rows : rows.filter((r) => shownNames.has(r.model));
+  }, [requests.data, shownNames]);
+  const rollups = useMemo(() => aggregateRequests(shownRequests), [shownRequests]);
 
   return (
     <div className="space-y-5" data-testid="live-stats-page">
@@ -105,21 +182,11 @@ export default function LiveStatsPage() {
       <header className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-3">
           <h1 className="text-2xl font-semibold">Live</h1>
-          {frame && frame.model ? (
-            <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-700/60 bg-emerald-900/30 px-2.5 py-0.5">
-              <span
-                aria-hidden="true"
-                className="h-1.5 w-1.5 rounded-full bg-emerald-400"
-              />
-              <span className="font-mono text-[11px] text-emerald-200">
-                {frame.model}
-              </span>
-            </span>
-          ) : noModel ? (
+          {noModel && (
             <span className="rounded-full border border-slate-700 bg-slate-800/50 px-2.5 py-0.5 text-[11px] uppercase tracking-wide text-slate-400">
               idle
             </span>
-          ) : null}
+          )}
         </div>
         <div className="flex items-center gap-3 text-xs">
           <ConnectionStatus state={engine} />
@@ -133,18 +200,15 @@ export default function LiveStatsPage() {
         </div>
       </header>
 
+      {/* The same selection as /stats and /godmode. */}
+      <ModelSelector models={loadedModels} selection={selection} />
+
       {/* Terminal / scrape banners ------------------------------------ */}
       {engine.status === "terminal-error" && (
         <Banner tone="error">
           Live engine stream disconnected
           {engine.errorCode ? ` (HTTP ${engine.errorCode})` : ""}. Reload the
           page to reconnect.
-        </Banner>
-      )}
-      {frame?.scrape_error && (
-        <Banner tone="warn">
-          Metrics scrape failed: {frame.scrape_error}. Showing the last good
-          values.
         </Banner>
       )}
 
@@ -156,37 +220,189 @@ export default function LiveStatsPage() {
         />
       ) : (
         <>
-          {/* Engine hero — the headline: load + KV pressure ---------- */}
-          <EngineHero frame={frame} hist={hist} skeleton={showSkeleton} />
+          {/* Fleet totals — only when the selection spans several models.
+              With one selected it would restate the panel below it. */}
+          {shown.length > 1 && <CombinedRow combined={combined} />}
 
-          {/* Live requests — the centerpiece ------------------------- */}
+          {/* One section per selected model. The engine-level numbers stay
+              PER MODEL rather than being averaged into a fleet figure: a p99
+              across two engines is not a p99 of anything, and averaging two KV
+              fractions whose denominators are different cache sizes produces a
+              number with no referent. */}
+          {shown.map((f) => (
+            <ModelSection
+              key={f.model_id}
+              frame={f}
+              hist={hist[f.model_id as string] ?? EMPTY_TRAILS}
+              skeleton={showSkeleton}
+              soloed={shown.length === 1}
+            />
+          ))}
+
+          {/* Live requests — the centerpiece, narrowed to the selection. */}
           <LiveRequestsPanel
-            data={requests.data}
+            rows={shownRequests}
             error={requests.error}
             isLoading={requests.isLoading && !requests.data}
           />
 
-          {/* Throughput + latency ------------------------------------ */}
+          {/* Aggregations, recomputed from the same narrowed rows. */}
           <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-            <ThroughputPanel frame={frame} genHist={hist.gen} skeleton={showSkeleton} />
-            <LatencyPanel frame={frame} skeleton={showSkeleton} />
-          </div>
-
-          {/* Aggregations -------------------------------------------- */}
-          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-            <ByTokenPanel data={requests.data} />
-            <ByIpPanel data={requests.data} />
-          </div>
-
-          {/* Cache / MFU / finished ---------------------------------- */}
-          <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
-            <CachePanel frame={frame} skeleton={showSkeleton} />
-            <MfuPanel frame={frame} skeleton={showSkeleton} />
-            <FinishedPanel frame={frame} skeleton={showSkeleton} />
+            <ByTokenPanel rows={rollups.by_token} />
+            <ByIpPanel rows={rollups.by_ip} />
           </div>
         </>
       )}
     </div>
+  );
+}
+
+// ===========================================================================
+// Fleet totals across the selected models
+// ===========================================================================
+
+/**
+ * The only numbers combined across engines: additive, same-unit quantities.
+ *
+ * Each tile states how many of the selected models contributed. That is not
+ * decoration — `null` in an EngineReading means "this engine does not report
+ * it", never zero, so a fleet total can be a sum over a SUBSET of what the
+ * operator selected, and a bare number would hide that.
+ */
+function CombinedRow({
+  combined,
+}: {
+  combined: ReturnType<typeof combineThroughput>;
+}) {
+  return (
+    <div data-testid="live-combined">
+      <Panel title="All selected models">
+        <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+          <CombinedTile
+            label="Generation"
+            unit="tok/s"
+            metric={combined.generation_tokens_per_s}
+            format={(n) => (n === null ? "—" : formatTps(n))}
+          />
+          <CombinedTile
+            label="Prompt"
+            unit="tok/s"
+            metric={combined.prompt_tokens_per_s}
+            format={(n) => (n === null ? "—" : formatTps(n))}
+          />
+          <CombinedTile label="Running" metric={combined.running} format={formatInt} />
+          <CombinedTile label="Waiting" metric={combined.waiting} format={formatInt} />
+        </div>
+      </Panel>
+    </div>
+  );
+}
+
+function CombinedTile({
+  label,
+  unit,
+  metric,
+  format,
+}: {
+  label: string;
+  unit?: string;
+  metric: CombinedMetric;
+  format: (n: number | null) => string;
+}) {
+  const partial = isPartial(metric);
+  return (
+    <div data-testid={`combined-${label.toLowerCase()}`}>
+      <div className="text-xs uppercase tracking-wider text-slate-500">{label}</div>
+      <div className="mt-1 font-mono text-2xl tabular-nums text-slate-100">
+        {/* `format(null)` is an em dash. A metric no selected engine reports
+            must NEVER render as 0 -- 0 says "measured, and idle". */}
+        {format(metric.value)}
+        {unit && metric.value !== null && (
+          <span className="ml-1 text-xs text-slate-500">{unit}</span>
+        )}
+      </div>
+      {partial && (
+        <div
+          data-testid={`combined-${label.toLowerCase()}-partial`}
+          className="mt-0.5 text-[10px] text-amber-300"
+          title="The remaining selected engines do not publish this metric, so they contribute nothing to the total rather than zero."
+        >
+          {metric.reporting} of {metric.total} models report this
+        </div>
+      )}
+      {metric.value === null && metric.total > 0 && (
+        <div className="mt-0.5 text-[10px] text-slate-500">
+          not reported by {metric.total === 1 ? "this engine" : "these engines"}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ===========================================================================
+// One model's section
+// ===========================================================================
+
+function ModelSection({
+  frame,
+  hist,
+  skeleton,
+  soloed,
+}: {
+  frame: LiveEngineFrame;
+  hist: Trails;
+  skeleton: boolean;
+  soloed: boolean;
+}) {
+  return (
+    <section
+      data-testid="live-model-section"
+      data-model-id={frame.model_id ?? ""}
+      className="space-y-4"
+    >
+      {/* The name is a heading rather than a chip once there can be several:
+          each block of panels below has to be attributable to one engine. */}
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-700/60 bg-emerald-900/30 px-2.5 py-0.5">
+          <span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+          <span
+            data-testid="live-model-name"
+            className="font-mono text-[11px] text-emerald-200"
+          >
+            {frame.model}
+          </span>
+        </span>
+        {frame.backend && (
+          <span className="rounded-full border border-slate-700 bg-slate-900/60 px-2 py-0.5 text-[10px] uppercase tracking-wide text-slate-400">
+            {ENGINE_LABELS[frame.backend] ?? frame.backend}
+          </span>
+        )}
+      </div>
+
+      {frame.scrape_error && (
+        <Banner tone="warn">
+          Metrics scrape failed for {frame.model ?? "this model"}:{" "}
+          {frame.scrape_error}. Showing the last good values.
+        </Banner>
+      )}
+
+      <EngineHero frame={frame} hist={hist} skeleton={skeleton && soloed} />
+
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <ThroughputPanel
+          frame={frame}
+          genHist={hist.gen}
+          skeleton={skeleton && soloed}
+        />
+        <LatencyPanel frame={frame} skeleton={skeleton && soloed} />
+      </div>
+
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+        <CachePanel frame={frame} skeleton={skeleton && soloed} />
+        <MfuPanel frame={frame} skeleton={skeleton && soloed} />
+        <FinishedPanel frame={frame} skeleton={skeleton && soloed} />
+      </div>
+    </section>
   );
 }
 
@@ -247,6 +463,15 @@ function LastUpdated({ ts }: { ts: string }) {
 // Engine hero
 // ===========================================================================
 
+// Display names for the frame's `backend` field, so an empty state can say
+// WHICH engine is silent rather than "this engine build". Falls back to a
+// neutral phrase for a backend this build of the UI has not heard of, which is
+// what a mid-rollout API newer than the UI produces.
+const ENGINE_LABELS: Record<string, string> = {
+  vllm: "vLLM",
+  llamacpp: "llama.cpp",
+};
+
 function EngineHero({
   frame,
   hist,
@@ -267,23 +492,30 @@ function EngineHero({
   }
 
   const e = frame.engine;
-  const kv = Math.max(0, Math.min(1, e.kv_cache_usage_perc));
+  // `null` means the engine does not report KV usage at all (llama.cpp has no
+  // such gauge). Clamping it to 0 would render "0%" against an empty meter --
+  // "plenty of headroom" -- which is a confident, precise, wrong answer. The
+  // panel takes the MFU panel's "Not reported" treatment instead.
+  const kv = e.kv_cache_usage_perc === null
+    ? null
+    : Math.max(0, Math.min(1, e.kv_cache_usage_perc));
+  const engineLabel = ENGINE_LABELS[frame.backend ?? ""] ?? "this engine";
   const reasons = Object.entries(e.waiting_by_reason ?? {}).filter(
-    ([, v]) => v > 0,
+    ([, v]) => v !== null && v > 0,
   );
 
   return (
     <div className="grid grid-cols-1 gap-4 lg:grid-cols-4">
       {/* Running ---------------------------------------------------- */}
       <Panel title="Running">
-        <BigNumber value={e.num_requests_running} accent />
+        <BigNumber value={formatInt(e.num_requests_running)} accent />
         <p className="mt-0.5 text-xs text-slate-500">requests decoding now</p>
         <Sparkline data={hist.running} className="mt-3 text-emerald-400" />
       </Panel>
 
       {/* Waiting ---------------------------------------------------- */}
       <Panel title="Waiting">
-        <BigNumber value={e.num_requests_waiting} />
+        <BigNumber value={formatInt(e.num_requests_waiting)} />
         <p className="mt-0.5 text-xs text-slate-500">queued for a slot</p>
         <div className="mt-3 flex flex-wrap gap-1.5">
           {reasons.length === 0 ? (
@@ -307,33 +539,56 @@ function EngineHero({
         className="lg:col-span-2"
         right={
           <span className="text-xs text-slate-500">
-            {e.engine_sleep_state === 0 ? "awake" : `sleep ${e.engine_sleep_state}`}
+            {/* `sleep null` shipped here. An engine with no sleep state is not
+                asleep and is not awake -- it has no answer, and a dash says so. */}
+            {e.engine_sleep_state === null
+              ? "—"
+              : e.engine_sleep_state === 0
+                ? "awake"
+                : `sleep ${e.engine_sleep_state}`}
           </span>
         }
       >
-        <div className="flex items-end justify-between gap-4">
-          <div>
-            <BigNumber value={formatPct(kv)} />
-            <p className="mt-0.5 font-mono text-xs text-slate-400">
-              {formatCompact(e.kv_tokens_used)} / {formatCompact(e.kv_tokens_total)}{" "}
-              tokens
+        {kv === null ? (
+          /* The MFU panel's treatment, for the same reason. Naming the engine
+             turns "we have no number" into "this engine does not produce one",
+             which is the difference between a broken dashboard and an honest
+             one. No meter at all -- an empty bar reads as a measurement. */
+          <div className="flex h-full flex-col justify-center py-2">
+            <p className="text-sm text-slate-500" data-testid="kv-usage">
+              Not reported
+            </p>
+            <p className="mt-1 text-xs text-slate-600">
+              {engineLabel} does not expose a KV-cache usage metric.
             </p>
           </div>
-          <div className="text-right">
-            <p className="font-mono text-lg font-semibold tabular-nums text-slate-100">
-              {e.preemptions_per_s === null
-                ? "—"
-                : e.preemptions_per_s.toFixed(2)}
-            </p>
-            <p className="text-xs text-slate-500">preemptions / s</p>
-          </div>
-        </div>
-        <Meter fraction={kv} className="mt-3 h-3.5" />
-        <div className="mt-1.5 flex justify-between text-[10px] uppercase tracking-wide text-slate-600">
-          <span>0</span>
-          <span>{formatInt(e.preemptions_total)} preempted total</span>
-          <span>{formatCompact(e.kv_tokens_total)}</span>
-        </div>
+        ) : (
+          <>
+            <div className="flex items-end justify-between gap-4">
+              <div>
+                <BigNumber value={<span data-testid="kv-usage">{formatPct(kv)}</span>} />
+                <p className="mt-0.5 font-mono text-xs text-slate-400">
+                  {formatCompact(e.kv_tokens_used)} /{" "}
+                  {formatCompact(e.kv_tokens_total)} tokens
+                </p>
+              </div>
+              <div className="text-right">
+                <p className="font-mono text-lg font-semibold tabular-nums text-slate-100">
+                  {e.preemptions_per_s === null
+                    ? "—"
+                    : e.preemptions_per_s.toFixed(2)}
+                </p>
+                <p className="text-xs text-slate-500">preemptions / s</p>
+              </div>
+            </div>
+            <Meter fraction={kv} className="mt-3 h-3.5" />
+            <div className="mt-1.5 flex justify-between text-[10px] uppercase tracking-wide text-slate-600">
+              <span>0</span>
+              <span>{formatInt(e.preemptions_total)} preempted total</span>
+              <span>{formatCompact(e.kv_tokens_total)}</span>
+            </div>
+          </>
+        )}
       </Panel>
     </div>
   );
@@ -344,21 +599,23 @@ function EngineHero({
 // ===========================================================================
 
 function LiveRequestsPanel({
-  data,
+  rows,
   error,
   isLoading,
 }: {
-  data: LiveRequestsSnapshot | undefined;
+  // Already narrowed to the selected models by the page. Taking rows rather
+  // than the whole snapshot is what makes it impossible for this panel and
+  // the two rollups beside it to disagree about which requests exist.
+  rows: LiveRequestRow[];
   error: unknown;
   isLoading: boolean;
 }) {
-  const rows = data?.requests ?? [];
   return (
     <Panel
       title="Live requests"
       right={
         <span className="tabular-nums text-xs text-slate-500">
-          {data ? `${data.count} active` : ""}
+          {`${rows.length} active`}
         </span>
       }
       bodyClassName="p-0"
@@ -367,7 +624,7 @@ function LiveRequestsPanel({
         <div className="p-4">
           <SkeletonBar />
         </div>
-      ) : error && !data ? (
+      ) : error && rows.length === 0 ? (
         <p className="p-4 text-sm text-red-400">
           Failed to load live requests
           {error instanceof Error ? `: ${error.message}` : "."}
@@ -506,13 +763,27 @@ function ThroughputPanel({
       <div className="flex items-end justify-between gap-4">
         <div>
           <p className="flex items-baseline gap-1.5">
-            <span className="font-mono text-3xl font-semibold tabular-nums text-slate-100">
-              {formatTps(t.generation_tokens_per_s ?? 0)}
+            {/* NOT `?? 0`. formatTps also returns "0" for a non-finite input,
+                so it cannot be reached for an absent value either: "0 tok/s"
+                is a statement that the engine is idle, and llama.cpp is not
+                idle -- it has simply not published a rate yet (the first frame
+                of any connection) or at all. */}
+            <span
+              className="font-mono text-3xl font-semibold tabular-nums text-slate-100"
+              data-testid="gen-tps"
+            >
+              {t.generation_tokens_per_s === null
+                ? "—"
+                : formatTps(t.generation_tokens_per_s)}
             </span>
             <span className="text-sm text-slate-400">gen tok/s</span>
           </p>
-          <p className="mt-1 font-mono text-xs text-slate-500">
-            prompt {formatTps(t.prompt_tokens_per_s ?? 0)} tok/s
+          <p className="mt-1 font-mono text-xs text-slate-500" data-testid="prompt-tps">
+            prompt{" "}
+            {t.prompt_tokens_per_s === null
+              ? "—"
+              : formatTps(t.prompt_tokens_per_s)}{" "}
+            tok/s
           </p>
         </div>
         <Sparkline data={genHist} className="h-10 w-28 text-emerald-400" />
@@ -594,10 +865,7 @@ function LatencyRow({
 // Aggregations
 // ===========================================================================
 
-function ByTokenPanel({ data }: { data: LiveRequestsSnapshot | undefined }) {
-  const rows = [...(data?.by_token ?? [])].sort(
-    (a, b) => b.context_tokens - a.context_tokens,
-  );
+function ByTokenPanel({ rows }: { rows: LiveByToken[] }) {
   return (
     <Panel title="By token" bodyClassName="p-0">
       {rows.length === 0 ? (
@@ -636,10 +904,7 @@ function ByTokenPanel({ data }: { data: LiveRequestsSnapshot | undefined }) {
   );
 }
 
-function ByIpPanel({ data }: { data: LiveRequestsSnapshot | undefined }) {
-  const rows = [...(data?.by_ip ?? [])].sort(
-    (a, b) => b.context_tokens - a.context_tokens,
-  );
+function ByIpPanel({ rows }: { rows: LiveByIp[] }) {
   return (
     <Panel title="By client IP" bodyClassName="p-0">
       {rows.length === 0 ? (

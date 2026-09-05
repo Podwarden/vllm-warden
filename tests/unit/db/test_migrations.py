@@ -35,8 +35,21 @@ async def test_migrations_idempotent(tmp_data_dir):
         # seed, #155) + 0021 (public_url doc-only no-op, #154) + 0022
         # (engine_templates + stack_attempts, #162) + 0023 (drop ghost
         # hf_cache_dir setting, 2026-06-15 ENOSPC follow-up) + 0024
-        # (models.prior_status, so recovery stops keying on an error string).
-        assert count == 23
+        # (models.prior_status, so recovery stops keying on an error string) +
+        # 0025 (chat2: chats/messages/attachments/user_chat_defaults/
+        # rate_cards/usage_ledger + models.supports_* columns) + 0026
+        # (chats.title_prev, so a reassessed auto-title can be undone) + 0027
+        # (models.backend, sub-project B -- nullable, no backfill, NULL means
+        # vllm) + 0028 (models.mmproj_filename + models.n_gpu_layers,
+        # sub-project C -- the two llama.cpp knobs, both nullable, no backfill)
+        # + 0029 (stress_runs: measured operating limits, keyed on
+        # (model_id, fingerprint) so the same model at two context sizes keeps
+        # two valid rows; a separate table rather than `models` columns because
+        # _PATCHABLE_MODEL_FIELDS is derived and would make a machine-written
+        # measurement hand-editable) + 0030 (stress_runs.progress: mid-run
+        # phase and probe count, overwritten in place by the heartbeat, so a
+        # multi-hour run is not a blank modal).
+        assert count == 29
 
 
 async def test_migrations_create_all_v2_tables(tmp_data_dir):
@@ -217,9 +230,10 @@ async def test_interrupted_between_ddl_and_bookkeeping_row_rolls_back(tmp_data_d
 async def test_interrupted_migration_leaves_connection_usable(tmp_data_dir):
     """The failed migration must not strand an open transaction.
 
-    main.py keeps using the same connection after apply_migrations returns
-    (mark_runtime_dead_on_startup, RuntimeRepo.clear_all), so a transaction left
-    open by the error path would deadlock the next writer against itself.
+    main.py writes to the same DB straight after apply_migrations returns
+    (boot reconciliation, mark_runtime_dead_on_startup, RuntimeRepo.clear_all),
+    so a transaction left open by the error path would deadlock the next
+    writer against itself.
     """
     db_path = tmp_data_dir / "vllm-warden.db"
     async with open_db(db_path) as db:

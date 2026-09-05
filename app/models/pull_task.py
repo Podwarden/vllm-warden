@@ -40,7 +40,9 @@ class PullAuthRequired(Exception):
     """
 
 
-def allow_patterns_for(filename: str | None) -> list[str] | None:
+def allow_patterns_for(
+    filename: str | None, *, mmproj_filename: str | None = None
+) -> list[str] | None:
     """Build the ``allow_patterns`` list for a per-file pull (#85).
 
     When the wizard pinned a specific weights file, we pull only that file
@@ -53,6 +55,15 @@ def allow_patterns_for(filename: str | None) -> list[str] | None:
     (``model.safetensors.index.json``). Without this, vLLM/transformers
     refuses to load because the index references shards that aren't on
     disk. Fixes vllm-warden#111.
+
+    ``mmproj_filename`` (sub-project C) is llama.cpp's multimodal projector: a
+    SEPARATE GGUF in the same repo, passed to llama-server as --mmproj. Without
+    it here the projector is never downloaded and the load fails at resolve time
+    -- correct, but late, and baffling to an operator who explicitly picked a
+    vision model. It is appended rather than folded into the shard glob because
+    it is not a member of the weights shard family. It also lands in the size
+    ESTIMATE, which shares this list, so the progress bar's denominator is not
+    short by the projector's ~888 MB.
     """
     if filename is None:
         return None
@@ -65,6 +76,8 @@ def allow_patterns_for(filename: str | None) -> list[str] | None:
             # lives in which shard.
             patterns.append("*.safetensors.index.json")
         # GGUF sharded sets need no index file — llama.cpp resolves by suffix.
+    if mmproj_filename:
+        patterns.append(mmproj_filename)
     return patterns
 
 
@@ -240,7 +253,9 @@ async def run_pull(model_id: str, settings: Settings, force: bool = False) -> No
     # patterns get plumbed into estimate_repo_bytes so the disk-shortage check
     # sees the filtered size — otherwise a 19.8 GB single-file pull would trip
     # a false shortage sized at the whole 200+ GB repo.
-    allow_patterns = allow_patterns_for(row.filename)
+    allow_patterns = allow_patterns_for(
+        row.filename, mmproj_filename=getattr(row, "mmproj_filename", None)
+    )
 
     # Phase 2: estimate total + persist (drives the progress bar denominator),
     # disk check (unless forced), then download with a polling coroutine that

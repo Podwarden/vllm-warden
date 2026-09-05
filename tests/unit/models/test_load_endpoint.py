@@ -1,12 +1,12 @@
 import asyncio
 import json
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass, field
 from unittest.mock import AsyncMock, patch
 
-import pytest
-
+from app.runtime.port_alloc import PortAllocator
 from tests.conftest import csrf_header, jwt_login, seed_admin_user
 
 
@@ -110,69 +110,163 @@ def test_unload_returns_404_for_unknown_model(tmp_data_dir, client):
     assert r.status_code == 404
 
 
-@pytest.mark.skip(
-    reason=(
-        "Quarantined 2026-05-23 — fails deterministically on develop "
-        "(pipeline #6621 jobs 34385 + 34400) with "
-        "`RuntimeError: There is no current event loop in thread "
-        "'MainThread'`, triggered by leaked supervisor state from a "
-        "prior test (`cannot mark warming from state None: expected "
-        "LOADING` at app/runtime/supervisor.py:172). Same flake family "
-        "as #127. Loses coverage of on-exit failure->status transition "
-        "+ port release — restore once root-cause fix lands. "
-        "PM will file the tracking follow-up against this skip."
-    )
-)
-def test_on_exit_callback_flips_status_to_failed_and_releases_port(tmp_data_dir, client):
-    """Regression: when the supervisor fires on_exit after a crash, the model
-    status must flip to 'failed' and the port must be released."""
-    client.get("/healthz")
-    _seed_done_with_pulled_model(
-        tmp_data_dir / "vllm-warden.db", allowed=[0, 1, 2, 3], gpus=[0, 1],
-        model_id="crash-model",
-    )
-    auth = _jwt_login(client)
+class _RecordingPortAllocator(PortAllocator):
+    """The app's own allocator plus a record of every ``release`` call, so a
+    test can assert the port came back through the public API instead of
+    peeking at the free list."""
 
-    captured_on_exit = []
+    def __init__(self) -> None:
+        super().__init__(start=10000, end=10999)
+        self.released: list[int] = []
+
+    def release(self, port: int) -> None:
+        self.released.append(port)
+        super().release(port)
+
+
+def _drive_engine_crash(client, db_path, auth, *, model_id, rc, serving):
+    """Load ``model_id`` through the route, fire ``on_exit(rc)`` from INSIDE
+    the supervisor stub -- on the app's own event loop -- and snapshot every
+    side effect ``on_exit`` owns at the moment it returns.
+
+    Two things about the shape are deliberate:
+
+    * ``on_exit`` runs where the real supervisor would run it. The previous
+      version of this test captured the callback and drove it from the test
+      thread with ``asyncio.get_event_loop().run_until_complete(...)``, which
+      raises ``RuntimeError: There is no current event loop`` the moment any
+      earlier ``asyncio.run()`` has touched the main thread's policy (the
+      session-scoped ``migrated_db_template`` fixture does exactly that).
+      Same pattern as ``test_load_crash_reports_diagnosed_last_error``.
+    * The DB and allocator are read inside the stub, not from the test
+      thread. Once ``sup.load`` returns the runner keeps going (health wait,
+      then its own ``failed`` write on the same row), so a read from outside
+      would race those writes. A ``threading.Event`` hands the snapshot back;
+      no polling.
+
+    ``serving=True`` flips the row to 'loaded' first, as the driver does once
+    the engine is up; ``False`` lands the crash on a row still 'loading' -- an
+    engine that never came up.
+    """
+    alloc = _RecordingPortAllocator()
+    client.app.state.port_allocator = alloc
+    seen: dict = {}
+    fired = threading.Event()
+    runner_done = threading.Event()
 
     async def fake_load(self, model, *, port, on_exit=None, overrides=None):
-        # Capture the callback; we'll invoke it manually below
-        captured_on_exit.append(on_exit)
+        with sqlite3.connect(db_path) as db:
+            if serving:
+                db.execute("UPDATE models SET status='loaded' WHERE id=?", (model_id,))
+            # What a live engine leaves in model_runtime; on_exit must clear it.
+            db.execute(
+                "INSERT INTO model_runtime(model_id, pid, port) VALUES (?, 4242, ?)",
+                (model_id, port),
+            )
+            db.commit()
+        seen["port"] = port
+        seen["released_before"] = list(alloc.released)
+        try:
+            await on_exit(rc)
+        finally:
+            with sqlite3.connect(db_path) as db:
+                seen["row"] = db.execute(
+                    "SELECT status, last_error, prior_status FROM models WHERE id=?",
+                    (model_id,),
+                ).fetchone()
+                (seen["runtime_rows"],) = db.execute(
+                    "SELECT COUNT(*) FROM model_runtime WHERE model_id=?", (model_id,)
+                ).fetchone()
+            seen["released_after"] = list(alloc.released)
+            fired.set()
 
-    health = AsyncMock(return_value=True)
+    async def fake_health(**kwargs):
+        # The engine is gone: a real health wait would sit on a dead socket for
+        # load_timeout_s. Report the miss and let the runner finish.
+        runner_done.set()
+        return False
 
     with patch("app.runtime.supervisor.Supervisor.load", new=fake_load), \
-         patch("app.models.routes_api.wait_for_health", new=health):
-        r = client.post("/api/models/crash-model/load", headers={**auth, **csrf_header(client)})
-    assert r.status_code == 202
-
-    # Wait for runner() to register the on_exit callback
-    for _ in range(50):
-        if captured_on_exit:
-            break
-        time.sleep(0.05)
-    assert captured_on_exit, "on_exit was never registered by runner()"
-
-    on_exit_fn = captured_on_exit[0]
-    assert on_exit_fn is not None, "on_exit should not be None"
-
-    # Simulate crash: update DB to 'loaded' first (what runner does after health ok)
-    with sqlite3.connect(tmp_data_dir / "vllm-warden.db") as db:
-        db.execute(
-            "UPDATE models SET status = 'loaded' WHERE id = 'crash-model'"
+         patch("app.models.routes_api.wait_for_health", new=fake_health):
+        r = client.post(
+            f"/api/models/{model_id}/load", headers={**auth, **csrf_header(client)}
         )
-        db.commit()
+        assert r.status_code == 202, r.text
+        assert fired.wait(timeout=10), "on_exit never fired inside the supervisor stub"
+        assert runner_done.wait(timeout=10), "the load runner never reached its health wait"
+    return seen
 
-    # Now fire the on_exit callback from a synchronous context
-    asyncio.get_event_loop().run_until_complete(on_exit_fn(139))
 
-    # Assert status flipped to failed
-    with sqlite3.connect(tmp_data_dir / "vllm-warden.db") as db:
-        row = db.execute(
-            "SELECT status, last_error FROM models WHERE id = 'crash-model'"
-        ).fetchone()
-    assert row[0] == "failed", f"Expected failed, got {row[0]}"
-    assert "139" in row[1], f"Expected rc=139 in last_error, got {row[1]}"
+def test_on_exit_callback_flips_status_to_failed_and_releases_port(tmp_data_dir, client):
+    """When the supervisor fires ``on_exit`` for an engine that WAS serving,
+    the closure in ``start_engine`` owns three side effects, and each one is
+    load-bearing for recovery:
+
+    * ``status='failed'`` with the rc in ``last_error`` (the operator's view);
+    * ``prior_status='loaded'`` -- the machine-readable "was serving" flag
+      ``watchdog.wants_restart`` keys on. The 2026-08-18 11.5-hour outage was
+      this write missing in effect: on_exit wrote a diagnosed last_error, the
+      old string sentinel was displaced, and nothing ever restarted the model;
+    * the ``model_runtime`` row cleared and the port handed back, or the next
+      load finds the port taken and the UI keeps showing a dead pid.
+
+    Until now only ``wants_restart(prior_status=...)`` was tested -- the
+    consumer -- which passes whether or not anything ever sets the flag.
+    """
+    client.get("/healthz")
+    db_path = tmp_data_dir / "vllm-warden.db"
+    _seed_done_with_pulled_model(
+        db_path, allowed=[0, 1, 2, 3], gpus=[0, 1], model_id="crash-model"
+    )
+    _stub_probe(client, [0, 1])
+    auth = _jwt_login(client)
+
+    seen = _drive_engine_crash(
+        client, db_path, auth, model_id="crash-model", rc=139, serving=True
+    )
+
+    status, last_error, prior_status = seen["row"]
+    assert status == "failed", f"expected failed, got {status!r}"
+    assert "rc=139" in (last_error or ""), f"rc must reach last_error, got {last_error!r}"
+    assert prior_status == "loaded", (
+        "on_exit must record that the row WAS serving, or wants_restart() never "
+        "picks it up and the engine stays dead until a human loads it"
+    )
+    assert seen["runtime_rows"] == 0, "model_runtime must not keep advertising a dead pid"
+    assert seen["released_before"] == [], "sanity: nothing released before on_exit"
+    assert seen["released_after"] == [seen["port"]], (
+        "on_exit must hand the port back to the allocator"
+    )
+
+
+def test_on_exit_during_a_first_load_does_not_flag_the_row_for_restart(
+    tmp_data_dir, client
+):
+    """The other half of the guard in ``on_exit``: a row that was still
+    'loading' when the engine died never came up, so it earns no automatic
+    restart -- retrying a bad config is a crash loop with a nicer name. The
+    row still fails with the rc, the runtime row still goes, and the port
+    still comes back."""
+    client.get("/healthz")
+    db_path = tmp_data_dir / "vllm-warden.db"
+    _seed_done_with_pulled_model(
+        db_path, allowed=[0, 1, 2, 3], gpus=[0, 1], model_id="never-up"
+    )
+    _stub_probe(client, [0, 1])
+    auth = _jwt_login(client)
+
+    seen = _drive_engine_crash(
+        client, db_path, auth, model_id="never-up", rc=1, serving=False
+    )
+
+    status, last_error, prior_status = seen["row"]
+    assert status == "failed"
+    assert "rc=1" in (last_error or "")
+    assert prior_status is None, (
+        "a load that never reached 'loaded' must not be marked as having served"
+    )
+    assert seen["runtime_rows"] == 0
+    assert seen["released_after"] == [seen["port"]]
 
 
 def test_load_writes_health_ok_after_warmup_probe_succeeds(tmp_data_dir, client):
@@ -516,7 +610,7 @@ def test_load_crash_reports_diagnosed_last_error(tmp_data_dir, client):
     auth = _jwt_login(client)
 
     # Seed a fake engine log that the diagnostics parser will recognise as a
-    # KV-cache overflow (real d5 string, including vLLM's own fit estimate).
+    # KV-cache overflow (real observed string, including vLLM's own fit estimate).
     logs_dir = tmp_data_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     (logs_dir / "crashy.log").write_text(
@@ -762,3 +856,117 @@ def test_unload_teardown_error_still_lands_terminal(tmp_data_dir, client):
     assert row[0] in ("pulled", "failed"), (
         f"row stranded at {row[0]} after teardown error"
     )
+
+
+# --- #236: force-unload must mean force -------------------------------------
+
+def _seed_model_in_status(db_path, model_id, status):
+    """Seed setup-done admin + one model parked in ``status``."""
+    _seed_done_with_pulled_model(db_path, allowed=[0, 1], gpus=[0], model_id=model_id)
+    with sqlite3.connect(db_path) as db:
+        db.execute(
+            "UPDATE models SET status=? WHERE id=?", (status, model_id)
+        )
+        db.commit()
+
+
+def _wait_for_status(db_path, model_id, wanted, tries=100):
+    row = None
+    for _ in range(tries):
+        with sqlite3.connect(db_path) as db:
+            row = db.execute(
+                "SELECT status FROM models WHERE id=?", (model_id,)
+            ).fetchone()
+        if row and row[0] in wanted:
+            return row[0]
+        time.sleep(0.05)
+    return row[0] if row else None
+
+
+def test_force_unload_succeeds_from_loading(tmp_data_dir, client):
+    """#236 — a warden that died mid-load leaves the row in 'loading' with no
+    engine anywhere. Plain unload refuses (correctly); ``?force=true`` is the
+    operator's escape hatch and used to refuse too, leaving hand-editing
+    SQLite as the ONLY way out.
+
+    The supervisor deliberately holds nothing here: that is exactly the state
+    a restart leaves behind, and force must still drive the row terminal.
+    """
+    client.get("/healthz")
+    db_path = tmp_data_dir / "vllm-warden.db"
+    _seed_model_in_status(db_path, "stranded-model", "loading")
+    auth = _jwt_login(client)
+
+    r = client.post(
+        "/api/models/stranded-model/unload?force=true",
+        headers={**auth, **csrf_header(client)},
+    )
+    assert r.status_code == 202, r.text
+    assert _wait_for_status(db_path, "stranded-model", ("pulled",)) == "pulled"
+
+
+def test_force_unload_succeeds_from_unloading(tmp_data_dir, client):
+    """The other transient status an interrupted teardown can strand."""
+    client.get("/healthz")
+    db_path = tmp_data_dir / "vllm-warden.db"
+    _seed_model_in_status(db_path, "half-unloaded", "unloading")
+    auth = _jwt_login(client)
+
+    r = client.post(
+        "/api/models/half-unloaded/unload?force=true",
+        headers={**auth, **csrf_header(client)},
+    )
+    assert r.status_code == 202, r.text
+    assert _wait_for_status(db_path, "half-unloaded", ("pulled",)) == "pulled"
+
+
+def test_force_unload_kills_what_the_supervisor_still_holds(tmp_data_dir, client):
+    """Force is not just a status rewrite: whatever the supervisor holds gets
+    torn down, so a load that IS still running releases its GPUs."""
+    client.get("/healthz")
+    db_path = tmp_data_dir / "vllm-warden.db"
+    _seed_model_in_status(db_path, "live-load", "loading")
+    auth = _jwt_login(client)
+
+    sup_unload = AsyncMock()
+    with patch("app.runtime.supervisor.Supervisor.unload", new=sup_unload):
+        r = client.post(
+            "/api/models/live-load/unload?force=true",
+            headers={**auth, **csrf_header(client)},
+        )
+        assert r.status_code == 202, r.text
+        assert _wait_for_status(db_path, "live-load", ("pulled",)) == "pulled"
+    assert sup_unload.await_count == 1
+    assert sup_unload.await_args.kwargs["force"] is True
+
+
+def test_plain_unload_still_refuses_from_loading(tmp_data_dir, client):
+    """The guard is unchanged without ``force``: unloading a load that is
+    genuinely in flight is still a 409, not a silent kill."""
+    client.get("/healthz")
+    db_path = tmp_data_dir / "vllm-warden.db"
+    _seed_model_in_status(db_path, "loading-model", "loading")
+    auth = _jwt_login(client)
+
+    r = client.post(
+        "/api/models/loading-model/unload",
+        headers={**auth, **csrf_header(client)},
+    )
+    assert r.status_code == 409
+    assert "loading" in r.json()["detail"]
+
+
+def test_force_unload_still_refuses_from_pulling(tmp_data_dir, client):
+    """No engine is involved in a download, and this route's terminal status
+    is 'pulled' — a lie for a half-finished pull. Boot reconciliation owns
+    that case."""
+    client.get("/healthz")
+    db_path = tmp_data_dir / "vllm-warden.db"
+    _seed_model_in_status(db_path, "pulling-model", "pulling")
+    auth = _jwt_login(client)
+
+    r = client.post(
+        "/api/models/pulling-model/unload?force=true",
+        headers={**auth, **csrf_header(client)},
+    )
+    assert r.status_code == 409

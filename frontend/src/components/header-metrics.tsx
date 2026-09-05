@@ -10,9 +10,12 @@
 //   - chrome stays subdued (slate-900/40 + slate-700/60 border) until
 //     a probe error or terminal-error promotes the cluster to warning
 //     (amber-400) / fault (red-400) state.
-//   - the active-model chip is the cluster's identity slot — it gets a
-//     persistent emerald dot when loaded so the operator can tell at a
-//     glance whether the rack is "running anything" without reading text.
+//   - the model slot is the cluster's identity slot — ONE CHIP PER LOADED
+//     MODEL, each with its own dot, so the operator can tell at a glance
+//     whether the rack is running anything and whether all of it is healthy.
+//     Two chips render inline; beyond that the remainder folds into a "+N"
+//     counter so the pill's width stays bounded at any fleet size, and the
+//     title + aria-label enumerate every model so nothing is actually lost.
 //   - hidden on /login and /setup matches NavBar's own gate.
 //
 // Restraint notes: this widget is glanceable and SHOULD NOT compete
@@ -20,6 +23,13 @@
 // animate the digits — flicker on every 2s tick is fatiguing.
 import { Cpu, MemoryStick } from 'lucide-react';
 import { useHeaderMetrics } from '@/lib/header-metrics-stream';
+import {
+  activeModelsOf,
+  worstModelStatus,
+  HEADER_MODELS_INLINE,
+  type HeaderActiveModel,
+  type HeaderModelStatus,
+} from '@/lib/header-models';
 
 // Format a percentage 0–100 (or null) into a fixed-width readout. We use
 // figure-tab-numerals via Tailwind's `tabular-nums` so the digit grid
@@ -48,11 +58,14 @@ export function HeaderMetrics() {
   const reconnecting = status === 'reconnecting';
   const probeError = frame?.probe_error ?? null;
 
-  // The engine's own state, independent of the stream's health. Older API
-  // builds omit the field entirely, in which case a non-null active_model
-  // means exactly one thing — loaded — which is the pre-status contract.
-  const modelStatus =
-    frame?.active_model_status ?? (frame?.active_model ? 'loaded' : null);
+  // EVERY loaded model, from one shape regardless of the API's age.
+  const models = activeModelsOf(frame);
+
+  // The cluster's own state summarises N engines into one accent colour, so
+  // it takes the WORST status rather than the first model's: three healthy
+  // engines must not paint over the fourth that crashed. Each chip below
+  // still carries its own dot, so the summary never hides which one.
+  const modelStatus = worstModelStatus(models);
   const failed = !terminal && modelStatus === 'failed';
   const loading = !terminal && modelStatus === 'loading';
   const loaded = !terminal && modelStatus === 'loaded';
@@ -72,6 +85,8 @@ export function HeaderMetrics() {
     loaded ? 'text-emerald-400' :
     'text-slate-400';
 
+  // The cluster-wide dot, shown only when the model slot has nothing of its
+  // own to say (offline / idle). With models present each chip draws its own.
   const dot =
     terminal || failed ? 'bg-red-400/80' :
     reconnecting || probeError ? 'bg-amber-400/80' :
@@ -81,33 +96,41 @@ export function HeaderMetrics() {
 
   const vramPct = terminal ? null : frame?.vram_pct ?? null;
   const gpuPct = terminal ? null : frame?.gpu_util_pct ?? null;
-  // 'offline' = the stream is gone (we know nothing). 'error' = the stream
-  // is fine and is telling us the engine died — two different failures that
-  // must not share a word.
-  const modelLabel =
-    terminal ? 'offline' :
-    failed ? 'error' :
-    loading ? 'loading' :
-    frame?.active_model ?? 'idle';
 
-  // Build a single-line tooltip that surfaces the data the badge omits:
-  // per-GPU breakdown, probe error, status hint.
+  // What the slot shows when there is no per-model list to show: 'offline' =
+  // the stream is gone (we know nothing); 'idle' = the stream is fine and the
+  // box is serving nothing. Two different situations that must not share a
+  // word. A model's OWN 'loading'/'failed' state now rides on its chip's dot
+  // instead of replacing the fleet's names with a bare status word — with
+  // several models, collapsing all of them to "error" would say less than the
+  // shortest useful thing.
+  const emptyLabel = terminal ? 'offline' : 'idle';
+
+  // Visible chips + the folded remainder. Bounded width at any N.
+  const inline = models.slice(0, HEADER_MODELS_INLINE);
+  const overflow = models.length - inline.length;
+
+  // Build a multi-line tooltip that surfaces the data the badge omits:
+  // per-GPU breakdown, every model by name, probe error, status hint.
   const tooltipLines: string[] = [];
   if (frame) {
     tooltipLines.push(
-      `VRAM ${gib(frame.vram_used_mib)} / ${gib(frame.vram_total_mib)} GiB`,
+      `VRAM ${gib(frame.vram_used_mib)} / ${gib(frame.vram_total_mib)} GiB (all cards)`,
     );
+    // The GPU readout is a max, so with several cards it names one of them.
+    // Saying which, and listing the rest, is what stops "GPU 90%" from
+    // reading as a statement about the box.
+    tooltipLines.push(`GPU ${frame.gpu_util_pct}% on the busiest card`);
     for (const g of frame.gpus) {
       const name = g.name ?? `GPU ${g.index}`;
       tooltipLines.push(
         `  ${name}: ${gib(g.memory_used_mib)}/${gib(g.memory_total_mib)} GiB · util ${g.utilization_pct}%`,
       );
     }
-    // The badge collapses 'loading'/'failed' to a bare word, so the model's
-    // name would otherwise be unreachable exactly when you most want it.
-    if (frame.active_model) {
-      const verb = failed ? 'Failed' : loading ? 'Loading' : 'Loaded';
-      tooltipLines.push(`${verb}: ${frame.active_model}`);
+    // EVERY model, including any the "+N" counter folded away. The chip is
+    // width-bounded; the tooltip is not, so this is where nothing is lost.
+    for (const m of models) {
+      tooltipLines.push(`${STATUS_VERB[m.status]}: ${m.served_model_name}`);
     }
   }
   if (probeError) tooltipLines.push(`Probe error: ${probeError}`);
@@ -128,7 +151,17 @@ export function HeaderMetrics() {
       // narrated). aria-live=off forces that.
       role="status"
       aria-live="off"
-      aria-label={`Header metrics — VRAM ${pct(vramPct).trim()} percent, GPU ${pct(gpuPct).trim()} percent, ${modelLabel}`}
+      // The accessible name enumerates EVERY model, including any the "+N"
+      // counter folded away — a screen-reader user has no tooltip to hover.
+      aria-label={
+        `Header metrics — VRAM ${pct(vramPct).trim()} percent, ` +
+        `GPU ${pct(gpuPct).trim()} percent on the busiest card, ` +
+        (models.length === 0
+          ? emptyLabel
+          : models
+              .map((m) => `${m.served_model_name} ${m.status}`)
+              .join(', '))
+      }
       title={tooltip}
       data-testid="header-metrics"
       data-status={status}
@@ -166,20 +199,106 @@ export function HeaderMetrics() {
 
       <span className="h-3 w-px bg-slate-700/80" aria-hidden="true" />
 
-      {/* Active model chip — identity slot. The dot encodes status
-          (emerald=loaded, slate=idle, amber=warn, red=fault). */}
-      <span className="inline-flex items-center gap-1.5 max-w-[10rem]">
-        <span
-          aria-hidden="true"
-          className={['h-1.5 w-1.5 rounded-full transition-colors', dot].join(' ')}
-        />
-        <span
-          data-testid="header-metrics-model"
-          className="truncate text-slate-200"
-        >
-          {modelLabel}
-        </span>
+      {/* Model slot — identity. One chip per loaded model, each with its own
+          dot, so a crashed engine beside a healthy one is visible as such
+          rather than averaged into one word. Two inline, the rest folded into
+          a counter; the title and aria-label above still name every one. */}
+      <span
+        data-testid="header-metrics-models"
+        className="inline-flex items-center gap-2 max-w-[18rem]"
+      >
+        {models.length === 0 ? (
+          <span className="inline-flex items-center gap-1.5">
+            <span
+              aria-hidden="true"
+              className={['h-1.5 w-1.5 rounded-full transition-colors', dot].join(' ')}
+            />
+            <span
+              data-testid="header-metrics-model"
+              className="truncate text-slate-200"
+            >
+              {emptyLabel}
+            </span>
+          </span>
+        ) : (
+          <>
+            {inline.map((m) => (
+              <ModelChip key={m.id} model={m} muted={terminal} />
+            ))}
+            {overflow > 0 && (
+              <span
+                data-testid="header-metrics-model-overflow"
+                className="shrink-0 rounded bg-slate-800/80 px-1 text-[10px] text-slate-300"
+              >
+                +{overflow}
+              </span>
+            )}
+          </>
+        )}
       </span>
     </div>
+  );
+}
+
+// Per-model dot colours. Deliberately the SAME vocabulary as the cluster
+// accent — emerald serving, sky starting, red dead — so a chip and the pill
+// around it never mean different things by the same colour.
+const MODEL_DOT: Record<HeaderModelStatus, string> = {
+  loaded: 'bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.6)]',
+  loading: 'bg-sky-400 animate-pulse',
+  failed: 'bg-red-400/80',
+};
+
+const STATUS_VERB: Record<HeaderModelStatus, string> = {
+  loaded: 'Loaded',
+  loading: 'Loading',
+  failed: 'Failed',
+};
+
+// Shown next to the NAME, not instead of it. The old single-model badge
+// replaced the name with a bare "loading"/"error" and left the name reachable
+// only by hovering — its own comment said so. With several models that trade
+// gets worse, not better: two chips both reading "error" name neither engine.
+// A short suffix keeps the word AND the name; 'loaded' needs no suffix,
+// because a serving model's dot already says it and the common case should be
+// the quietest.
+const STATUS_SUFFIX: Partial<Record<HeaderModelStatus, string>> = {
+  loading: 'loading',
+  // 'error', not 'offline': the stream is fine and is telling us the engine
+  // died. The two failures must not share a word.
+  failed: 'error',
+};
+
+/** One model's dot + name. `muted` when the stream is gone and we know
+ *  nothing current — the last frame's names stay readable but stop claiming
+ *  to be live. */
+function ModelChip({
+  model,
+  muted,
+}: {
+  model: HeaderActiveModel;
+  muted: boolean;
+}) {
+  return (
+    <span
+      data-testid="header-metrics-model-chip"
+      data-model-status={model.status}
+      className="inline-flex min-w-0 items-center gap-1.5"
+      title={`${STATUS_VERB[model.status]}: ${model.served_model_name}`}
+    >
+      <span
+        aria-hidden="true"
+        className={[
+          'h-1.5 w-1.5 shrink-0 rounded-full transition-colors',
+          muted ? 'bg-slate-500/70' : MODEL_DOT[model.status],
+        ].join(' ')}
+      />
+      <span className="truncate text-slate-200">{model.served_model_name}</span>
+      {STATUS_SUFFIX[model.status] && (
+        <span className="shrink-0 text-[10px] text-slate-400">
+          {STATUS_SUFFIX[model.status]}
+        </span>
+      )}
+    </span>
   );
 }

@@ -60,10 +60,20 @@ interface SettingsResponse {
   trust_remote_code: boolean;
   extra_args: string[];
   extra_env: Record<string, string>;
+  // Tri-state on the wire: 1 = the operator said yes, 0 = said no, null =
+  // nobody said (the backend auto-detects). See _MODEL_TRISTATE_FIELDS in
+  // app/settings/routes_api.py.
+  supports_tools: number | null;
+  supports_vision: number | null;
+  supports_reasoning: number | null;
   status: string;
   pulled_bytes: number;
   pulled_total: number | null;
   last_error: string | null;
+  // Sub-project C (migration 0028 + B's 0027).
+  backend: string | null;
+  n_gpu_layers: number | null;
+  mmproj_filename: string | null;
 }
 
 function fakeSettings(overrides: Partial<SettingsResponse> = {}): SettingsResponse {
@@ -80,10 +90,16 @@ function fakeSettings(overrides: Partial<SettingsResponse> = {}): SettingsRespon
     trust_remote_code: false,
     extra_args: [],
     extra_env: {},
+    supports_tools: null,
+    supports_vision: null,
+    supports_reasoning: null,
     status: 'pulled',
     pulled_bytes: 0,
     pulled_total: null,
     last_error: null,
+    backend: 'vllm',
+    n_gpu_layers: null,
+    mmproj_filename: null,
     ...overrides,
   };
 }
@@ -160,6 +176,101 @@ describe('ModelSettingsPage', () => {
     expect(body.gpu_indices).toBeUndefined();
     expect(body.served_model_name).toBeUndefined();
     expect(body.extra_env).toBeUndefined();
+  });
+
+  // The capability flags are tri-state in the DB and the third state is
+  // load-bearing: NULL is what lets app/chat2/catalog.py auto-detect vision
+  // from the on-disk HF config. A boolean checkbox could not express "back to
+  // auto", which is why these three are selects.
+  it('round-trips the tri-state capability flags, sending null for Auto', async () => {
+    const settings = fakeSettings({ supports_vision: 1, supports_tools: null, supports_reasoning: 0 });
+    const fetchMock = vi.fn(async (input: RequestInfo, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : (input as Request).url;
+      const method = (init?.method ?? 'GET').toUpperCase();
+      if (url === '/api/models/abc/settings' && method === 'GET') {
+        return new Response(JSON.stringify(settings), { status: 200 });
+      }
+      if (url === '/api/models/abc/settings' && method === 'PATCH') {
+        return new Response('{"ok":true}', { status: 200 });
+      }
+      if (url === '/api/system/gpus') {
+        return new Response(JSON.stringify(DEFAULT_GPU_PROBE), { status: 200 });
+      }
+      throw new Error(`unexpected fetch: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderPage('abc');
+    await act(async () => { await new Promise((r) => setTimeout(r, 0)); });
+    await screen.findByLabelText(/HF revision/i);
+
+    // 1 / null / 0 must read back as three distinct answers
+    expect(screen.getByRole('button', { name: 'Vision' })).toHaveTextContent('Yes');
+    expect(screen.getByRole('button', { name: 'Tools' })).toHaveTextContent('Auto');
+    expect(screen.getByRole('button', { name: 'Reasoning' })).toHaveTextContent('No');
+
+    // an explicit answer handed back to auto-detection
+    fireEvent.click(screen.getByRole('button', { name: 'Vision' }));
+    fireEvent.mouseDown(screen.getByRole('option', { name: 'Auto' }));
+    // …and a first explicit answer where there was none
+    fireEvent.click(screen.getByRole('button', { name: 'Tools' }));
+    fireEvent.mouseDown(screen.getByRole('option', { name: 'No' }));
+
+    const saveBtn = screen.getByRole('button', { name: /save/i });
+    await waitFor(() => expect(saveBtn).not.toBeDisabled());
+    fireEvent.click(saveBtn);
+
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some((c) => (c[1] as RequestInit | undefined)?.method === 'PATCH')).toBe(true);
+    });
+    const patchCall = fetchMock.mock.calls.find((c) => (c[1] as RequestInit | undefined)?.method === 'PATCH')!;
+    const raw = (patchCall[1] as RequestInit).body as string;
+    // `null` has to survive serialization — an omitted key means "leave it
+    // alone" to the backend, which is the opposite of "reset to auto".
+    expect(raw).toContain('"supports_vision":null');
+    expect(JSON.parse(raw)).toEqual({ supports_vision: null, supports_tools: false });
+  });
+
+  // The backend lets a capabilities-only patch through on a loaded model
+  // (app/settings/routes_api.py:`capabilities_only`) — the loaded model is
+  // exactly the one you are looking at when you notice vision is set wrong.
+  it('keeps the capability selects editable on a loaded model while the rest stays locked', async () => {
+    const settings = fakeSettings({ status: 'loaded' });
+    const fetchMock = vi.fn(async (input: RequestInfo, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : (input as Request).url;
+      const method = (init?.method ?? 'GET').toUpperCase();
+      if (url === '/api/models/abc/settings' && method === 'GET') {
+        return new Response(JSON.stringify(settings), { status: 200 });
+      }
+      if (url === '/api/models/abc/settings' && method === 'PATCH') {
+        return new Response('{"ok":true}', { status: 200 });
+      }
+      if (url === '/api/system/gpus') {
+        return new Response(JSON.stringify(DEFAULT_GPU_PROBE), { status: 200 });
+      }
+      throw new Error(`unexpected fetch: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderPage('abc');
+    await act(async () => { await new Promise((r) => setTimeout(r, 0)); });
+
+    // every engine setting is still locked behind "unload first"
+    expect(await screen.findByLabelText(/HF revision/i)).toBeDisabled();
+    const vision = screen.getByRole('button', { name: 'Vision' });
+    expect(vision).not.toBeDisabled();
+
+    fireEvent.click(vision);
+    fireEvent.mouseDown(screen.getByRole('option', { name: 'Yes' }));
+
+    const saveBtn = screen.getByRole('button', { name: /save/i });
+    await waitFor(() => expect(saveBtn).not.toBeDisabled());
+    fireEvent.click(saveBtn);
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some((c) => (c[1] as RequestInit | undefined)?.method === 'PATCH')).toBe(true);
+    });
+    const patchCall = fetchMock.mock.calls.find((c) => (c[1] as RequestInit | undefined)?.method === 'PATCH')!;
+    expect(JSON.parse((patchCall[1] as RequestInit).body as string)).toEqual({ supports_vision: true });
   });
 
   it('surfaces 409 with an unload-first banner', async () => {
@@ -477,5 +588,95 @@ describe('ModelSettingsPage', () => {
     });
     await waitFor(() => expect(saveBtn).not.toBeDisabled());
     expect(screen.queryByTestId('gpu-indices-empty-error')).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Sub-project C: BackendCapabilities drives field visibility. The component
+// hard-codes nothing about which engine has which knob -- design spec §9.1.
+// ---------------------------------------------------------------------------
+
+describe('ModelSettingsPage — per-backend fields', () => {
+  beforeEach(() => {
+    setAccessToken('test-jwt');
+    setCsrfToken('test-csrf');
+  });
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  async function renderSettings(overrides: Partial<SettingsResponse>) {
+    const settings = fakeSettings(overrides);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input : (input as Request).url;
+        if (url === '/api/models/abc/settings') {
+          return new Response(JSON.stringify(settings), { status: 200 });
+        }
+        if (url === '/api/system/gpus') {
+          return new Response(JSON.stringify(DEFAULT_GPU_PROBE), { status: 200 });
+        }
+        if (url === '/api/presets') {
+          return new Response(JSON.stringify({ presets: [] }), { status: 200 });
+        }
+        if (url.includes('/effective-argv')) {
+          return new Response(JSON.stringify({ argv: [] }), { status: 200 });
+        }
+        return new Response('{}', { status: 200 });
+      }),
+    );
+    renderPage('abc');
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+  }
+
+  it('hides vLLM-only fields for a llama.cpp model', async () => {
+    await renderSettings({ backend: 'llamacpp' });
+    for (const label of [/^dtype/i, /gpu memory utilization/i, /trust remote code/i]) {
+      expect(screen.queryByLabelText(label)).toBeNull();
+    }
+  });
+
+  it('shows the llama.cpp-only fields for a llama.cpp model', async () => {
+    await renderSettings({ backend: 'llamacpp' });
+    expect(screen.getByLabelText(/gpu layers/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/vision projector/i)).toBeInTheDocument();
+  });
+
+  it('shows every vLLM field for a vLLM model', async () => {
+    await renderSettings({ backend: 'vllm' });
+    expect(screen.getByLabelText(/^dtype/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/gpu memory utilization/i)).toBeInTheDocument();
+    expect(screen.queryByLabelText(/gpu layers/i)).toBeNull();
+    expect(screen.queryByLabelText(/vision projector/i)).toBeNull();
+  });
+
+  it('treats a NULL backend as vLLM (D6)', async () => {
+    // Every pre-B row has backend NULL. It must render exactly as it did
+    // before the column existed, or the migration changed the UI for rows
+    // nobody touched.
+    await renderSettings({ backend: null });
+    expect(screen.getByLabelText(/^dtype/i)).toBeInTheDocument();
+    expect(screen.queryByLabelText(/gpu layers/i)).toBeNull();
+  });
+
+  it('does not offer a parallelism strategy for llama.cpp', async () => {
+    // The control exists nowhere on this page today (it is create-time only),
+    // and it must not appear here for llama.cpp when it eventually does:
+    // plan() maps both 'tp' and 'pp' to --split-mode layer, so the question
+    // has no answer.
+    await renderSettings({ backend: 'llamacpp' });
+    expect(screen.queryByLabelText(/parallelism/i)).toBeNull();
+  });
+
+  it('keeps the fields that BOTH backends consume', async () => {
+    // The map lists only the exceptions, so a field named for no backend is
+    // shared. This is what stops the filter from quietly hiding the common case.
+    await renderSettings({ backend: 'llamacpp' });
+    expect(screen.getByLabelText(/max model length/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/served model name/i)).toBeInTheDocument();
   });
 });

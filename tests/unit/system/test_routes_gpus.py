@@ -285,3 +285,68 @@ def test_system_gpus_probe_error_surfaces(tmp_data_dir, client, monkeypatch):
     assert body["gpus"] == []
     assert body["probe_error"] == "nvidia-smi unavailable"
     assert "probed_at" in body
+
+
+# ---------------------------------------------------------------------------
+# allowed_gpu_indices
+#
+# The setup wizard writes it into setup_state.draft and POST /api/models
+# enforces it with a 400. Until now NO route read it back, so the Add-model
+# dialog offered every physically present card and only learned about the
+# allowlist from a rejection after the operator had filled in the whole form --
+# a control that cannot work, offered anyway.
+#
+# It rides on this route rather than a new one: the wizard already calls
+# /api/system/gpus for exactly this list, and the allowlist is a fact about the
+# same GPUs.
+# ---------------------------------------------------------------------------
+
+
+def test_system_gpus_reports_the_configured_allowlist(
+    tmp_data_dir, client, monkeypatch
+):
+    client.get("/healthz")
+    seed_admin_user(tmp_data_dir / "vllm-warden.db", allowed_gpu_indices=[1])
+    _install_probe(client, [SNAP_TWO_GPUS])
+    _install_supervisor_pids(client, {})
+    _patch_attribute(monkeypatch, mapping={})
+
+    auth = _jwt_auth(client)
+    body = client.get("/api/system/gpus", headers=auth).json()
+    # Both cards are still reported -- the allowlist narrows what may be
+    # SELECTED; it does not hide hardware the operator can see in nvidia-smi.
+    assert [g["index"] for g in body["gpus"]] == [0, 1]
+    assert body["allowed_indices"] == [1]
+
+
+def test_allowed_indices_is_null_when_setup_recorded_none(tmp_data_dir, client):
+    """Null means "no allowlist recorded", which is NOT "none allowed".
+
+    A client must read null as "every GPU is selectable". Collapsing the two
+    would lock the operator out of a box whose setup draft predates the key.
+    """
+    client.get("/healthz")
+    seed_admin_user(tmp_data_dir / "vllm-warden.db")
+    with sqlite3.connect(tmp_data_dir / "vllm-warden.db") as db:
+        db.execute("UPDATE setup_state SET draft = '{}' WHERE id = 1")
+        db.commit()
+
+    auth = _jwt_auth(client)
+    body = client.get("/api/system/gpus", headers=auth).json()
+    assert body["allowed_indices"] is None
+
+
+def test_allowed_indices_survives_a_probe_failure(tmp_data_dir, client, monkeypatch):
+    """The allowlist comes from SQLite, not nvidia-smi. A box whose driver is
+    missing still knows which GPUs it is configured for."""
+    client.get("/healthz")
+    seed_admin_user(tmp_data_dir / "vllm-warden.db", allowed_gpu_indices=[0, 3])
+    _install_probe(client, [GpuSnapshot(gpus=[], apps=[],
+                                        probe_error="nvidia-smi unavailable")])
+    _install_supervisor_pids(client, {})
+    _patch_attribute(monkeypatch, mapping={})
+
+    auth = _jwt_auth(client)
+    body = client.get("/api/system/gpus", headers=auth).json()
+    assert body["gpus"] == []
+    assert body["allowed_indices"] == [0, 3]

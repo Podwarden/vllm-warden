@@ -575,6 +575,15 @@ async def _restart(settings, app_state, model_id: str, overrides) -> str:
 
     async with open_db(settings.db_path) as db:
         await ModelRepo(db).update_status(model_id, "loading")
+        # ...and put it straight back, so the flag is true for the WHOLE
+        # restore attempt rather than only at its edges (#236). While this
+        # await runs the row reads 'loading' with no prior_status, which is
+        # indistinguishable from an operator's first-ever load of a model —
+        # and boot reconciliation now demotes THAT to 'pulled' rather than
+        # retrying it forever. Keeping the flag lit is what lets a warden
+        # restart mid-restore still restore, instead of quietly leaving a
+        # model that was serving parked at 'pulled'.
+        await ModelRepo(db).set_prior_status(model_id, was)
 
     port = app_state.port_allocator.allocate()
     try:
@@ -606,7 +615,7 @@ async def _restart(settings, app_state, model_id: str, overrides) -> str:
     return row.status if row else "unknown"
 
 
-def wants_restart(row) -> bool:
+def wants_restart(row, leases=None) -> bool:
     """True when a row is a crashed engine that WAS serving, so restart it.
 
     One predicate, deliberately, for both ways a serving engine can end up
@@ -636,7 +645,23 @@ def wants_restart(row) -> bool:
 
     ``pulling`` and ``unloading`` are deliberately excluded: a half-finished
     pull is not a serving model, and an unload is an operator's stated intent.
+
+    ``leases`` is the stress-test registry (``app/stress/lease.py``), optional
+    so every existing caller is unaffected. A model under an unexpired stress
+    lease is skipped: its run crashed the engine on purpose, is already probing
+    far more tightly than this loop's ~90s detection latency, and will restart
+    it itself. Without this, the sweep and the runner both call ``_restart``,
+    which force-unloads unconditionally, and whichever loses the race destroys
+    the other's freshly loaded engine -- while both charge the restart budget
+    that leaves the model dead after three.
+
+    The check belongs HERE rather than in ``check_once`` because this predicate
+    is what both recovery paths consult. ``check_once`` only ever sees rows
+    whose status is ``loaded``, and a crash sets ``failed`` first, so guarding
+    it would guard the path that does not fire.
     """
+    if leases is not None and leases.is_held(row.id):
+        return False
     return row.status == "failed" and (row.prior_status or "") in (
         "loaded",
         "loading",
@@ -663,7 +688,8 @@ async def restore_after_warden_restart(settings, app_state) -> list[str]:
     """
     async with open_db(settings.db_path) as db:
         rows = await ModelRepo(db).list_all()
-    candidates = [r for r in rows if wants_restart(r)]
+    leases = getattr(app_state, "stress_leases", None)
+    candidates = [r for r in rows if wants_restart(r, leases=leases)]
     restored = []
     for row in candidates:
         logger.warning(
@@ -704,7 +730,8 @@ async def restart_crashed_models(settings, app_state, budget) -> list[str]:
     # wrapper has usually already exited and the supervisor has dropped the
     # handle, so re-reading it now would find nothing the earlier pass did not.
     out = []
-    for row in (r for r in rows if wants_restart(r)):
+    leases = getattr(app_state, "stress_leases", None)
+    for row in (r for r in rows if wants_restart(r, leases=leases)):
         if not budget.allow(row.id):
             logger.error(
                 "watchdog: %s exceeded the restart budget — leaving it failed", row.id
@@ -763,7 +790,19 @@ async def check_once(
     for gone in [k for k in state if k not in live]:
         state.pop(gone, None)
 
+    leases = getattr(app_state, "stress_leases", None)
     for row in loaded:
+        # A stress run deliberately provokes exactly what this loop hunts: an
+        # engine that stops answering. THIS is the path that fires for it --
+        # the row still reads 'loaded' because nothing set it 'failed', so
+        # wants_restart (which both recovery paths consult) is never reached
+        # here and its lease guard never applies. Without this check the run
+        # and the watchdog both call _restart, which force-unloads
+        # unconditionally, and whichever loses the race destroys the other's
+        # engine while charging a restart budget that leaves the model dead
+        # after three.
+        if leases is not None and leases.is_held(row.id):
+            continue
         port = sup.get_port(row.id)
         if port is None:
             continue  # no runtime record yet; nothing to probe

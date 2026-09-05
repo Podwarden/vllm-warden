@@ -4,8 +4,30 @@
 // bare `import` (no symbols) is sufficient.
 import '@testing-library/jest-dom/vitest';
 import React from 'react';
+import { JSDOM } from 'jsdom';
 import { beforeEach, vi } from 'vitest';
 import { __resetLoginRedirectInFlightForTests } from '@/lib/auth-fetch';
+
+// v2026.08.23 (chat2 Task 12) — Node 24+ ships its own global `localStorage`
+// (Web Storage API), on by default with no backing file, so every method
+// throws `<method> is not a function`. Under vitest's jsdom environment
+// `window` IS `globalThis`, so that broken built-in shadows jsdom's own
+// `window.localStorage` too — hence 16 pre-existing failures across
+// `stats-page.test.tsx` / `use-persisted-range.test.tsx` (documented in
+// chat2 Task 5's report as a known local Node-version issue, not touched
+// there because other task agents were live in this file). Repoint the
+// global at a real, working `Storage` from a throwaway jsdom instance.
+//
+// Assigned directly via `Object.defineProperty`, NOT `vi.stubGlobal`: a
+// dozen existing test files call `vi.unstubAllGlobals()` in their own
+// afterEach (to undo their own `fetch`/`ResizeObserver` stubs), and that
+// call reverts every stub ever registered process-wide, not just the
+// caller's own — it would silently undo this fix after their first test.
+Object.defineProperty(globalThis, 'localStorage', {
+  value: new JSDOM('', { url: 'http://localhost/' }).window.localStorage,
+  configurable: true,
+  writable: true,
+});
 
 // v17.11 Bundle 2 — `react-virtuoso` uses ResizeObserver + getBoundingClientRect
 // for window measurement, neither of which work in jsdom. The library
@@ -13,11 +35,22 @@ import { __resetLoginRedirectInFlightForTests } from '@/lib/auth-fetch';
 // that asserts on a row rendered through Virtuoso.
 //
 // We replace Virtuoso with a plain "render all items in order" shim that
-// passes through the props tests actually care about (style, role, data,
-// itemContent, components.List). The shim also drops `followOutput` and
-// `atBottomStateChange` since jsdom has no scroll geometry to drive them
-// — tests that need to assert on sticky-mode behaviour should drive the
-// `useStickyBottom` hook directly.
+// passes through the props tests actually care about (style, data,
+// itemContent, computeItemKey, components.List).
+//
+// Still load-bearing after /chat2 moved to @podwarden/chat-ui (v2026.08.25):
+// `models/log-stream.tsx` and `godmode/godmode-viewer.tsx` both render their
+// rows through <Virtuoso>, and their suites assert on row TEXT
+// (`log-stream.test.tsx` → "hello world", "first output"). Without this shim
+// those rows never mount. `godmode-viewer.test.tsx` installs its own richer
+// local mock, which overrides this one for that file only.
+//
+// The chat2-era extras are gone with the feature that needed them: the
+// `__virtuosoTestHandle` escape hatch (published `atBottomStateChange` /
+// `followOutput` / a spy-able `scrollToIndex` so <Thread>'s "Jump to latest"
+// debounce could be driven from a test) and the `components.Footer` /
+// `EmptyPlaceholder` overrides. Nothing outside chat2 used either — the two
+// remaining callers pass `components={{ List }}` and nothing else.
 vi.mock('react-virtuoso', () => {
   type Row = { kind?: string; row?: unknown; event?: unknown } | unknown;
   function Virtuoso(props: {
@@ -25,10 +58,18 @@ vi.mock('react-virtuoso', () => {
     itemContent?: (index: number, item: Row) => React.ReactNode;
     computeItemKey?: (index: number, item: Row) => React.Key;
     style?: React.CSSProperties;
-    components?: { List?: React.ComponentType<React.HTMLAttributes<HTMLDivElement>> };
+    ref?: React.Ref<{ scrollToIndex: (o: unknown) => void }>;
+    components?: {
+      List?: React.ComponentType<React.HTMLAttributes<HTMLDivElement>>;
+    };
   }) {
     const { data = [], itemContent, computeItemKey, style, components } = props;
-    const children = data.map((item, idx) => {
+    // React 19 passes `ref` as a plain prop to function components. The
+    // callers use it only for `scrollToIndex`, which has nothing to scroll
+    // here — but the handle must exist so `ref.current?.scrollToIndex(...)`
+    // is a real call rather than an optional-chain no-op.
+    React.useImperativeHandle(props.ref, () => ({ scrollToIndex: () => {} }), []);
+    const rows = data.map((item, idx) => {
       const key = computeItemKey ? computeItemKey(idx, item) : idx;
       return React.createElement(
         'div',
@@ -38,9 +79,9 @@ vi.mock('react-virtuoso', () => {
     });
     const ListComp = components?.List;
     if (ListComp) {
-      return React.createElement('div', { style }, React.createElement(ListComp, {}, children));
+      return React.createElement('div', { style }, React.createElement(ListComp, {}, rows));
     }
-    return React.createElement('div', { style }, children);
+    return React.createElement('div', { style }, rows);
   }
   return { Virtuoso };
 });

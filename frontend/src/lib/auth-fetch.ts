@@ -212,15 +212,24 @@ async function fetchCsrfToken(): Promise<string | null> {
   return csrfFetching;
 }
 
-function pathFromInput(input: RequestInfo): string {
+function pathFromInput(input: RequestInfo | URL): string {
   if (typeof input === "string") return input;
-  // URL or Request — Request has .url, URL stringifies. Both satisfy the
-  // RequestInfo union in the type system; check at runtime to be safe.
+  // URL or Request — Request has .url, URL stringifies.
+  //
+  // NB the parameter is `RequestInfo | URL`, not plain `RequestInfo`: the DOM
+  // lib defines `RequestInfo = Request | string`, so `URL` is NOT a member of
+  // it, even though this branch has always handled one and the global `fetch`
+  // has always accepted one. The declared type was simply narrower than the
+  // real behaviour. Widened v2026.08.25 so `authFetch` is assignable to
+  // `@podwarden/chat-ui`'s `Adapters['fetch']`, which takes
+  // `RequestInfo | URL` — under `strictFunctionTypes` a narrower parameter
+  // makes the whole function unassignable. Widening a parameter is safe for
+  // every existing caller.
   if (input instanceof URL) return input.toString();
   return (input as Request).url ?? "";
 }
 
-function needsCsrfToken(method: string, input: RequestInfo): boolean {
+function needsCsrfToken(method: string, input: RequestInfo | URL): boolean {
   if (SAFE_METHODS.has(method.toUpperCase())) return false;
   const path = pathFromInput(input);
   // Anchor against the path portion. Absolute URLs (rare for same-origin
@@ -363,7 +372,7 @@ const UNAUTH_BYPASS_PREFIXES: readonly string[] = [
   "/api/csrf",
 ];
 
-function shouldEagerRefresh(input: RequestInfo): boolean {
+function shouldEagerRefresh(input: RequestInfo | URL): boolean {
   const path = pathFromInput(input);
   let pathname = path;
   try {
@@ -374,7 +383,7 @@ function shouldEagerRefresh(input: RequestInfo): boolean {
   return !UNAUTH_BYPASS_PREFIXES.some((p) => pathname.startsWith(p));
 }
 
-export async function authFetch(input: RequestInfo, init: RequestInit = {}): Promise<Response> {
+export async function authFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
   const method = (init.method ?? 'GET').toString();
   const headers = new Headers(init.headers);
 
@@ -501,7 +510,7 @@ export async function authFetch(input: RequestInfo, init: RequestInit = {}): Pro
 // behaviour so SWR's `error` slot surfaces non-2xx responses instead of
 // silently passing through an HTML/error body that would later blow up at
 // `.json()` time inside a render.
-export async function authFetchJSON<T = unknown>(input: RequestInfo): Promise<T> {
+export async function authFetchJSON<T = unknown>(input: RequestInfo | URL): Promise<T> {
   const r = await authFetch(input);
   if (!r.ok) {
     const err = new Error(`HTTP ${r.status}`) as Error & { status?: number };

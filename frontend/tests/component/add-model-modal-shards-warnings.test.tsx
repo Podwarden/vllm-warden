@@ -280,6 +280,16 @@ describe("AddModelModal — GGUF arch warnings (#101)", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: /discover/i }));
 
+    // Discovery pre-selects the backend from the filename, and every weights
+    // file here is a .gguf -- so the modal lands on llama.cpp, where this
+    // banner is a statement about a loader that is not in use. The warning is
+    // about vLLM's GGUF allowlist, so it belongs to the case where the
+    // operator deliberately overrides that pre-selection back to vLLM.
+    await screen.findByTestId("backend-select");
+    fireEvent.change(screen.getByTestId("backend-select"), {
+      target: { value: "vllm" },
+    });
+
     const warn = await screen.findByTestId("gguf-arch-warning");
     expect(warn.getAttribute("data-warning-type")).toBe(
       "gguf_arch_unsupported",
@@ -318,6 +328,16 @@ describe("AddModelModal — GGUF arch warnings (#101)", () => {
       target: { value: "fake/repo" },
     });
     fireEvent.click(screen.getByRole("button", { name: /discover/i }));
+
+    // Discovery pre-selects the backend from the filename, and every weights
+    // file here is a .gguf -- so the modal lands on llama.cpp, where this
+    // banner is a statement about a loader that is not in use. The warning is
+    // about vLLM's GGUF allowlist, so it belongs to the case where the
+    // operator deliberately overrides that pre-selection back to vLLM.
+    await screen.findByTestId("backend-select");
+    fireEvent.change(screen.getByTestId("backend-select"), {
+      target: { value: "vllm" },
+    });
 
     const warn = await screen.findByTestId("gguf-arch-warning");
     expect(warn.getAttribute("data-warning-type")).toBe("gguf_arch_unknown");

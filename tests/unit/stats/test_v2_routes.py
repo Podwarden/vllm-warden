@@ -91,6 +91,22 @@ def _seed_v2_fixture(db_path):
                 ("t-orphan", now_min, 1, 10, 5),
             ],
         )
+        # model_samples — the SAME traffic, seen through the model dimension.
+        # The overview's token series and tps read this table rather than
+        # token_usage_minute, because only this one can be filtered by model
+        # (?models=), and reading two different tables for the filtered and the
+        # unfiltered case would make "every model selected" disagree with "no
+        # filter". The per-key endpoint still reads token_usage_minute; it asks
+        # a per-key question. Totals here are kept identical so the assertions
+        # below stay checkable by hand: 1500 at now_min-1, 840 at now_min.
+        db.executemany(
+            "INSERT INTO model_samples(model_id, minute, requests, "
+            "prompt_tokens, completion_tokens) VALUES (?, ?, ?, ?, ?)",
+            [
+                ("m-active", now_min - 1, 10, 1000, 500),
+                ("m-active", now_min, 8, 560, 280),
+            ],
+        )
         db.commit()
 
 
@@ -153,7 +169,12 @@ def test_v2_overview_shape_and_current_math(tmp_data_dir, client):
     assert set(body.keys()) == {
         "range", "now_minute", "since_minute", "current",
         "active_models", "series",
+        # Null on an unfiltered request; a model selection echoes here so the
+        # page can state what its numbers cover. See test_v2_model_selection.py.
+        "selected_model_ids", "selected_gpu_indices",
     }
+    assert body["selected_model_ids"] is None
+    assert body["selected_gpu_indices"] is None
     assert body["range"] == "1h"
     assert isinstance(body["now_minute"], int)
     assert isinstance(body["since_minute"], int)
@@ -169,7 +190,7 @@ def test_v2_overview_shape_and_current_math(tmp_data_dir, client):
     assert current["vram_pct"] == 38
     assert current["gpu_util_pct"] == 80
     assert current["power_w"] == 250.0
-    # TPS = (heavy 500+250 + light 50+25 + orphan 10+5) / 60 = 840/60 = 14.0
+    # TPS = model_samples at the latest minute, (560 + 280) / 60 = 14.0.
     assert current["tps"] == 14.0
 
     # active_models — only loaded models present.

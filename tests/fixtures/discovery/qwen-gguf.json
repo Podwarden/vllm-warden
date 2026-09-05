@@ -87,7 +87,10 @@
     "num_key_value_heads": 8,
     "max_position_embeddings": 32768,
     "torch_dtype": "bfloat16",
-    "quantization_config": null
+    "quantization_config": null,
+    "head_dim": null,
+    "sliding_window": null,
+    "layer_types": null
   },
   "repo": {
     "id": "unsloth/Qwen3.6-27B-MTP-GGUF",

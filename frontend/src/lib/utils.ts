@@ -11,7 +11,7 @@ export function cn(...inputs: ClassValue[]) {
  * Tries the modern async Clipboard API first (`navigator.clipboard.writeText`,
  * gated to secure contexts: HTTPS or `localhost`). When that is unavailable
  * — which is the common case for vllm-warden in production where operators
- * reach the UI over raw HTTP via Tailscale/LAN (e.g. `http://10.10.0.187`) —
+ * reach the UI over raw HTTP via a VPN or the LAN (e.g. `http://192.0.2.10`) —
  * falls back to the legacy hidden-`<textarea>` + `document.execCommand("copy")`
  * approach so the copy button still works.
  *
@@ -28,7 +28,7 @@ export async function copyToClipboard(text: string): Promise<void> {
   // The secure-context check matters because Chromium exposes
   // `navigator.clipboard` on `http://` pages too, but `writeText()`
   // rejects with NotAllowedError — using the textarea fallback up front
-  // gives a more reliable copy on the d5 / LAN-HTTP deployment.
+  // gives a more reliable copy on a LAN-HTTP deployment.
   if (
     typeof navigator !== "undefined" &&
     navigator.clipboard &&

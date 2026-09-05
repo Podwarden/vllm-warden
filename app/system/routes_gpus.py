@@ -22,6 +22,7 @@ from fastapi import APIRouter, Depends, Request
 from app.auth.deps import require_jwt
 from app.db.database import open_db
 from app.db.repos.models import ModelRepo
+from app.db.repos.setup import SetupRepo
 from app.system.gpu import GpuSnapshot, query_gpu_snapshot
 from app.system.pid_attribution import attribute_pid_to_model
 
@@ -83,6 +84,28 @@ async def _build_model_label_map(db_path: str) -> dict[str, str]:
     async with open_db(db_path) as db:
         rows = await ModelRepo(db).list_all()
     return {r.id: r.served_model_name for r in rows}
+
+
+async def _allowed_gpu_indices(db_path: str) -> list[int] | None:
+    """The setup wizard's GPU allowlist, or None if none was ever recorded.
+
+    ``POST /api/models`` has always rejected a selection outside this list with
+    a 400, but nothing read it back, so the Add-model dialog offered every card
+    the box has and learned about the allowlist only by being refused -- after
+    the operator had filled in the whole form. Offering a control that cannot
+    work is the defect this codebase's capability plumbing exists to avoid.
+
+    None and [] are DIFFERENT and clients must treat them so: None is "no
+    allowlist recorded -- everything is selectable"; [] is "the operator allowed
+    nothing". Collapsing them would lock an operator out of a box whose setup
+    draft predates the key.
+    """
+    async with open_db(db_path) as db:
+        state = await SetupRepo(db).get()
+    allowed = state.draft.get("allowed_gpu_indices")
+    if not isinstance(allowed, list):
+        return None
+    return sorted(int(i) for i in allowed)
 
 
 def _holder_payload(
@@ -148,8 +171,16 @@ async def system_gpus(request: Request, _user: str = Depends(require_jwt)) -> di
                 }
               ]
             }
-          ]
+          ],
+          "allowed_indices": [0, 1] | null
         }
+
+    ``allowed_indices`` is the setup wizard's GPU allowlist -- the same list
+    ``POST /api/models`` enforces with a 400. It is appended, never a
+    replacement for ``gpus``: every physically present card is still reported,
+    because hiding a card the operator can see in nvidia-smi answers a
+    different question than the one they asked. ``null`` means no allowlist was
+    recorded and is NOT the same as ``[]``.
 
     When ``nvidia-smi`` is not on PATH (dev box without NVIDIA) the endpoint
     still returns HTTP 200 with ``gpus: []`` and ``probe_error`` populated so
@@ -202,4 +233,11 @@ async def system_gpus(request: Request, _user: str = Depends(require_jwt)) -> di
         "probed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "probe_error": snap.probe_error,
         "gpus": gpus_payload,
+        # The setup wizard's allowlist, so a client can stop offering GPUs that
+        # POST /api/models would reject. Read from SQLite, so it survives a
+        # failed probe: a box whose driver is missing still knows what it is
+        # configured for. null != [] -- see _allowed_gpu_indices.
+        "allowed_indices": await _allowed_gpu_indices(
+            request.app.state.settings.db_path
+        ),
     }

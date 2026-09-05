@@ -30,12 +30,33 @@ from transformers import AutoTokenizer
 logger = logging.getLogger(__name__)
 
 
+# Average characters per token across the tokenizers this product serves. A
+# crude constant, and deliberately so: this number is only ever reached when the
+# exact count is unavailable, and pretending to more precision than
+# "approximately four" would disguise an estimate as a measurement.
+_CHARS_PER_TOKEN = 4
+
+
 class TokenizerCache:
     """Lazy-loaded HF tokenizer cache keyed by (hf_repo, trust_remote_code). Used for accounting only."""
 
     def __init__(self) -> None:
         self._cache: dict[tuple[str, bool], object] = {}
+        # Model repos whose token counts are character ESTIMATES because no
+        # tokenizer could be loaded. Keyed by the model's own hf_repo, which is
+        # what an operator looking for the row to fix would search for -- not by
+        # whichever repo we happened to try.
+        self._estimating: set[str] = set()
         self._lock = asyncio.Lock()
+
+    def estimating(self) -> frozenset[str]:
+        """Repos currently being character-estimated rather than tokenized.
+
+        Exposed so the health/status surface can say so. Approximate accounting
+        feeds the per-token rate limiter, and an operator is entitled to know
+        their billing is an estimate.
+        """
+        return frozenset(self._estimating)
 
     async def get(self, hf_repo: str, *, trust_remote_code: bool):
         key = (hf_repo, trust_remote_code)
@@ -47,11 +68,50 @@ class TokenizerCache:
                 )
             return self._cache[key]
 
-    async def count(self, hf_repo: str, text: str, *, trust_remote_code: bool) -> int:
+    async def count(
+        self,
+        hf_repo: str,
+        text: str,
+        *,
+        trust_remote_code: bool,
+        fallback_repo: str | None = None,
+    ) -> int:
+        """Token count for accounting. NEVER raises.
+
+        ``fallback_repo`` is the model row's ``tokenizer_repo`` and, when set, is
+        used INSTEAD OF ``hf_repo`` -- not after it. A GGUF-only repo has no
+        tokenizer files at all, so trying it first is a guaranteed miss and, on a
+        cold cache, a pointless network round trip. (The name is
+        ``fallback_repo`` because that is what the column is for from the row's
+        point of view: a fallback source for files the weights repo lacks.)
+
+        When no tokenizer can be loaded we fall back to a character estimate
+        rather than raising. This call sits on the proxy's hot path
+        (app/proxy/routes.py:418) with no try/except above it, so an exception
+        here is a 500 on a request the engine could have served perfectly well --
+        which is exactly what a GGUF-only repo produced before sub-project C.
+        The degradation is logged ONCE per repo (a per-request log on the hot
+        path is a second incident) and reported through ``estimating()``.
+        """
         if not text:
             return 0
-        tok = await self.get(hf_repo, trust_remote_code=trust_remote_code)
-        return len(tok.encode(text))
+        repo = fallback_repo or hf_repo
+        try:
+            tok = await self.get(repo, trust_remote_code=trust_remote_code)
+            return len(tok.encode(text))
+        except Exception:  # noqa: BLE001 -- accounting must not fail a request
+            if hf_repo not in self._estimating:
+                self._estimating.add(hf_repo)
+                logger.warning(
+                    "TokenizerCache: no usable tokenizer for %r (tried %r); token "
+                    "accounting for this model is a CHARACTER ESTIMATE, which "
+                    "also drives the per-token rate limit. Set the model's "
+                    "tokenizer_repo to a repo that ships tokenizer.json -- for a "
+                    "GGUF quant that is normally the upstream safetensors repo.",
+                    hf_repo,
+                    repo,
+                )
+            return max(1, len(text) // _CHARS_PER_TOKEN)
 
     async def evict(self, hf_repo: str) -> int:
         """Drop every cached tokenizer for ``hf_repo`` (both trust_remote_code
@@ -67,6 +127,11 @@ class TokenizerCache:
             to_drop = [k for k in self._cache if k[0] == hf_repo]
             for k in to_drop:
                 self._cache.pop(k, None)
+            # Clear the estimate marker too, or a model whose tokenizer_repo the
+            # operator has just fixed keeps estimating until the process
+            # restarts -- and the once-per-repo log would never fire again to
+            # say so.
+            self._estimating.discard(hf_repo)
         if to_drop:
             logger.debug(
                 "TokenizerCache.evict(%r) dropped %d entr%s",

@@ -1,7 +1,7 @@
 "use client";
 
 // God-mode live viewer — real-time prompts + model output flowing through the
-// vLLM warden proxy. Admin-only (the SSE endpoint gates on require_jwt).
+// LLM Warden proxy. Admin-only (the SSE endpoint gates on require_jwt).
 //
 // This mirrors models/log-stream.tsx deliberately: <Virtuoso> + the shared
 // `useStickyBottom` hook give us live/explore scroll, "Jump to latest", the
@@ -22,6 +22,10 @@ import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { Button } from "@/components/ui/button";
 import { useStickyBottom } from "@/components/shared/use-sticky-bottom";
 import { useEventSource, MAX_RECONNECT, type SseState } from "@/lib/sse";
+import { useHeaderMetrics } from "@/lib/header-metrics-stream";
+import { activeModelsOf } from "@/lib/header-models";
+import { useModelSelection } from "@/lib/model-selection";
+import { ModelSelector } from "@/components/stats/model-selector";
 import { cn } from "@/lib/utils";
 import { reqColor } from "./req-color";
 import { MediaStrip } from "./godmode-media";
@@ -164,6 +168,34 @@ export function groupBlocks(events: GodModeEvent[]): RequestBlockData[] {
   return order.map((id) => byId.get(id)!);
 }
 
+/**
+ * Narrow request blocks to a model selection.
+ *
+ * `modelIds` of `null` means no filter. Filtering happens HERE, in the client,
+ * and not in the SSE: the hub is a shared broadcast ring with a replay
+ * snapshot, and a per-subscriber server-side filter would drop a
+ * `request_start` while still delivering that request's `delta` and
+ * `request_end` frames — leaving orphan blocks with no prompt and no model.
+ * Correlation is by `req_id`, so the whole conversation has to arrive together
+ * and be grouped before anything can be attributed to a model at all.
+ *
+ * The god-mode env gate is untouched by this: the stream is as gated as it
+ * ever was, and this only decides what a viewer who already has it renders.
+ *
+ * A block with NO `request_start` is KEPT. Its start was evicted from the ring,
+ * so its model is unknowable — and silently dropping traffic we cannot
+ * attribute would make a narrowed god-mode view quietly incomplete, which is
+ * the one thing a forensic tool must never be.
+ */
+export function filterBlocksByModel(
+  blocks: RequestBlockData[],
+  modelIds: readonly string[] | null,
+): RequestBlockData[] {
+  if (modelIds === null) return blocks;
+  const wanted = new Set(modelIds);
+  return blocks.filter((b) => !b.start || wanted.has(b.start.model));
+}
+
 // ---------------------------------------------------------------------------
 // Repeated-system-prompt collapse
 // ---------------------------------------------------------------------------
@@ -294,7 +326,34 @@ export function GodModeViewer({ className, heightPx = 560 }: GodModeViewerProps)
   const sticky = useStickyBottom("stick");
   const virtuosoRef = useRef<VirtuosoHandle>(null);
 
-  const blocks = useMemo(() => groupBlocks(state.events), [state.events]);
+  // The loaded-model list comes from the header-metrics stream, which is
+  // already open in this tab (NavBar mounts it everywhere but /login and
+  // /setup) and is ref-counted, so subscribing here costs no new connection
+  // and no new endpoint. It is also exactly the right list: the models the
+  // box is currently serving.
+  const header = useHeaderMetrics();
+  const loadedModels = useMemo(
+    () =>
+      activeModelsOf(header.frame).map((m) => ({
+        id: m.id,
+        served_model_name: m.served_model_name,
+      })),
+    [header.frame],
+  );
+  const modelIds = useMemo(() => loadedModels.map((m) => m.id), [loadedModels]);
+  const selection = useModelSelection(modelIds);
+
+  const allBlocks = useMemo(() => groupBlocks(state.events), [state.events]);
+  const blocks = useMemo(
+    () =>
+      filterBlocksByModel(
+        allBlocks,
+        // No selection yet (still resolving, or nothing loaded) means no
+        // filter — never an empty allow-list, which would blank the view.
+        selection.selected.length > 0 ? selection.selected : null,
+      ),
+    [allBlocks, selection.selected],
+  );
 
   // Per-request collapse decision: diff each request's prompt against the
   // PREVIOUS request from the same token identity (label preferred, id fallback)
@@ -371,6 +430,11 @@ export function GodModeViewer({ className, heightPx = 560 }: GodModeViewerProps)
 
   return (
     <div className={cn("space-y-2", className)}>
+      {/* The same selection as /stats and /stats/live. God mode's own gate is
+          untouched — this decides only what a viewer who already has the
+          stream renders. */}
+      <ModelSelector models={loadedModels} selection={selection} />
+
       {showStatusBar && statusBar !== null && (
         <div
           role={statusBar.tone === "error" ? "alert" : "status"}

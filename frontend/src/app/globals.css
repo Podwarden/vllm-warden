@@ -1,3 +1,4 @@
+@import '@podwarden/chat-ui/theme.css';
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -28,6 +29,25 @@
 
 /* ── Retro Light ────────────────────────────────────────── */
 [data-theme="retro"] {
+  /* chat-ui semantic tokens (space-separated R G B, no rgb() wrapper) */
+  --chat-page: 253 246 236;        /* #FDF6EC */
+  --chat-surface: 255 255 255;
+  --chat-surface-2: 254 243 199;   /* #fef3c7 */
+  --chat-rule: 253 230 138;
+  --chat-fg: 28 25 23;             /* #1c1917 */
+  --chat-muted: 68 64 60;          /* #44403c */
+  --chat-dim: 101 96 90;           /* #65605a */
+  --chat-accent: 180 83 9;         /* #b45309 */
+  --chat-accent-strong: 146 64 14; /* #92400e */
+  --chat-user: 217 119 6;          /* #d97706 */
+  --chat-warn: 217 119 6;
+  --chat-warn-dim: 245 158 11;
+  --chat-negative: 220 38 38;      /* #dc2626 */
+  --chat-negative-dim: 254 226 226;
+  --chat-positive: 146 64 14;
+  --chat-code: 253 246 236;
+  --chat-on-accent: 255 255 255;
+
   .bg-slate-950 { background-color: #FDF6EC !important; }
   .bg-slate-950\/50 { background-color: rgba(253,246,236,0.85) !important; }
   .bg-slate-950\/20 { background-color: rgba(253,246,236,0.5) !important; }
@@ -91,6 +111,7 @@
 
   .bg-red-950\/10 { background-color: rgba(254,226,226,0.4) !important; }
   .text-red-400 { color: #dc2626 !important; }
+  .hover\:text-red-400:hover { color: #dc2626 !important; }
 
   /* Destructive button — warm amber-red */
   .bg-red-600 { background-color: #92400E !important; }
@@ -194,6 +215,25 @@
 
 /* ── Retro Dark ─────────────────────────────────────────── */
 [data-theme="retro-dark"] {
+  /* chat-ui semantic tokens (space-separated R G B, no rgb() wrapper) */
+  --chat-page: 28 20 9;            /* #1C1409 */
+  --chat-surface: 42 31 14;        /* #2A1F0E */
+  --chat-surface-2: 62 46 22;      /* #3E2E16 */
+  --chat-rule: 74 56 32;           /* #4A3820 */
+  --chat-fg: 255 251 235;          /* #FFFBEB */
+  --chat-muted: 196 180 154;       /* #C4B49A */
+  --chat-dim: 138 124 102;         /* #8A7C66 */
+  --chat-accent: 251 191 36;       /* #fbbf24 */
+  --chat-accent-strong: 245 158 11;/* #f59e0b */
+  --chat-user: 217 119 6;
+  --chat-warn: 245 158 11;
+  --chat-warn-dim: 245 158 11;
+  --chat-negative: 248 113 113;
+  --chat-negative-dim: 69 10 10;
+  --chat-positive: 245 158 11;
+  --chat-code: 28 20 9;
+  --chat-on-accent: 28 20 9;
+
   .bg-slate-950 { background-color: #1C1409 !important; }
   .bg-slate-900 { background-color: #2A1F0E !important; }
   .bg-slate-900\/50 { background-color: rgba(42,31,14,0.7) !important; }
@@ -253,6 +293,7 @@
 
   .bg-red-950\/10 { background-color: rgba(127,29,29,0.2) !important; }
   .text-red-400 { color: #f87171 !important; }
+  .hover\:text-red-400:hover { color: #f87171 !important; }
 
   /* Destructive button — warm amber-red */
   .bg-red-600 { background-color: #92400E !important; }

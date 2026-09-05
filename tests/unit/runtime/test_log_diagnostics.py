@@ -5,14 +5,14 @@ traceback into an actionable, operator-facing message. It matches on STABLE
 tokens (not exact phrasing) because vLLM's wording drifts across versions.
 Returns ``None`` when nothing matches so the caller keeps its generic message.
 
-The two KV-related fixtures below are the EXACT strings observed on d5 (real
+The two KV-related fixtures below are the EXACT strings observed in production (real
 vLLM output), including their quirks (``models's`` typo, a stray ``(`` before
 ``16.0 GiB``). The parser must match these tolerantly — never anchor on exact
 punctuation.
 """
 from __future__ import annotations
 
-from app.runtime.log_diagnostics import diagnose_engine_log
+from app.runtime.backends.vllm.diagnostics import diagnose_engine_log
 
 # --- Variant 1: KV cache too small for the requested context. ---------------
 # vLLM prints its OWN authoritative fit estimate ("the estimated maximum model

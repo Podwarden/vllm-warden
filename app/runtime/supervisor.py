@@ -6,12 +6,12 @@ from pathlib import Path
 
 import httpx
 
-from app.runtime.cmd_builder import build_vllm_args
+from app.runtime.backends import registry
+from app.runtime.backends.paths import resolve_model_paths
+from app.runtime.backends.vllm.images import resolve_image
 from app.runtime.engine import EngineSpec
 from app.runtime.engine.local_subprocess import LocalSubprocessDriver
-from app.runtime.env_builder import build_subprocess_env
 from app.runtime.gpu_ownership import GpuOwnership
-from app.templates.resolver import resolve_image
 
 UNLOAD_GRACE_SECONDS = 30.0
 
@@ -159,7 +159,7 @@ class Supervisor:
                     f"engine version pin ({engine_image}) cannot be honored: "
                     "this deployment runs the in-container subprocess engine, "
                     "whose vLLM version is fixed by the warden image. Clear the "
-                    "engine pin on this model, or run vLLM Warden with "
+                    "engine pin on this model, or run LLM Warden with "
                     "VW_ENGINE_DRIVER=docker to select engine versions."
                 )
             self.gpus.claim(model.id, model.gpu_indices)
@@ -170,36 +170,61 @@ class Supervisor:
                     return hf_token_path.read_text().strip() if hf_token_path.exists() else ""
 
                 hf_token = await asyncio.to_thread(_read_hf_token)
-                env = build_subprocess_env(
-                    model,
-                    hf_token=hf_token,
-                    hf_cache_dir=str(self.settings.hf_cache_dir),
-                    # #210 — the shm mitigation applies to the local driver
-                    # only; the docker driver sizes /dev/shm itself.
-                    engine_driver=getattr(self.settings, "engine_driver", "local"),
-                )
-                args = build_vllm_args(
+                # D6 — models.backend is nullable and NULL decodes to "vllm";
+                # registry.get owns that default. An unknown name raises
+                # UnknownBackendError here, INSIDE the try that releases the
+                # GPU claim below, so a row asking for a backend this build
+                # does not have fails before anything is spawned rather than
+                # silently launching vLLM under the operator's chosen name.
+                backend_name = getattr(model, "backend", None)
+                backend = registry.get(backend_name)
+                # #211 / #210 — the DRIVER decides how wide the engine binds
+                # its (unauthenticated) OpenAI server and whether the shm
+                # mitigation applies; the BACKEND decides what the flag and the
+                # env are called. getattr so stand-in settings in tests still
+                # resolve to the safe local/loopback default.
+                driver_name = getattr(self.settings, "engine_driver", "local")
+                # Resolve the row's pinned files ONCE, here, so Backend.plan()
+                # stays pure and so a missing file is reported as itself rather
+                # than as a subprocess that exits rc=1 forty seconds later. This
+                # runs inside the try/except that releases the GPU claim, so a
+                # mistyped filename cannot leave a card reserved.
+                #
+                # ONLY for a backend that actually needs a path. vLLM takes a
+                # repo id and does its own lookup, so resolving on its behalf is
+                # a cache scan of a directory it never opens -- and Path.is_dir()
+                # propagates EACCES, so an unreadable hf_cache_dir would fail a
+                # vLLM load that has no business reading that directory at all.
+                # Gated on the CAPABILITY, never on the backend's name: a name
+                # check here is per-backend branching in the control plane, which
+                # is the O(n*m) multiplication decision D1 exists to remove.
+                resolved = None
+                if backend.capabilities.needs_local_model_path:
+                    resolved = await asyncio.to_thread(
+                        resolve_model_paths,
+                        model,
+                        hf_cache_dir=self.settings.hf_cache_dir,
+                    )
+                plan = backend.plan(
                     model,
                     port=port,
+                    bind_host=backend.bind_host(driver_name),
                     overrides=overrides,
-                    # #211 — the driver decides how wide the engine binds its
-                    # (unauthenticated) OpenAI server: only the docker driver,
-                    # whose engine lives in its own netns, needs 0.0.0.0. Under
-                    # the local driver the engine shares this process's netns,
-                    # so loopback keeps ports 10000-10999 off the pod IP and
-                    # every request through the proxy's auth + accounting.
-                    # getattr so stand-in settings in tests still resolve to
-                    # the safe local/loopback default.
-                    driver=getattr(self.settings, "engine_driver", "local"),
+                    resolved=resolved,
+                    hf_token=hf_token,
+                    hf_cache_dir=str(self.settings.hf_cache_dir),
+                    engine_driver=driver_name,
+                    image=engine_image,
                 )
                 spec = EngineSpec(
                     model_id=model.id,
                     model_arg=model.hf_repo,
-                    args=args,
-                    env=env,
-                    port=port,
-                    image=engine_image,
-                    gpu_indices=list(model.gpu_indices),
+                    argv=plan.argv,
+                    env=plan.env,
+                    port=plan.port,
+                    image=plan.image,
+                    gpu_indices=plan.gpu_indices,
+                    backend=backend.capabilities.name,
                 )
                 handle = await self._driver.spawn(spec)
 
@@ -326,7 +351,7 @@ class Supervisor:
             # statement, so a teardown exception stranded the claim and left
             # the GPUs permanently "already claimed" by a model that is gone —
             # unrecoverable without a control-plane restart (#166-adjacent
-            # leak, observed on d5). Release in ``finally`` to close that gap.
+            # leak, observed in production). Release in ``finally`` to close that gap.
             try:
                 watcher = self._watchers.pop(model_id, None)
                 if watcher is not None and not watcher.done():

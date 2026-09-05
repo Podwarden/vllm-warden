@@ -180,13 +180,16 @@ describe("StatsPage", () => {
     expect(screen.getByTestId("tile-tps-value").textContent).toBe("14");
   });
 
-  it("renders the active-model strip", async () => {
+  it("names the loaded models in the selector", async () => {
+    // Was a read-only "Loaded:" strip. The models are now the page's model
+    // SELECTION, so the same names appear as checkboxes -- one control that
+    // narrows the stats, the live view and god mode alike.
     installFetchStub({ overview: FIXTURE_OVERVIEW });
     renderPage();
     await waitFor(() => {
-      expect(screen.getByTestId("active-models")).toBeInTheDocument();
+      expect(screen.getByTestId("model-selector")).toBeInTheDocument();
     });
-    expect(screen.getByTestId("active-models").textContent).toContain(
+    expect(screen.getByTestId("model-selector").textContent).toContain(
       "served-name-1",
     );
   });
@@ -252,7 +255,9 @@ describe("StatsPage", () => {
     expect(screen.getByTestId("tile-power-value").textContent).toBe("—");
   });
 
-  it("hides the active-model strip when no model is loaded", async () => {
+  it("hides the selector entirely when no model is loaded", async () => {
+    // There is no selection to make. An empty fieldset would be a control with
+    // nothing behind it, which is the defect class this whole branch is about.
     installFetchStub({
       overview: { ...FIXTURE_OVERVIEW, active_models: [] },
     });
@@ -260,7 +265,7 @@ describe("StatsPage", () => {
     await waitFor(() => {
       expect(screen.getByTestId("tile-vram-value")).toBeInTheDocument();
     });
-    expect(screen.queryByTestId("active-models")).toBeNull();
+    expect(screen.queryByTestId("model-selector")).toBeNull();
   });
 
   it("shows an empty-state when the per-key table has no rows", async () => {

@@ -15,15 +15,26 @@ from typing import Protocol, runtime_checkable
 @dataclass(frozen=True)
 class EngineSpec:
     """Everything a driver needs to start one engine. Built by Supervisor
-    from a model row + the resolved argv; drivers stay model-agnostic."""
+    from a model row + the backend's LaunchPlan; drivers stay model-agnostic
+    AND backend-agnostic."""
 
     model_id: str
     model_arg: str            # the --model value (repo or repo:quant)
-    args: list[str]           # full `vllm serve` argv tail (post-binary)
+    argv: list[str]           # FULL argv, including argv[0]. Before sub-project
+                              # B this was `args` -- the post-binary tail -- and
+                              # each driver knew the binary. Now the backend
+                              # owns it (app/runtime/backends/).
     env: dict[str, str]       # process/container env
     port: int                 # host port the engine listens on
     image: str | None = None  # engine container image (docker driver only)
     gpu_indices: list[int] = field(default_factory=list)
+    # Which backend produced `argv`. Drivers may use it for naming and labels.
+    # Sub-project B does NOT change any existing name that could use it: the
+    # container name prefix and the docker label are identity, and changing
+    # identity in a byte-identical refactor is out of scope (see the rename,
+    # sub-project A). Sub-project C makes the container name backend-aware so a
+    # vLLM and a llama.cpp engine for one model id cannot collide.
+    backend: str = "vllm"
 
 
 @runtime_checkable

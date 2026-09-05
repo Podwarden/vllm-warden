@@ -4,6 +4,7 @@ import { useRouter } from 'next/navigation';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { setAccessToken } from '@/lib/auth-fetch';
+import { pathForStep } from '@/lib/setup-steps';
 
 export default function LoginPage() {
   const [username, setUsername] = useState('');
@@ -23,15 +24,18 @@ export default function LoginPage() {
         // Public, cookie-less probe — omit credentials.
         const r = await fetch('/api/setup/state', { credentials: 'omit' });
         if (!r.ok) throw new Error(`setup state ${r.status}`);
-        const { done } = await r.json();
+        const { done, step } = await r.json();
         if (cancelled) return;
         // Fail toward the wizard: only a successful probe that explicitly
         // reports done === true shows the sign-in form. A malformed/non-boolean
-        // body funnels to /setup/welcome rather than exposing a sign-in form
+        // body funnels to the wizard rather than exposing a sign-in form
         // for an account that may not exist. (Probe FAILURE is handled by the
         // catch below, which falls back to the form so a hiccup can't trap.)
+        // Funnel to the server's CURRENT step, not hard-coded welcome — a
+        // half-finished setup resumes where it left off instead of landing
+        // on a welcome page whose only action the server would reject.
         if (done !== true) {
-          router.replace('/setup/welcome');
+          router.replace(pathForStep(step));
           return;
         }
       } catch {
@@ -69,7 +73,7 @@ export default function LoginPage() {
 
   return (
     <form onSubmit={submit} className="max-w-sm mx-auto mt-20 space-y-4">
-      <h1 className="text-xl font-semibold">vllm-warden</h1>
+      <h1 className="text-xl font-semibold">LLM Warden</h1>
       <label className="block">Username<Input name="username" value={username} onChange={(e) => setUsername(e.target.value)} /></label>
       <label className="block">Password<Input name="password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} /></label>
       {error && <p className="text-red-500 text-sm">{error}</p>}
