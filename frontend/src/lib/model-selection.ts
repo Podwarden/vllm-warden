@@ -1,7 +1,7 @@
 "use client";
 // Which loaded models a page's numbers cover.
 //
-// One selection, shared by /stats, /stats/live and /godmode — the operator
+// One selection, shared by /stats and /godmode — the operator
 // picks once and every surface answers about the same models. A per-page
 // selection would let two pages disagree about what "the numbers" mean while
 // both were open, which is the same defect as a control whose effect is gated

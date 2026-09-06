@@ -13,7 +13,14 @@ from typing import Any
 
 import pytest
 
-from app.system.gpu import GpuComputeApp, GpuLive, GpuSnapshot
+from app.system.gpu import (
+    GpuComputeApp,
+    GpuLive,
+    GpuSnapshot,
+    GpuTopology,
+    NvlinkStatus,
+    ThrottleReasons,
+)
 from tests.conftest import jwt_login, seed_admin_user
 
 
@@ -140,6 +147,25 @@ def test_system_gpus_attributes_known_pids(tmp_data_dir, client, monkeypatch):
         "utilization_pct": 87,
         # #176 — SNAP_TWO_GPUS rows don't set compute_cap, so it surfaces None.
         "compute_cap": None,
+        "architecture": None,
+        # Telemetry the fixture rows never set: every slot null = "not
+        # reported", and nvlink null (probe gave nothing) is distinct from
+        # {"state": "unsupported"}.
+        "telemetry": {
+            "temperature_c": None, "temp_slowdown_c": None,
+            "temp_shutdown_c": None, "temp_max_operating_c": None,
+            "fan_pct": None, "power_w": None, "power_limit_w": None,
+            "ecc_enabled": None, "pstate": None,
+            "sm_clock_mhz": None, "sm_clock_max_mhz": None,
+            "mem_clock_mhz": None, "mem_clock_max_mhz": None,
+            "throttle": None,
+            "nvlink": None,
+            "pcie": {
+                "gen_current": None, "gen_max": None,
+                "width_current": None, "width_max": None,
+                "gen_gpu_max": None, "gen_host_max": None,
+            },
+        },
         "holders": [
             {
                 "pid": 12345, "memory_mib": 12400, "process": "vllm-worker",
@@ -187,6 +213,11 @@ def test_system_gpus_surfaces_compute_cap(tmp_data_dir, client, monkeypatch):
     body = r.json()
     assert body["gpus"][0]["compute_cap"] == 8.6
     assert body["gpus"][1]["compute_cap"] is None
+    # The generation is derived from compute_cap and nothing else — the
+    # V100 row has no capability, so it gets no label rather than a guess
+    # from its name.
+    assert body["gpus"][0]["architecture"] == "Ampere"
+    assert body["gpus"][1]["architecture"] is None
 
 
 def test_system_gpus_attributes_worker_pid_via_pgrp(tmp_data_dir, client, monkeypatch):
@@ -350,3 +381,129 @@ def test_allowed_indices_survives_a_probe_failure(tmp_data_dir, client, monkeypa
     body = client.get("/api/system/gpus", headers=auth).json()
     assert body["gpus"] == []
     assert body["allowed_indices"] == [0, 3]
+
+
+def test_system_gpus_surfaces_per_card_telemetry(tmp_data_dir, client, monkeypatch):
+    """A heterogeneous two-card host: each card's own limits, ECC and NVLink
+    standing surface verbatim, and a missing sensor surfaces as null rather
+    than 0 — the difference between "no fan" and "fan at 0 %"."""
+    client.get("/healthz")
+    _seed_done(tmp_data_dir / "vllm-warden.db")
+    snap = GpuSnapshot(
+        gpus=[
+            GpuLive(index=0, uuid="GPU-aaaa", name="NVIDIA RTX A4000",
+                    memory_total_mib=16376, memory_used_mib=14137,
+                    memory_free_mib=2239, utilization_pct=0, compute_cap=8.6,
+                    bus_id="00000000:01:00.0", temperature_c=35, fan_pct=41,
+                    power_w=12.68, power_limit_w=140.0, ecc_enabled=False,
+                    pstate="P8", sm_clock_mhz=210, sm_clock_max_mhz=2100,
+                    mem_clock_mhz=405, mem_clock_max_mhz=7001,
+                    throttle=ThrottleReasons(mask=1, sw_thermal=False, hw_thermal=False,
+                                             sw_power_cap=False, hw_slowdown=False,
+                                             hw_power_brake=False, idle=True),
+                    nvlink=NvlinkStatus(state="unsupported"),
+                    temp_slowdown_c=100, temp_shutdown_c=103, temp_max_operating_c=98,
+                    pcie_gen_current=1, pcie_gen_max=3,
+                    pcie_width_current=4, pcie_width_max=16,
+                    pcie_gen_gpu_max=4, pcie_gen_host_max=4),
+            GpuLive(index=1, uuid="GPU-bbbb", name="Quadro RTX 5000",
+                    memory_total_mib=15360, memory_used_mib=13818,
+                    memory_free_mib=1542, utilization_pct=0, compute_cap=7.5,
+                    bus_id="00000000:02:00.0", temperature_c=29, fan_pct=None,
+                    power_w=0.0, power_limit_w=230.0, ecc_enabled=True,
+                    pstate="P8", sm_clock_mhz=300,
+                    nvlink=NvlinkStatus(state="inactive")),
+        ],
+        apps=[],
+        probe_error=None,
+    )
+    _install_probe(client, [snap])
+    _install_supervisor_pids(client, {})
+    _patch_attribute(monkeypatch, mapping={})
+
+    auth = _jwt_auth(client)
+    r = client.get("/api/system/gpus", headers=auth)
+    assert r.status_code == 200, r.text
+    t0, t1 = (g["telemetry"] for g in r.json()["gpus"])
+    assert t0 == {
+        "temperature_c": 35, "temp_slowdown_c": 100, "temp_shutdown_c": 103,
+        "temp_max_operating_c": 98, "fan_pct": 41, "power_w": 12.68,
+        "power_limit_w": 140.0, "ecc_enabled": False, "pstate": "P8",
+        "sm_clock_mhz": 210, "sm_clock_max_mhz": 2100,
+        "mem_clock_mhz": 405, "mem_clock_max_mhz": 7001,
+        # Idle: the driver says so (mask 0x1) and nothing is slowing it down.
+        "throttle": {"mask": 1, "sw_thermal": False, "hw_thermal": False,
+                     "sw_power_cap": False, "hw_slowdown": False,
+                     "hw_power_brake": False, "idle": True},
+        "nvlink": {"state": "unsupported", "active_links": 0, "total_links": 0,
+                   "link_speed_gbs": None},
+        # Idle gen 1 against a negotiated max of 3, x4 of x16, both endpoints
+        # Gen 4-capable: every number verbatim, no judgement applied here.
+        "pcie": {"gen_current": 1, "gen_max": 3, "width_current": 4, "width_max": 16,
+                 "gen_gpu_max": 4, "gen_host_max": 4},
+    }
+    # The second card never had PCIe fields (older row shape): all null.
+    assert all(v is None for v in t1["pcie"].values())
+    assert t1["power_limit_w"] == 230.0 and t1["ecc_enabled"] is True
+    assert t1["fan_pct"] is None            # no fan sensor -> null, not 0
+    assert t1["power_w"] == 0.0             # a real 0 W reading stays 0
+    assert t1["temp_slowdown_c"] is None    # no thermal block for this card
+    assert t1["nvlink"]["state"] == "inactive"
+    # No throttle probe answer for card 1: null, which is not "not throttled".
+    assert t1["throttle"] is None
+    assert t1["sm_clock_max_mhz"] is None and t1["mem_clock_mhz"] is None
+    # No topo -m in this snapshot either.
+    assert r.json()["topology"] is None
+
+
+def test_system_gpus_surfaces_topology_and_throttle_verdict(tmp_data_dir, client, monkeypatch):
+    """The 4-card host as it is right now: every card in SW thermal slowdown
+    holding 57-74 % of its SM ceiling, and a topo -m matrix with no NVLink
+    anywhere. The matrix rides beside the list (it is a relationship BETWEEN
+    cards), verbatim legend codes, and the throttle flags come from the
+    driver — no temperature heuristic anywhere on the route."""
+    client.get("/healthz")
+    _seed_done(tmp_data_dir / "vllm-warden.db")
+    clocks = [1350, 1560, 1305, 1200]
+    snap = GpuSnapshot(
+        gpus=[
+            GpuLive(index=i, uuid=f"GPU-{i}", name="NVIDIA RTX A4000",
+                    memory_total_mib=16376, memory_used_mib=15155,
+                    memory_free_mib=1221, utilization_pct=100, compute_cap=8.6,
+                    temperature_c=[93, 91, 95, 93][i], temp_slowdown_c=100,
+                    sm_clock_mhz=clocks[i], sm_clock_max_mhz=2100,
+                    mem_clock_mhz=6501, mem_clock_max_mhz=7001,
+                    throttle=ThrottleReasons(mask=0x20, sw_thermal=True, hw_thermal=False,
+                                             sw_power_cap=False, hw_slowdown=False,
+                                             hw_power_brake=False, idle=False))
+            for i in range(4)
+        ],
+        apps=[],
+        probe_error=None,
+        topology=GpuTopology(
+            indices=[0, 1, 2, 3],
+            matrix=[
+                ["X", "PHB", "PHB", "PHB"], ["PHB", "X", "PHB", "PHB"],
+                ["PHB", "PHB", "X", "PHB"], ["PHB", "PHB", "PHB", "X"],
+            ],
+        ),
+    )
+    _install_probe(client, [snap])
+    _install_supervisor_pids(client, {})
+    _patch_attribute(monkeypatch, mapping={})
+
+    auth = _jwt_auth(client)
+    body = client.get("/api/system/gpus", headers=auth).json()
+    assert body["topology"] == {
+        "indices": [0, 1, 2, 3],
+        "matrix": [
+            ["X", "PHB", "PHB", "PHB"], ["PHB", "X", "PHB", "PHB"],
+            ["PHB", "PHB", "X", "PHB"], ["PHB", "PHB", "PHB", "X"],
+        ],
+    }
+    for i, g in enumerate(body["gpus"]):
+        assert g["architecture"] == "Ampere"
+        t = g["telemetry"]
+        assert t["throttle"]["sw_thermal"] is True
+        assert t["throttle"]["sw_power_cap"] is False
+        assert (t["sm_clock_mhz"], t["sm_clock_max_mhz"]) == (clocks[i], 2100)

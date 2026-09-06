@@ -5,7 +5,7 @@
 // This is a direct sibling of `header-metrics-stream.ts`: same module-level
 // singleton + subscriber-set pattern, same ticket-mint preflight, same
 // exp-backoff reconnect, same terminal-error (401/403/404) classification.
-// The /ui/stats/live page mounts a single <LiveStatsPage>, but React
+// The merged /ui/stats page mounts a single <StatsPage>, but React
 // StrictMode dev re-renders and fast-refresh can briefly double-mount —
 // collapsing to one underlying stream keeps the ticket-mint + /metrics-scrape
 // traffic to exactly one connection per tab regardless.

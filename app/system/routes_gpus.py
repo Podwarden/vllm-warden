@@ -23,7 +23,13 @@ from app.auth.deps import require_jwt
 from app.db.database import open_db
 from app.db.repos.models import ModelRepo
 from app.db.repos.setup import SetupRepo
-from app.system.gpu import GpuSnapshot, query_gpu_snapshot
+from app.system.gpu import (
+    GpuLive,
+    GpuSnapshot,
+    GpuTopology,
+    architecture_for,
+    query_gpu_snapshot,
+)
 from app.system.pid_attribution import attribute_pid_to_model
 
 logger = logging.getLogger(__name__)
@@ -137,6 +143,86 @@ def _holder_payload(
     }
 
 
+def _telemetry_payload(g: GpuLive) -> dict[str, Any]:
+    """The per-card telemetry block. Every value is nullable and null means
+    "the hardware did not report this" — the UI renders those as "not
+    reported", never as 0 or blank, because a fan-less card, a card with no
+    power sensor and a card drawing 0 W are three different things.
+
+    ``nvlink`` is null only when the ``nvlink -s`` probe gave nothing for the
+    card; a card with no NVLink is ``{"state": "unsupported"}``, which is a
+    real answer and rendered as one. Likewise ``throttle`` is null only when
+    the throttle-reason probe gave nothing; a card that is not throttling is
+    an object with every flag false."""
+    nvlink = (
+        None
+        if g.nvlink is None
+        else {
+            "state": g.nvlink.state,
+            "active_links": g.nvlink.active_links,
+            "total_links": g.nvlink.total_links,
+            "link_speed_gbs": g.nvlink.link_speed_gbs,
+        }
+    )
+    throttle = (
+        None
+        if g.throttle is None
+        else {
+            "mask": g.throttle.mask,
+            "sw_thermal": g.throttle.sw_thermal,
+            "hw_thermal": g.throttle.hw_thermal,
+            "sw_power_cap": g.throttle.sw_power_cap,
+            "hw_slowdown": g.throttle.hw_slowdown,
+            "hw_power_brake": g.throttle.hw_power_brake,
+            "idle": g.throttle.idle,
+        }
+    )
+    return {
+        "temperature_c": g.temperature_c,
+        "temp_slowdown_c": g.temp_slowdown_c,
+        "temp_shutdown_c": g.temp_shutdown_c,
+        "temp_max_operating_c": g.temp_max_operating_c,
+        "fan_pct": g.fan_pct,
+        "power_w": g.power_w,
+        "power_limit_w": g.power_limit_w,
+        "ecc_enabled": g.ecc_enabled,
+        "pstate": g.pstate,
+        # Each clock against its own ceiling — the ceiling is what makes a
+        # low reading readable (210 MHz idle is normal; 1200 of 2100 under
+        # load is a card being held back).
+        "sm_clock_mhz": g.sm_clock_mhz,
+        "sm_clock_max_mhz": g.sm_clock_max_mhz,
+        "mem_clock_mhz": g.mem_clock_mhz,
+        "mem_clock_max_mhz": g.mem_clock_max_mhz,
+        # The driver's own statement of why the clocks are held, never a
+        # guess from a temperature ratio. Thermal, power cap and hardware
+        # slowdown are different problems and stay separate flags.
+        "throttle": throttle,
+        "nvlink": nvlink,
+        # gen_current is 1 on an idle card (PCIe power-saving) and is NOT a
+        # fault; width_current < width_max is a permanent slot/riser limit.
+        # gen_max is the negotiated ceiling; gen_gpu_max / gen_host_max are
+        # what each endpoint could do, null on drivers that lack the fields.
+        "pcie": {
+            "gen_current": g.pcie_gen_current,
+            "gen_max": g.pcie_gen_max,
+            "width_current": g.pcie_width_current,
+            "width_max": g.pcie_width_max,
+            "gen_gpu_max": g.pcie_gen_gpu_max,
+            "gen_host_max": g.pcie_gen_host_max,
+        },
+    }
+
+
+def _topology_payload(topo: GpuTopology | None) -> dict[str, Any] | None:
+    """The ``topo -m`` matrix as the panel draws it. ``indices[i]`` is the GPU
+    number of row/column ``i``; cells are the legend codes verbatim ("X",
+    "NV2", "PHB", ...). null = the probe gave nothing."""
+    if topo is None:
+        return None
+    return {"indices": list(topo.indices), "matrix": [list(row) for row in topo.matrix]}
+
+
 @router.get("/api/system/gpus")
 async def system_gpus(request: Request, _user: str = Depends(require_jwt)) -> dict[str, Any]:
     """Live nvidia-smi snapshot with per-GPU memory and PID-attributed holders.
@@ -154,6 +240,25 @@ async def system_gpus(request: Request, _user: str = Depends(require_jwt)) -> di
               "memory_used_mib": 12450,
               "memory_free_mib": 3926,
               "utilization_pct": 87,
+              "compute_cap": 8.6 | null,
+              "architecture": "Ampere" | null,   # derived from compute_cap only
+              "telemetry": {            # each null = "not reported"
+                "temperature_c": 82,  "temp_slowdown_c": 100,
+                "temp_shutdown_c": 103, "temp_max_operating_c": 98,
+                "fan_pct": 80,        "power_w": 53.1,  "power_limit_w": 140.0,
+                "ecc_enabled": false, "pstate": "P2",
+                "sm_clock_mhz": 1350,  "sm_clock_max_mhz": 2100,
+                "mem_clock_mhz": 6501, "mem_clock_max_mhz": 7001,
+                "throttle": {"mask": 32, "sw_thermal": true, "hw_thermal": false,
+                             "sw_power_cap": false, "hw_slowdown": false,
+                             "hw_power_brake": false, "idle": false} | null,
+                "nvlink": {"state": "unsupported" | "inactive" | "active",
+                           "active_links": 0, "total_links": 0,
+                           "link_speed_gbs": null} | null,
+                "pcie": {"gen_current": 1, "gen_max": 3,      # gen 1 idle = normal
+                         "width_current": 4, "width_max": 16, # x4 of x16 = a limit
+                         "gen_gpu_max": 4, "gen_host_max": 4}
+              },
               "holders": [
                 {
                   "pid": 12345, "memory_mib": 12400,
@@ -172,8 +277,15 @@ async def system_gpus(request: Request, _user: str = Depends(require_jwt)) -> di
               ]
             }
           ],
+          "topology": {"indices": [0, 1, 2, 3],
+                       "matrix": [["X", "PHB", "PHB", "PHB"], ...]} | null,
           "allowed_indices": [0, 1] | null
         }
+
+    ``topology`` is the ``nvidia-smi topo -m`` matrix: ``X`` self, ``NV#`` a
+    bond of # NVLinks, and PIX / PXB / PHB / NODE / SYS all "no direct link,
+    routed through PCIe at increasing distance". null when the probe gave
+    nothing.
 
     ``allowed_indices`` is the setup wizard's GPU allowlist -- the same list
     ``POST /api/models`` enforces with a 400. It is appended, never a
@@ -226,6 +338,11 @@ async def system_gpus(request: Request, _user: str = Depends(require_jwt)) -> di
             # the candidate quant/dtype in fit-preview to warn on emulated
             # FP8 / unsupported builds.
             "compute_cap": g.compute_cap,
+            # Derived from compute_cap and nothing else: nvidia-smi has no
+            # architecture field. null = capability missing or not in the
+            # fixed map, and the panel then shows the raw number.
+            "architecture": architecture_for(g.compute_cap),
+            "telemetry": _telemetry_payload(g),
             "holders": holders,
         })
 
@@ -233,6 +350,7 @@ async def system_gpus(request: Request, _user: str = Depends(require_jwt)) -> di
         "probed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "probe_error": snap.probe_error,
         "gpus": gpus_payload,
+        "topology": _topology_payload(snap.topology),
         # The setup wizard's allowlist, so a client can stop offering GPUs that
         # POST /api/models would reject. Read from SQLite, so it survives a
         # failed probe: a box whose driver is missing still knows what it is

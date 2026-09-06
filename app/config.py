@@ -137,6 +137,19 @@ class Settings:
     chat_quota_free_floor_bytes: int = 5 * 1024**3
     chat_attachment_ttl_days: int = 90
 
+    # --- Per-request history (app/stats/request_history.py) ----------------
+    # One row per completed /v1 request, in SQLite. Pruned by age AND by row
+    # count, because either alone fails: a quiet deployment would keep a
+    # trickle forever under a count cap, and a load test at 10 req/s writes
+    # ~860k rows a day under an age cap. 30 days is four times the widest
+    # window the stats page offers (7d), so the 7d view is always served in
+    # full and a last-N latency basis still has depth when traffic is thin.
+    # At the observed thousands of requests a day that is tens of MB on the
+    # 10 GiB data volume; the row cap bounds the pathological case at ~40 MB
+    # whatever the request rate.
+    request_history_retention_days: int = 30
+    request_history_max_rows: int = 200_000
+
     @property
     def db_path(self) -> Path:
         return self.data_dir / "vllm-warden.db"
@@ -261,6 +274,12 @@ def load_settings() -> Settings:
         os.environ.get("VW_CHAT_QUOTA_FREE_FLOOR_BYTES", 5 * 1024**3)
     )
     chat_attachment_ttl_days = int(os.environ.get("VW_CHAT_ATTACHMENT_TTL_DAYS", 90))
+    request_history_retention_days = int(
+        os.environ.get("VW_REQUEST_HISTORY_RETENTION_DAYS", "30")
+    )
+    request_history_max_rows = int(
+        os.environ.get("VW_REQUEST_HISTORY_MAX_ROWS", "200000")
+    )
     return Settings(
         data_dir=data_dir,
         hf_cache_dir=hf_cache_dir,
@@ -299,4 +318,6 @@ def load_settings() -> Settings:
         chat_quota_user_bytes=chat_quota_user_bytes,
         chat_quota_free_floor_bytes=chat_quota_free_floor_bytes,
         chat_attachment_ttl_days=chat_attachment_ttl_days,
+        request_history_retention_days=request_history_retention_days,
+        request_history_max_rows=request_history_max_rows,
     )

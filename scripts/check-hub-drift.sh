@@ -30,8 +30,14 @@ tar -xzf "$WORK/bundle.tgz" -C "$WORK/b" --strip-components=1 || { echo "could n
 [ -f "$WORK/b/.env.example" ] || { echo "the Hub bundle has no .env.example" >&2; exit 2; }
 
 # Both files: names of active `VAR=` lines and, here, of commented `# VAR=`
-# knobs (the grammar .env.example's header documents).
-names() { sed -n 's/^\(# \)\{0,1\}\([A-Z_][A-Z0-9_]*\)=.*/\2/p' "$1" | sort -u; }
+# knobs (the grammar .env.example's header documents). Compose-internal names
+# are excluded on both sides: a Hub install is not driven by this repo's
+# compose file and has no reason to carry them, so their absence is not drift.
+# scripts/check-env-contract.sh skips the same two for the same reason.
+names() {
+  sed -n 's/^\(# \)\{0,1\}\([A-Z_][A-Z0-9_]*\)=.*/\2/p' "$1" \
+    | grep -vxE 'COMPOSE_PROJECT_NAME|COMPOSE_FILE' | sort -u
+}
 value() { sed -n "s/^\(# \)\{0,1\}$2=\(.*\)$/\2/p" "$1" | head -1 | sed 's/[[:space:]]*#.*$//; s/[[:space:]]*$//'; }
 
 names "$ROOT/.env.example" > "$WORK/repo.txt"

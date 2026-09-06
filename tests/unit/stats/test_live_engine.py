@@ -168,8 +168,9 @@ def test_first_frame_shape_and_derivations(reading):
     assert lat["ttft_mean"] == pytest.approx(0.34)
     assert lat["itl_p50"] == pytest.approx(0.025)
 
-    assert frame["mfu"]["flops_per_gpu_total"] == pytest.approx(1.2e15)
-    assert frame["mfu"]["mfu_estimate"] is None
+    # MFU is deleted, field and panel: mfu_estimate was a literal None stub and
+    # the FLOPs counter beside it was cumulative rendered as per-second.
+    assert "mfu" not in frame
     assert frame["finished"] == {"stop": 40210, "length": 118, "abort": 33}
 
     # State captured for next-frame rate math.

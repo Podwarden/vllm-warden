@@ -430,7 +430,7 @@ export function GodModeViewer({ className, heightPx = 560 }: GodModeViewerProps)
 
   return (
     <div className={cn("space-y-2", className)}>
-      {/* The same selection as /stats and /stats/live. God mode's own gate is
+      {/* The same selection as /stats. God mode's own gate is
           untouched — this decides only what a viewer who already has the
           stream renders. */}
       <ModelSelector models={loadedModels} selection={selection} />

@@ -21,7 +21,7 @@ from app.proxy import content_log
 from app.proxy.auth import require_bearer, token_allows
 from app.proxy.envelope_hint import enrich_5xx_from_db
 from app.proxy.reaggregate import StreamAggregator, parse_sse_event
-from app.proxy.request_registry import LiveRequest
+from app.proxy.request_registry import LiveRequest, finished_record
 from app.proxy.runaway import RunawayDetector
 
 # Aliased: the forward handler already binds a LOCAL `registry` (the Plane-B
@@ -548,6 +548,7 @@ async def _forward(request: Request, model, host: str, port: int, path: str, tok
                 token_name=token.name,
                 client_ip=_client_ip(request),
                 model=model.served_model_name,
+                model_row_id=model.id,
                 path=path,
                 prompt_tokens=prompt_tokens,
                 max_model_len=model.max_model_len,
@@ -561,6 +562,17 @@ async def _forward(request: Request, model, host: str, port: int, path: str, tok
     async def _deregister() -> None:
         if live_req is None or registry is None:
             return
+        # Record it BEFORE the registry forgets it. Duration, TTFT and finish
+        # reason exist only at this moment; until now they were discarded here,
+        # which is why the dashboard went blank the instant anything
+        # interesting ended. `record` enqueues for a background writer and
+        # never touches the DB here: this runs before the slot is released.
+        try:
+            history = getattr(request.app.state, "request_history", None)
+            if history is not None:
+                history.record(finished_record(live_req, now=time.monotonic()))
+        except Exception:  # noqa: BLE001 — bookkeeping must never fail a request
+            logger.debug("stats: could not record finished request", exc_info=True)
         try:
             await registry.deregister(live_req.id)
         except Exception:
@@ -683,6 +695,21 @@ async def _forward(request: Request, model, host: str, port: int, path: str, tok
                         ):
                             try:
                                 live_req.phase = "decode"
+                                # First frame out of the engine: this is TTFT,
+                                # and the only place every backend can be
+                                # measured the same way.
+                                if live_req.first_token_monotonic is None:
+                                    live_req.first_token_monotonic = time.monotonic()
+                            except Exception:
+                                pass
+                        # Cheap substring gate first: the hot path must not
+                        # parse JSON on every frame to learn something that
+                        # appears once, in the last one.
+                        if live_req is not None and b'"finish_reason"' in line:
+                            try:
+                                fr_seen = content_log.parse_sse_finish(line)
+                                if fr_seen:
+                                    live_req.finish_reason = fr_seen
                             except Exception:
                                 pass
                         if do_content_log:

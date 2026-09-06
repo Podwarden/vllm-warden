@@ -20,6 +20,7 @@ def _mk(**over) -> LiveRequest:
         token_name="hermes-bot",
         client_ip="10.42.5.185",
         model="qwen",
+        model_row_id="qwen",
         path="/v1/chat/completions",
         prompt_tokens=100,
         max_model_len=1000,

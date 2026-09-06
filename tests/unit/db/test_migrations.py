@@ -48,8 +48,11 @@ async def test_migrations_idempotent(tmp_data_dir):
         # _PATCHABLE_MODEL_FIELDS is derived and would make a machine-written
         # measurement hand-editable) + 0030 (stress_runs.progress: mid-run
         # phase and probe count, overwritten in place by the heartbeat, so a
-        # multi-hour run is not a blank modal).
-        assert count == 29
+        # multi-hour run is not a blank modal) + 0031 (request_history: one row
+        # per completed /v1 request -- the proxy's own TTFT and duration, so
+        # llama.cpp gets a latency panel and the requests chart honours the
+        # window instead of a 15-minute in-memory ring).
+        assert count == 30
 
 
 async def test_migrations_create_all_v2_tables(tmp_data_dir):

@@ -88,6 +88,15 @@ DRIVER version      : 550.54.15
 CUDA Version        : 12.4
 """
 
+NVIDIA_SMI_VERSION_OUT_R610 = """\
+NVIDIA-SMI version  : 610.57.04
+NVML version        : 610.57
+DRIVER version      : Deprecated, see "KMD version" instead
+CUDA version        : Deprecated, see "CUDA UMD version" instead
+KMD version         : 610.57.04
+CUDA UMD version    : 13.3
+"""
+
 OS_RELEASE_UBUNTU = """\
 PRETTY_NAME="Ubuntu 22.04.4 LTS"
 NAME="Ubuntu"
@@ -196,6 +205,59 @@ class TestParseCudaVersion:
 
     def test_missing_returns_none(self):
         assert parse_cuda_version("just some other output") is None
+
+    def test_r610_deprecated_key_reads_cuda_umd_version(self):
+        # Recorded from a 610.57.04 host: the old key is now a text sentence
+        # and the number moved under "CUDA UMD version". This is what left
+        # the panel showing "CUDA —".
+        assert parse_cuda_version(NVIDIA_SMI_VERSION_OUT_R610) == "13.3"
+
+    def test_deprecated_sentence_alone_is_none_not_garbage(self):
+        out = 'CUDA version        : Deprecated, see "CUDA UMD version" instead\n'
+        assert parse_cuda_version(out) is None
+
+    def test_plain_banner_r610(self):
+        banner = (
+            "+-----------------------------------------------------------------------+\n"
+            "| NVIDIA-SMI 610.57.04   KMD Version: 610.57.04   CUDA UMD Version: 13.3 |\n"
+        )
+        assert parse_cuda_version(banner) == "13.3"
+
+    def test_plain_banner_r550(self):
+        banner = "| NVIDIA-SMI 550.54.15    Driver Version: 550.54.15    CUDA Version: 12.4  |"
+        assert parse_cuda_version(banner) == "12.4"
+
+
+class TestCollectGpusCudaFallback:
+    def test_falls_back_to_banner_when_version_flag_fails(self, monkeypatch: pytest.MonkeyPatch):
+        """Drivers without ``--version`` exit non-zero; the banner still has it."""
+        from app.system import system_info as mod
+
+        def fake_run(args: list[str]) -> str | None:
+            if "--query-gpu" in " ".join(args):
+                return NVIDIA_SMI_GPU_CSV
+            if "--version" in args:
+                return None
+            if args == ["nvidia-smi"]:
+                return "| NVIDIA-SMI 470.57.02  Driver Version: 470.57.02  CUDA Version: 11.4 |"
+            return None
+
+        monkeypatch.setattr(mod, "_run_subprocess", fake_run)
+        gpus = mod.collect_gpus()
+        assert [g["cuda_version"] for g in gpus] == ["11.4", "11.4"]
+
+    def test_r610_version_output_end_to_end(self, monkeypatch: pytest.MonkeyPatch):
+        from app.system import system_info as mod
+
+        def fake_run(args: list[str]) -> str | None:
+            if "--query-gpu" in " ".join(args):
+                return NVIDIA_SMI_GPU_CSV
+            if "--version" in args:
+                return NVIDIA_SMI_VERSION_OUT_R610
+            raise AssertionError(f"banner fallback must not run: {args}")
+
+        monkeypatch.setattr(mod, "_run_subprocess", fake_run)
+        assert mod.collect_gpus()[0]["cuda_version"] == "13.3"
 
 
 class TestParseOsRelease:

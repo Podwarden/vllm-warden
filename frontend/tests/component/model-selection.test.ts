@@ -238,7 +238,6 @@ function engineFrame(
       itl_p50: null, itl_p99: null, tpot_p50: null,
       e2e_p50: null, e2e_p90: null, e2e_p99: null,
     },
-    mfu: null,
     finished: {},
     scrape_error: null,
     ...overrides,
@@ -289,7 +288,9 @@ describe('combineThroughput — a mixed vLLM + llama.cpp selection', () => {
     const out = combineThroughput([
       engineFrame('a'),
       engineFrame('b', {
-        engine: { ...engineFrame('b').engine, num_requests_running: 4 },
+        // engine is nullable at the type level now (a null frame); the
+        // fixture always builds one, hence the assertion.
+        engine: { ...engineFrame('b').engine!, num_requests_running: 4 },
       }),
     ]);
     expect(out.running.value).toBe(5);

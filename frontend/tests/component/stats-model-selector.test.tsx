@@ -211,10 +211,11 @@ describe("StatsPage — model selection", () => {
     });
   });
 
-  it("warns that the card metrics narrow with the selection", async () => {
-    // VRAM, GPU and power have no model dimension; gpu_samples has no model
-    // column. A narrowed reading of them is "the cards these models occupy",
-    // and a number that changed meaning has to say so.
+  it("says the host figures do NOT narrow with the selection", async () => {
+    // The settled rule on the merged page: the selection scopes tokens,
+    // latency, KV and requests. VRAM, GPU utilisation and power stay HOST
+    // figures — two engines share a card, so watts cannot be attributed to
+    // one model — and the caption says so instead of silently re-scoping.
     installFetchStub();
     renderPage();
     await waitFor(() =>
@@ -223,7 +224,7 @@ describe("StatsPage — model selection", () => {
     fireEvent.click(boxFor("m-qwen"));
     await waitFor(() =>
       expect(screen.getByTestId("stats-covering").textContent).toMatch(
-        /cards these models occupy/i,
+        /stay host figures/i,
       ),
     );
   });
@@ -245,27 +246,27 @@ describe("StatsPage — model selection", () => {
     );
   });
 
-  it("feeds the selector from the SAME response as the numbers", async () => {
-    // One request, not two. active_models is deliberately NOT narrowed by
+  it("keeps a host key unfiltered beside the scoped one, and the selector offers the fleet", async () => {
+    // The merged page holds FOUR overview keys, by design: the selected
+    // window unfiltered (host charts + the selector's own option list), the
+    // selected window scoped (tokens/tps), and the same pair at a fixed 24h
+    // for the reference lines. active_models is deliberately NOT narrowed by
     // ?models= -- the selector is built from it, so narrowing would make a
-    // deselected model impossible to re-select -- which means the filtered
-    // response still lists the whole fleet and no second endpoint or second
-    // poll is needed. A page that polled twice per tick to answer one question
-    // would also be a page where the two answers could disagree.
+    // deselected model impossible to re-select.
     const urls = installFetchStub();
     renderPage();
-    // Wait until the selection has resolved and narrowed the request.
+    // Wait until the selection has resolved and produced the scoped keys.
     await waitFor(() =>
       expect(urls.some((u) => u.includes("models="))).toBe(true),
     );
     const overviewCalls = urls.filter((u) =>
       u.startsWith("/api/stats/v2/overview"),
     );
-    // The unfiltered first paint, then the filtered one once the selection
-    // resolves. Anything more means a redundant key is being polled.
-    expect(overviewCalls.length).toBeLessThanOrEqual(2);
+    // One call per distinct key, nothing redundant.
+    expect(overviewCalls.length).toBe(new Set(overviewCalls).size);
+    // The host keys never carry a selection; the scoped keys always do.
+    expect(overviewCalls.some((u) => !u.includes("models="))).toBe(true);
     expect(overviewCalls[0]).not.toContain("models=");
-    expect(overviewCalls[overviewCalls.length - 1]).toContain("models=");
     // ...and the selector still offers the whole fleet.
     await waitFor(() =>
       expect(screen.getAllByTestId("model-selector-option")).toHaveLength(2),

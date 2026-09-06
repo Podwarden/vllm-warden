@@ -1,10 +1,13 @@
 import json
 import time
+from typing import Any
 
+import aiosqlite
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from app.auth.deps import require_jwt
 from app.db.database import open_db
+from app.stats import request_history
 
 router = APIRouter()
 
@@ -473,4 +476,231 @@ async def stats_v2_tokens_per_key(
             }
             for r in rows
         ],
+    }
+
+
+# ============================================================================
+# Per-request history -- /api/stats/v2/requests and /api/stats/v2/latency.
+#
+# Both read the request_history table (app/stats/request_history.py), which
+# the proxy feeds on every completed /v1 request. They honour the same
+# ``range`` and ``models`` rules as the other v2 endpoints, and every response
+# carries a ``coverage`` block so the page can say precisely what a window
+# covers -- "history begins 3 h ago" is a different statement from "no
+# requests in the last 24 h", and a chart that shows a narrower span than the
+# button promises, without saying so, is the failure this page was rebuilt to
+# remove.
+# ============================================================================
+
+_REQUESTS_LIMIT_DEFAULT = 2000
+_REQUESTS_LIMIT_MAX = 5000
+_LATENCY_LAST_N_DEFAULT = 500
+_LATENCY_LAST_N_MAX = 5000
+
+
+async def _validate_selection(db: aiosqlite.Connection, selected: list[str] | None) -> None:
+    """400 on an unknown model id, exactly as the overview does.
+
+    The selector is built from loaded models, so an id it cannot offer is a
+    client defect; a history row for a since-deleted model is reachable only
+    without a filter, which is the honest outcome for a model nobody can
+    select any more.
+    """
+    if selected is not None:
+        await _resolve_selection(db, selected)
+
+
+def _coverage(
+    *, earliest: float | None, since: float, retention_days: int, max_rows: int
+) -> dict[str, Any]:
+    """What the store can say about a window starting at ``since``.
+
+    ``covers_window`` is True only when history reaches back to ``since`` AND
+    the configured retention is at least as long as the window -- a 7d window
+    against a 1-day retention can never be served in full, and the page should
+    say that rather than draw one day under a "7d" heading.
+    """
+    window_s = max(0.0, time.time() - since)
+    retention_ok = retention_days * 86400.0 >= window_s
+    reaches_back = earliest is not None and earliest <= since
+    return {
+        "earliest_epoch": earliest,
+        "retention_days": retention_days,
+        "max_rows": max_rows,
+        "covers_window": bool(retention_ok and reaches_back),
+    }
+
+
+@router.get("/api/stats/v2/requests")
+async def stats_v2_requests(
+    request: Request,
+    range: str = "1h",
+    models: str | None = None,
+    limit: int = _REQUESTS_LIMIT_DEFAULT,
+    _user: str = Depends(require_jwt),
+) -> dict[str, Any]:
+    """Completed requests in the window, newest first, for the requests chart.
+
+    Returns:
+      {
+        "range": "1h",
+        "since_epoch": float,
+        "now_epoch": float,
+        "selected_model_ids": [str, ...] | None,
+        "total": int,          # rows in the window for the selection
+        "stride": int,         # 1 = every row; k = every k-th row (see below)
+        "requests": [ {finished_record fields + finished_at}, ... ],
+        "coverage": {
+          "earliest_epoch": float | None,   # when history begins, store-wide
+          "retention_days": int,
+          "max_rows": int,
+          "covers_window": bool,
+        },
+      }
+
+    ``limit`` caps the rows returned (default 2000, max 5000). When the window
+    holds more, every k-th row is returned rather than the newest ``limit``:
+    the chart has a TIME axis, and a newest-N cut would leave its left side
+    empty while the heading claimed the whole window. ``stride`` says which k,
+    and ``total`` says how many rows the window really holds.
+    """
+    _validate_range(range)
+    since = time.time() - _RANGE_TO_MINUTES[range] * 60.0
+    settings = request.app.state.settings
+    selected = _parse_models(models)
+    limit = max(1, min(int(limit), _REQUESTS_LIMIT_MAX))
+    async with open_db(settings.db_path) as db:
+        await _validate_selection(db, selected)
+        window = await request_history.query_window(
+            db, since=since, model_ids=selected, limit=limit
+        )
+        earliest = await request_history.earliest_finished_at(db)
+    return {
+        "range": range,
+        "since_epoch": since,
+        "now_epoch": time.time(),
+        "selected_model_ids": selected,
+        "total": window.total,
+        "stride": window.stride,
+        "requests": window.rows,
+        "coverage": _coverage(
+            earliest=earliest,
+            since=since,
+            retention_days=int(settings.request_history_retention_days),
+            max_rows=int(settings.request_history_max_rows),
+        ),
+    }
+
+
+@router.get("/api/stats/v2/latency")
+async def stats_v2_latency(
+    request: Request,
+    range: str = "1h",
+    models: str | None = None,
+    basis: str = "window",
+    n: int = _LATENCY_LAST_N_DEFAULT,
+    _user: str = Depends(require_jwt),
+) -> dict[str, Any]:
+    """TTFT, per-request mean ITL and duration distributions from the store.
+
+    Two bases, and the response says which:
+
+      basis=window   every request that finished inside ``range``. The same
+                     scope as the rest of the page.
+      basis=last     the newest ``n`` requests regardless of time (default
+                     500, max 5000). A fixed count does not go silent when
+                     traffic is thin, which makes it the better statistic for
+                     latency on a quiet deployment; ``span_s`` says how far
+                     back those ``n`` reach so the page can state it.
+
+    All three series are the PROXY's measurements, identical for every
+    backend. ``itl`` is the mean inter-token gap of each request -- a
+    per-request statistic, not the engine's per-token histogram -- and is
+    labelled that way wherever it is shown. Quantiles are exact, from the
+    samples; ``buckets`` use vLLM's own edges (e2e for duration) in the
+    engine-histogram wire shape so the existing renderer draws them.
+
+    Returns:
+      {
+        "basis": "window" | "last", "range": str, "n": int | None,
+        "since_epoch": float | None,     # window basis only
+        "selected_model_ids": [...] | None,
+        "count": int, "span_s": float | None,
+        "oldest_epoch": float | None, "newest_epoch": float | None,
+        "ttft": Dist, "itl": Dist, "duration": Dist,
+        "coverage": {... as /api/stats/v2/requests ...},
+      }
+      Dist = {"count", "p50", "p90", "p99", "mean",
+              "buckets": {"le": [..., null], "counts": [...cumulative],
+                          "count", "sum"}}
+    """
+    _validate_range(range)
+    if basis not in ("window", "last"):
+        raise HTTPException(
+            status_code=400, detail=f"invalid basis '{basis}'; allowed: ['last', 'window']"
+        )
+    n = max(1, min(int(n), _LATENCY_LAST_N_MAX))
+    since = time.time() - _RANGE_TO_MINUTES[range] * 60.0
+    settings = request.app.state.settings
+    selected = _parse_models(models)
+    async with open_db(settings.db_path) as db:
+        await _validate_selection(db, selected)
+        if basis == "window":
+            # No row cap here: the distribution must be over EVERY request in
+            # the window, not a sample of it. Four columns a row keeps a full
+            # 7d at the retention cap well under a second.
+            rows = await request_history.query_window_latency(
+                db, since=since, model_ids=selected
+            )
+        else:
+            rows = await request_history.query_last(db, n=n, model_ids=selected)
+        earliest = await request_history.earliest_finished_at(db)
+    summary = request_history.latency_summary(rows)
+    return {
+        "basis": basis,
+        "range": range,
+        "n": n if basis == "last" else None,
+        "since_epoch": since if basis == "window" else None,
+        "selected_model_ids": selected,
+        **summary,
+        "coverage": _coverage(
+            earliest=earliest,
+            since=since,
+            retention_days=int(settings.request_history_retention_days),
+            max_rows=int(settings.request_history_max_rows),
+        ),
+    }
+
+
+@router.get("/api/stats/live/finished")
+async def stats_live_finished(
+    request: Request,
+    models: str | None = None,
+    limit: int = 50,
+    _user: str = Depends(require_jwt),
+) -> dict[str, Any]:
+    """Requests that have COMPLETED, newest first. Superseded.
+
+    Kept for a UI image older than this API: ui and api ship separately, and
+    the previous stats page polls this for its finished table. It now reads
+    the persisted store, so ``retained_seconds`` is the configured retention
+    rather than the old ring's 15 minutes. New code reads
+    ``/api/stats/v2/requests``, which carries the window and its coverage.
+
+    ``models`` follows the same absent/empty rules as every other stats
+    endpoint: absent means the whole deployment, empty is a client defect and
+    a 400.
+    """
+    selection = _parse_models(models)
+    settings = request.app.state.settings
+    if getattr(request.app.state, "request_history", None) is None:
+        # A build without the store answers honestly rather than 500ing.
+        return {"requests": [], "retained_seconds": 0, "available": False}
+    limit = max(1, min(int(limit), 200))
+    async with open_db(settings.db_path) as db:
+        rows = await request_history.query_last(db, n=limit, model_ids=selection)
+    return {
+        "requests": rows,
+        "retained_seconds": int(settings.request_history_retention_days) * 86400,
+        "available": True,
     }

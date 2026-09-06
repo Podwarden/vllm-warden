@@ -55,6 +55,29 @@ export interface LiveCache {
   external_prefix_hit_rate_cumulative: number | null;
 }
 
+/**
+ * One engine histogram, as cumulative-since-engine-start buckets.
+ *
+ * `le: null` encodes +Inf (JSON has no infinity, and dropping the bucket would
+ * discard the whole tail). `counts` are cumulative along the boundaries. A
+ * missing histogram is `null` at the parent — llama.cpp reports none at all,
+ * and zeros would render as a distribution in which every request was
+ * instantaneous.
+ */
+export interface HistogramBuckets {
+  le: (number | null)[];
+  counts: number[];
+  count: number | null;
+  sum: number | null;
+}
+
+export interface LatencyBuckets {
+  ttft: HistogramBuckets | null;
+  itl: HistogramBuckets | null;
+  tpot: HistogramBuckets | null;
+  e2e: HistogramBuckets | null;
+}
+
 export interface LiveLatency {
   ttft_p50: number | null;
   ttft_p90: number | null;
@@ -66,12 +89,8 @@ export interface LiveLatency {
   e2e_p50: number | null;
   e2e_p90: number | null;
   e2e_p99: number | null;
-}
-
-export interface LiveMfu {
-  flops_per_gpu_total: number | null;
-  /** Model FLOPs Utilization 0..1, or null if the formula isn't wired yet. */
-  mfu_estimate: number | null;
+  /** Optional at the type level for ui/api rollout skew. */
+  buckets?: LatencyBuckets | null;
 }
 
 export interface LiveEngineFrame {
@@ -88,13 +107,24 @@ export interface LiveEngineFrame {
   backend: string | null;
   /** From the model row / engine — the denominator for context bars. */
   max_model_len: number | null;
-  engine: LiveEngine;
-  throughput: LiveThroughput;
-  cache: LiveCache;
-  latency: LiveLatency;
-  mfu: LiveMfu | null;
-  /** request_success_total{finished_reason} → count. */
-  finished: Record<string, number>;
+  /**
+   * NULL on a null frame, and the type says so. `_null_frame` on the backend
+   * emits `engine`/`throughput`/`cache`/`latency`/`finished` as JSON null
+   * while keeping `model_id`, so a scrape error produces a block that reaches
+   * the per-model render path. The old page's types declared these
+   * non-nullable, which was false, and `EngineHero` dereferenced
+   * `frame.engine.kv_cache_usage_perc` unguarded — a scrape error could crash
+   * the whole page. Widening the types makes TypeScript point at every render
+   * site that needs the guard.
+   */
+  engine: LiveEngine | null;
+  throughput: LiveThroughput | null;
+  cache: LiveCache | null;
+  latency: LiveLatency | null;
+  /** request_success_total{finished_reason} → count. Values are null when the
+   *  engine does not report that counter; the whole map is null on a null
+   *  frame. */
+  finished: Record<string, number | null> | null;
   /** Non-null string when the /metrics scrape failed this tick. */
   scrape_error: string | null;
   /**

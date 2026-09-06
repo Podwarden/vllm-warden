@@ -197,6 +197,18 @@ async def lifespan(app: FastAPI):
 
     app.state.request_registry = RequestRegistry()
 
+    # Requests that have COMPLETED. The registry holds only in-flight ones and
+    # drops each in the streaming `finally`, taking its duration, TTFT and
+    # finish reason with it. They go to SQLite (request_history) through a
+    # queue: the proxy enqueues from `_deregister` and never touches the DB
+    # on the slot-release path; the writer task below drains in batches. This
+    # replaced an in-memory ring that kept 15 minutes and died with the
+    # process -- see app/stats/request_history.py for why.
+    from app.stats.request_history import RequestHistoryStore
+
+    request_history = RequestHistoryStore(settings.db_path)
+    app.state.request_history = request_history
+
     from app.runtime.stats_pruner import run_pruner_forever
     from app.runtime.stats_sampler import run_sampler_forever
     from app.runtime.watchdog import run_watchdog_forever
@@ -204,6 +216,7 @@ async def lifespan(app: FastAPI):
     sampler_task = asyncio.create_task(run_sampler_forever(settings))
     pruner_task = asyncio.create_task(run_pruner_forever(settings))
     watchdog_task = asyncio.create_task(run_watchdog_forever(settings, app.state))
+    history_task = asyncio.create_task(request_history.run_forever())
 
     # Chat2 (2026-08-23) — orphan/TTL/LRU collector for attachments (spec §3).
     # Same "log and keep going" shape as the other background loops above.
@@ -219,11 +232,15 @@ async def lifespan(app: FastAPI):
         pruner_task.cancel()
         watchdog_task.cancel()
         gc_task.cancel()
+        # The history writer flushes what is queued on cancellation, so a
+        # request that finished a moment before shutdown is not lost.
+        history_task.cancel()
         await asyncio.gather(
             sampler_task,
             pruner_task,
             watchdog_task,
             gc_task,
+            history_task,
             return_exceptions=True,
         )
 

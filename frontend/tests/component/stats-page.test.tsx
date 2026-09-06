@@ -215,15 +215,17 @@ describe("StatsPage", () => {
     expect(rows[1].textContent).toContain("orphan");
   });
 
-  it("renders the four chart panels", async () => {
+  it("renders the three host chart panels and no VRAM-over-time chart", async () => {
     installFetchStub({ overview: FIXTURE_OVERVIEW });
     renderPage();
     await waitFor(() => {
-      expect(screen.getByTestId("chart-vram")).toBeInTheDocument();
+      expect(screen.getByTestId("chart-util")).toBeInTheDocument();
     });
-    expect(screen.getByTestId("chart-util")).toBeInTheDocument();
     expect(screen.getByTestId("chart-power")).toBeInTheDocument();
     expect(screen.getByTestId("chart-tokens")).toBeInTheDocument();
+    // VRAM is a step function (pre-allocated at load) — its chart was a flat
+    // block and is gone; current VRAM lives on the per-GPU cards instead.
+    expect(screen.queryByTestId("chart-vram")).toBeNull();
   });
 
   it("persists the range selection to localStorage under 'vw.stats.range'", async () => {

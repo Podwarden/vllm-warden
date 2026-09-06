@@ -2,9 +2,13 @@
 
 Sub-project C splits app/stats/live_engine.py's 31 hard-coded ``vllm:`` metric
 names out of build_frame() so a second backend can supply its own. The frame
-that comes out the other side is the dashboard's contract -- eleven panels in
-frontend/src/app/stats/live/page.tsx read it field by field -- so the split has
-to be provably shape-preserving, not argued to be.
+that comes out the other side is the dashboard's contract -- the merged stats
+page (frontend/src/app/stats/page.tsx) reads it field by field -- so the split
+has to be provably shape-preserving, not argued to be.
+
+The golden was regenerated once after that split, when the ``mfu`` block was
+deleted (panel and field together -- the estimate was a literal None stub and
+the FLOPs counter was cumulative rendered as per-second).
 
 Two cases, because build_frame has two modes: prev=None (the first frame after a
 connection opens, where every rate is null) and prev=<snapshot> (the steady
@@ -70,7 +74,36 @@ def _frames() -> dict:
         # Added by Task 4; asserted separately below so the golden written
         # before the split stays byte-for-byte valid after it.
         f.pop("backend")
+        # Same treatment for the raw latency buckets: regenerating the golden
+        # to absorb one added key would silently rebaseline every other value
+        # it pins, which is the one thing a characterisation test must not do.
+        if f.get("latency"):
+            f["latency"].pop("buckets", None)
     return {"first_frame": first, "rate_frame": rated}
+
+
+def test_the_frame_carries_the_raw_latency_buckets():
+    """Emitted alongside the quantiles, not instead of them.
+
+    TTFT is bimodal by construction -- prefix-cache hit against cold prefill --
+    so a single percentile lands in the valley between the two humps and
+    describes a request that never happened. The buckets let the client draw
+    what was actually measured.
+    """
+    reading = VllmBackend().parse_metrics(METRICS_TXT.read_text())
+    frame, _ = build_frame(
+        reading, model="m", model_id="mid", max_model_len=None,
+        prev=None, scrape_monotonic=NOW,
+    )
+    buckets = frame["latency"]["buckets"]
+    assert set(buckets) == {"ttft", "itl", "tpot", "e2e"}
+    ttft = buckets["ttft"]
+    assert len(ttft["le"]) == len(ttft["counts"])
+    # Cumulative, so counts never decrease along the boundaries.
+    assert ttft["counts"] == sorted(ttft["counts"])
+    # +Inf is encoded as null: JSON has no infinity, and dropping that bucket
+    # would discard the whole tail.
+    assert ttft["le"][-1] is None
 
 
 def test_frame_carries_the_backend_name():

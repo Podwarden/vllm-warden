@@ -873,6 +873,130 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/stats/v2/requests": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Stats V2 Requests
+         * @description Completed requests in the window, newest first, for the requests chart.
+         *
+         *     Returns:
+         *       {
+         *         "range": "1h",
+         *         "since_epoch": float,
+         *         "now_epoch": float,
+         *         "selected_model_ids": [str, ...] | None,
+         *         "total": int,          # rows in the window for the selection
+         *         "stride": int,         # 1 = every row; k = every k-th row (see below)
+         *         "requests": [ {finished_record fields + finished_at}, ... ],
+         *         "coverage": {
+         *           "earliest_epoch": float | None,   # when history begins, store-wide
+         *           "retention_days": int,
+         *           "max_rows": int,
+         *           "covers_window": bool,
+         *         },
+         *       }
+         *
+         *     ``limit`` caps the rows returned (default 2000, max 5000). When the window
+         *     holds more, every k-th row is returned rather than the newest ``limit``:
+         *     the chart has a TIME axis, and a newest-N cut would leave its left side
+         *     empty while the heading claimed the whole window. ``stride`` says which k,
+         *     and ``total`` says how many rows the window really holds.
+         */
+        get: operations["stats_v2_requests_api_stats_v2_requests_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/stats/v2/latency": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Stats V2 Latency
+         * @description TTFT, per-request mean ITL and duration distributions from the store.
+         *
+         *     Two bases, and the response says which:
+         *
+         *       basis=window   every request that finished inside ``range``. The same
+         *                      scope as the rest of the page.
+         *       basis=last     the newest ``n`` requests regardless of time (default
+         *                      500, max 5000). A fixed count does not go silent when
+         *                      traffic is thin, which makes it the better statistic for
+         *                      latency on a quiet deployment; ``span_s`` says how far
+         *                      back those ``n`` reach so the page can state it.
+         *
+         *     All three series are the PROXY's measurements, identical for every
+         *     backend. ``itl`` is the mean inter-token gap of each request -- a
+         *     per-request statistic, not the engine's per-token histogram -- and is
+         *     labelled that way wherever it is shown. Quantiles are exact, from the
+         *     samples; ``buckets`` use vLLM's own edges (e2e for duration) in the
+         *     engine-histogram wire shape so the existing renderer draws them.
+         *
+         *     Returns:
+         *       {
+         *         "basis": "window" | "last", "range": str, "n": int | None,
+         *         "since_epoch": float | None,     # window basis only
+         *         "selected_model_ids": [...] | None,
+         *         "count": int, "span_s": float | None,
+         *         "oldest_epoch": float | None, "newest_epoch": float | None,
+         *         "ttft": Dist, "itl": Dist, "duration": Dist,
+         *         "coverage": {... as /api/stats/v2/requests ...},
+         *       }
+         *       Dist = {"count", "p50", "p90", "p99", "mean",
+         *               "buckets": {"le": [..., null], "counts": [...cumulative],
+         *                           "count", "sum"}}
+         */
+        get: operations["stats_v2_latency_api_stats_v2_latency_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/stats/live/finished": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Stats Live Finished
+         * @description Requests that have COMPLETED, newest first. Superseded.
+         *
+         *     Kept for a UI image older than this API: ui and api ship separately, and
+         *     the previous stats page polls this for its finished table. It now reads
+         *     the persisted store, so ``retained_seconds`` is the configured retention
+         *     rather than the old ring's 15 minutes. New code reads
+         *     ``/api/stats/v2/requests``, which carries the window and its coverage.
+         *
+         *     ``models`` follows the same absent/empty rules as every other stats
+         *     endpoint: absent means the whole deployment, empty is a client defect and
+         *     a 400.
+         */
+        get: operations["stats_live_finished_api_stats_live_finished_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/stats/live": {
         parameters: {
             query?: never;
@@ -1236,6 +1360,25 @@ export interface paths {
          *               "memory_used_mib": 12450,
          *               "memory_free_mib": 3926,
          *               "utilization_pct": 87,
+         *               "compute_cap": 8.6 | null,
+         *               "architecture": "Ampere" | null,   # derived from compute_cap only
+         *               "telemetry": {            # each null = "not reported"
+         *                 "temperature_c": 82,  "temp_slowdown_c": 100,
+         *                 "temp_shutdown_c": 103, "temp_max_operating_c": 98,
+         *                 "fan_pct": 80,        "power_w": 53.1,  "power_limit_w": 140.0,
+         *                 "ecc_enabled": false, "pstate": "P2",
+         *                 "sm_clock_mhz": 1350,  "sm_clock_max_mhz": 2100,
+         *                 "mem_clock_mhz": 6501, "mem_clock_max_mhz": 7001,
+         *                 "throttle": {"mask": 32, "sw_thermal": true, "hw_thermal": false,
+         *                              "sw_power_cap": false, "hw_slowdown": false,
+         *                              "hw_power_brake": false, "idle": false} | null,
+         *                 "nvlink": {"state": "unsupported" | "inactive" | "active",
+         *                            "active_links": 0, "total_links": 0,
+         *                            "link_speed_gbs": null} | null,
+         *                 "pcie": {"gen_current": 1, "gen_max": 3,      # gen 1 idle = normal
+         *                          "width_current": 4, "width_max": 16, # x4 of x16 = a limit
+         *                          "gen_gpu_max": 4, "gen_host_max": 4}
+         *               },
          *               "holders": [
          *                 {
          *                   "pid": 12345, "memory_mib": 12400,
@@ -1254,8 +1397,15 @@ export interface paths {
          *               ]
          *             }
          *           ],
+         *           "topology": {"indices": [0, 1, 2, 3],
+         *                        "matrix": [["X", "PHB", "PHB", "PHB"], ...]} | null,
          *           "allowed_indices": [0, 1] | null
          *         }
+         *
+         *     ``topology`` is the ``nvidia-smi topo -m`` matrix: ``X`` self, ``NV#`` a
+         *     bond of # NVLinks, and PIX / PXB / PHB / NODE / SYS all "no direct link,
+         *     routed through PCIe at increasing distance". null when the probe gave
+         *     nothing.
          *
          *     ``allowed_indices`` is the setup wizard's GPU allowlist -- the same list
          *     ``POST /api/models`` enforces with a 400. It is appended, never a
@@ -3780,6 +3930,111 @@ export interface operations {
                 };
                 content: {
                     "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    stats_v2_requests_api_stats_v2_requests_get: {
+        parameters: {
+            query?: {
+                range?: string;
+                models?: string | null;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    stats_v2_latency_api_stats_v2_latency_get: {
+        parameters: {
+            query?: {
+                range?: string;
+                models?: string | null;
+                basis?: string;
+                n?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    stats_live_finished_api_stats_live_finished_get: {
+        parameters: {
+            query?: {
+                models?: string | null;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
                 };
             };
             /** @description Validation Error */

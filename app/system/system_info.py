@@ -157,6 +157,7 @@ _NVIDIA_SMI_QUERY = [
     "--format=csv,noheader,nounits",
 ]
 _NVIDIA_SMI_VERSION = ["nvidia-smi", "--version"]
+_NVIDIA_SMI_BANNER = ["nvidia-smi"]
 
 
 def parse_nvidia_smi_gpus(stdout: str, cuda_version: str | None) -> list[dict[str, Any]]:
@@ -195,17 +196,30 @@ def parse_nvidia_smi_gpus(stdout: str, cuda_version: str | None) -> list[dict[st
     return out
 
 
-_CUDA_VERSION_RE = re.compile(r"CUDA Version\s*[:=]\s*([0-9]+\.[0-9]+(?:\.[0-9]+)?)")
+# Matches "CUDA Version : 12.4" (R550 and earlier) AND "CUDA UMD version : 13.3"
+# (R610+). Case-insensitive because R610 lower-cased "version", and the value
+# group demands digits so the R610 line
+#     CUDA version : Deprecated, see "CUDA UMD version" instead
+# is skipped over rather than captured. That deprecated line is exactly why
+# the panel showed "CUDA —" on the 610.57 host: the old pattern wanted
+# "CUDA Version" with a capital V followed by a number, and R610 prints
+# neither.
+_CUDA_VERSION_RE = re.compile(
+    r"CUDA(?:\s+UMD)?\s+version\s*[:=]\s*([0-9]+\.[0-9]+(?:\.[0-9]+)?)",
+    re.IGNORECASE,
+)
 
 
 def parse_cuda_version(stdout: str) -> str | None:
-    """Extract CUDA toolkit version from ``nvidia-smi --version`` output.
+    """Extract the driver's CUDA version from ``nvidia-smi --version`` (or the
+    plain ``nvidia-smi`` banner — same line, same regex).
 
-    The format has shifted between driver releases — current shape is
-    ``CUDA Version : 12.4`` on its own line, but older drivers emit
-    ``CUDA Version: 11.8`` (no space before colon) and some virtualised
-    drivers omit the line entirely. We regex-match liberally and return
-    ``None`` if no match — caller surfaces "unknown" rather than crashing.
+    The format has shifted between driver releases: ``CUDA Version : 12.4``
+    through R550, ``CUDA Version: 11.8`` (no space) on older builds, and
+    from R610 ``CUDA UMD version : 13.3`` with the old key deprecated to a
+    text sentence. Some virtualised drivers omit the line entirely. We
+    match liberally and return ``None`` if nothing numeric is found —
+    caller surfaces "not reported" rather than crashing.
     """
     m = _CUDA_VERSION_RE.search(stdout)
     return m.group(1) if m else None
@@ -254,6 +268,11 @@ def collect_gpus() -> list[dict[str, Any]]:
         return []
     version_out = _run_subprocess(_NVIDIA_SMI_VERSION) or ""
     cuda_version = parse_cuda_version(version_out)
+    if cuda_version is None:
+        # Drivers that predate ``--version`` exit non-zero on it; the plain
+        # banner has carried "CUDA Version: X.Y" for a decade, so read that
+        # before giving up.
+        cuda_version = parse_cuda_version(_run_subprocess(_NVIDIA_SMI_BANNER) or "")
     return parse_nvidia_smi_gpus(query_out, cuda_version)
 
 

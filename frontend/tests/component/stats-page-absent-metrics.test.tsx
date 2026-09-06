@@ -1,93 +1,37 @@
 // A metric the engine does not report must never render as 0.
 //
-// Design spec §9.3: a user who reads past a degradation and acts on it has been
-// actively misled. "0% KV usage" says *plenty of headroom*; "0 tok/s" says *the
-// engine is idle*. For llama.cpp both are false -- the truth is "this engine is
-// silent about that" -- and an operator who trusts either has been given a
-// confidently precise wrong answer.
+// Design spec §9.3: a user who reads past a degradation and acts on it has
+// been actively misled. "0% KV usage" says *plenty of headroom*; "0 tok/s"
+// says *the engine is idle*. For llama.cpp both are false — the truth is
+// "this engine is silent about that" — and an operator who trusts either has
+// been given a confidently precise wrong answer.
 //
-// The MFU panel already had the right shape: a "Not reported" empty state that
-// names the engine. This pins that the KV panel, the throughput headline, the
-// running/waiting counts and the sleep-state chip all behave the same way, and
-// that a vLLM frame is unchanged.
+// Originally written against /stats/live; retargeted at the merged /stats
+// page, which inherits every one of these obligations: the per-model KV row,
+// the combined throughput figure, the sleep-state chip and the latency
+// panels all say "not reported" (naming the engine) rather than zero.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, cleanup } from "@testing-library/react";
-import { SWRConfig } from "swr";
+import { screen, cleanup, waitFor } from "@testing-library/react";
+import { setAccessToken, setCsrfToken } from "@/lib/auth-fetch";
 
-const mockState = { status: "connected", frame: null as unknown, errorCode: null };
+vi.mock("@/lib/live-stats-stream", async (orig) => {
+  const actual = await orig<typeof import("@/lib/live-stats-stream")>();
+  const { mockStream } = await import("./stats-merged-stream");
+  return { ...actual, useLiveStats: () => mockStream.state };
+});
 
-vi.mock("@/lib/live-stats-stream", () => ({
-  useLiveStats: () => mockState,
-}));
+import {
+  FakeResizeObserver,
+  SILENT_LLAMACPP,
+  block,
+  frameWith,
+  installFetchStub,
+  renderPage,
+  setFrame,
+} from "./stats-merged-harness";
 
-class FakeResizeObserver {
-  observe() {}
-  unobserve() {}
-  disconnect() {}
-}
-vi.stubGlobal("ResizeObserver", FakeResizeObserver);
-
-import LiveStatsPage from "@/app/stats/live/page";
-
-const EMPTY_REQUESTS = {
-  ts: "2026-09-01T00:00:00Z",
-  requests: [],
-  by_token: [],
-  by_ip: [],
-  totals: { requests: 0, context_tokens: 0, prompt_tokens: 0, completion_tokens: 0 },
-};
-
-// Six numbers present, the rest null because llama.cpp does not report them.
-const LLAMACPP_FRAME = {
-  ts: "2026-09-01T00:00:00Z",
-  model: "qwen",
-  model_id: "m1",
-  backend: "llamacpp",
-  max_model_len: 8192,
-  engine: {
-    num_requests_running: 1,
-    num_requests_waiting: 0,
-    waiting_by_reason: { capacity: null, deferred: null },
-    kv_cache_usage_perc: null,
-    kv_tokens_used: null,
-    kv_tokens_total: null,
-    engine_sleep_state: null,
-    preemptions_total: null,
-    preemptions_per_s: null,
-  },
-  throughput: {
-    prompt_tokens_per_s: null,
-    generation_tokens_per_s: null,
-    prompt_tokens_total: 120,
-    generation_tokens_total: 34,
-  },
-  cache: {
-    prefix_hit_rate: null,
-    prefix_hit_rate_cumulative: 0.25,
-    mm_hit_rate_cumulative: null,
-    external_prefix_hit_rate_cumulative: null,
-  },
-  latency: {
-    ttft_p50: null,
-    ttft_p90: null,
-    ttft_p99: null,
-    ttft_mean: null,
-    itl_p50: null,
-    itl_p99: null,
-    tpot_p50: null,
-    e2e_p50: null,
-    e2e_p90: null,
-    e2e_p99: null,
-  },
-  mfu: { flops_per_gpu_total: null, mfu_estimate: null },
-  finished: { stop: null, length: null, abort: null },
-  scrape_error: null,
-};
-
-const VLLM_FRAME = {
-  ...LLAMACPP_FRAME,
-  backend: "vllm",
+const VLLM = block("model-a-8b", {
   engine: {
     num_requests_running: 3,
     num_requests_waiting: 2,
@@ -105,68 +49,105 @@ const VLLM_FRAME = {
     prompt_tokens_total: 1000000,
     generation_tokens_total: 500000,
   },
-};
-
-function renderWithFrame(frame: unknown) {
-  mockState.frame = frame;
-  return render(
-    <SWRConfig
-      value={{
-        provider: () => new Map(),
-        dedupingInterval: 0,
-        revalidateOnFocus: false,
-        revalidateOnReconnect: false,
-        fetcher: async () => EMPTY_REQUESTS,
-      }}
-    >
-      <LiveStatsPage />
-    </SWRConfig>,
-  );
-}
-
-beforeEach(() => {
-  mockState.frame = null;
 });
-afterEach(() => cleanup());
 
-describe("live stats with a backend that reports fewer metrics", () => {
-  it("renders absent KV usage as not-reported, never as 0%", () => {
-    renderWithFrame(LLAMACPP_FRAME);
-    expect(screen.queryByText("0%")).toBeNull();
+describe("merged stats with a backend that reports fewer metrics", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+    setAccessToken("test-jwt", 900);
+    setCsrfToken("test-csrf");
+    vi.stubGlobal("ResizeObserver", FakeResizeObserver);
+    installFetchStub();
+  });
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it("renders absent KV usage as not-reported, never as 0%", async () => {
+    setFrame(frameWith([SILENT_LLAMACPP]));
+    renderPage();
+    await waitFor(() =>
+      expect(screen.getByTestId("kv-usage")).toBeInTheDocument(),
+    );
     expect(screen.getByTestId("kv-usage").textContent ?? "").toMatch(
-      /not reported|—/i,
+      /not reported/i,
+    );
+    expect(screen.queryByText("0%")).toBeNull();
+  });
+
+  it("names the engine that is silent", async () => {
+    setFrame(frameWith([SILENT_LLAMACPP]));
+    renderPage();
+    await waitFor(() =>
+      expect(screen.getAllByText(/llama\.cpp/i).length).toBeGreaterThan(0),
     );
   });
 
-  it("renders absent throughput as a dash, never as 0", () => {
-    renderWithFrame(LLAMACPP_FRAME);
-    expect(screen.getByTestId("gen-tps").textContent).toBe("—");
-    expect(screen.getByTestId("prompt-tps").textContent ?? "").toContain("—");
+  it("gives a llama.cpp model latency distributions from the proxy's own measurements", async () => {
+    // llama.cpp reports NO histograms. The distributions no longer come from
+    // the engine: TTFT and duration are measured by the proxy for every
+    // backend and persisted, so a GGUF model gets the panels rather than
+    // "not reported" — and never a distribution invented from zeros.
+    setFrame(frameWith([SILENT_LLAMACPP]));
+    renderPage();
+    await waitFor(() =>
+      expect(screen.getByTestId("ttft-histogram")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("itl-histogram")).toBeInTheDocument();
+    expect(screen.getByTestId("duration-histogram")).toBeInTheDocument();
+    expect(screen.getByTestId("ttft-panel").textContent).not.toMatch(/not reported/i);
+    expect(screen.getByTestId("latency-section").textContent).toMatch(/proxy-measured/i);
   });
 
-  it("never prints the string 'null'", () => {
-    const { container } = renderWithFrame(LLAMACPP_FRAME);
+  it("does not render '0 tok/s' for an engine that publishes no rate", async () => {
+    setFrame(frameWith([SILENT_LLAMACPP]));
+    renderPage();
+    await waitFor(() =>
+      expect(screen.getByTestId("timeline-panel")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("timeline-panel").textContent).not.toMatch(
+      /\b0 tok\/s now/,
+    );
+  });
+
+  it("never prints the string 'null'", async () => {
+    setFrame(frameWith([SILENT_LLAMACPP]));
+    const { container } = renderPage();
+    await waitFor(() =>
+      expect(screen.getByTestId("kv-usage")).toBeInTheDocument(),
+    );
     expect(container.textContent ?? "").not.toMatch(/\bnull\b/);
   });
 
-  it("names the engine that is silent", () => {
-    renderWithFrame(LLAMACPP_FRAME);
-    expect(screen.getAllByText(/llama\.cpp/i).length).toBeGreaterThan(0);
-  });
-
-  it("renders an absent sleep state as a dash, not 'sleep null'", () => {
-    const { container } = renderWithFrame(LLAMACPP_FRAME);
+  it("renders an absent sleep state as a dash, not 'sleep null'", async () => {
+    setFrame(frameWith([SILENT_LLAMACPP]));
+    const { container } = renderPage();
+    await waitFor(() =>
+      expect(screen.getByTestId("kv-usage")).toBeInTheDocument(),
+    );
     expect(container.textContent ?? "").not.toContain("sleep null");
   });
 
-  it("still renders a vLLM frame exactly as before", () => {
-    renderWithFrame(VLLM_FRAME);
+  it("still renders a vLLM frame exactly as before", async () => {
+    setFrame(frameWith([VLLM]));
+    renderPage();
+    await waitFor(() =>
+      expect(screen.getByTestId("kv-usage")).toBeInTheDocument(),
+    );
     expect(screen.getByTestId("kv-usage").textContent ?? "").toContain("50%");
-    expect(screen.getByTestId("gen-tps").textContent ?? "").not.toBe("—");
+    // The reported rate reaches the combined figure in the timeline heading.
+    expect(screen.getByTestId("timeline-panel").textContent).toContain(
+      "50 tok/s now",
+    );
   });
 
-  it("keeps the sleep-state chip for a vLLM frame", () => {
-    const { container } = renderWithFrame(VLLM_FRAME);
+  it("keeps the sleep-state chip for a vLLM frame", async () => {
+    setFrame(frameWith([VLLM]));
+    const { container } = renderPage();
+    await waitFor(() =>
+      expect(screen.getByTestId("kv-usage")).toBeInTheDocument(),
+    );
     expect(container.textContent ?? "").toContain("awake");
   });
 });

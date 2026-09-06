@@ -57,6 +57,7 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, Request
@@ -82,7 +83,6 @@ from app.utils.sse import sse_headers
 
 router = APIRouter(prefix="/api/stats", tags=["stats-live"])
 
-
 # --------------------------------------------------------------------------- #
 # Cadence / cache tuning
 # --------------------------------------------------------------------------- #
@@ -100,7 +100,6 @@ def _interval_seconds() -> float:
         return 2.0
     return max(0.5, v)
 
-
 # SSE keepalive cadence — same rationale as the header stream. With the default
 # 2s emit interval this never fires; it covers an operator who bumps the emit
 # interval up for a quiet dashboard.
@@ -114,28 +113,23 @@ STATS_LIVE_CACHE_TTL_S: float = 1.5
 # slow scrape should surface as scrape_error, not stall the whole stream.
 SCRAPE_TIMEOUT_S: float = 5.0
 
-
 def _pct(hist, q: float) -> float | None:
     if hist is None:
         return None
     buckets, _sum, _count = hist
     return hist_quantile(buckets, q)
 
-
 def _ratio(num: float | None, den: float | None) -> float | None:
     if num is None or den is None or den <= 0:
         return None
     return num / den
 
-
 def _int_or_none(v: float | None) -> int | None:
     return int(round(v)) if v is not None else None
-
 
 # --------------------------------------------------------------------------- #
 # Frame construction
 # --------------------------------------------------------------------------- #
-
 
 @dataclass
 class RateState:
@@ -149,7 +143,6 @@ class RateState:
     prefix_hits: float | None
     prefix_queries: float | None
 
-
 def _rate(cur: float | None, prev: float | None, dt: float) -> float | None:
     """Per-second rate of a cumulative counter, or ``None``.
 
@@ -161,10 +154,82 @@ def _rate(cur: float | None, prev: float | None, dt: float) -> float | None:
         return None
     return (cur - prev) / dt
 
+#: What ``Metrics.histogram()`` returns: cumulative ``(le, count)`` pairs plus
+#: the histogram's own sum and count. Named so the two helpers below can state
+#: what they accept instead of taking a bare tuple.
+Hist = tuple[list[tuple[float, float]], float | None, float | None]
+
+
+def buckets_payload(hist: Hist | None) -> dict[str, Any] | None:
+    """The engine's histogram buckets, as JSON.
+
+    Emitted alongside the quantiles rather than instead of them. TTFT here is
+    bimodal by construction -- prefix-cache hit against cold prefill -- so a
+    single percentile lands in the valley between the two humps and describes a
+    request that never happened. The buckets let the client draw the measured
+    distribution and put the percentiles on it as markers.
+
+    ``+Inf`` is encoded as ``None``: JSON has no infinity, and dropping that
+    bucket would silently discard the entire tail, which for a latency chart is
+    the half worth looking at.
+
+    None for a missing histogram -- llama.cpp reports none at all, and zeros
+    would render as a distribution in which every request was instantaneous.
+    """
+    if hist is None:
+        return None
+    buckets, total_sum, total_count = hist
+    if not buckets:
+        return None
+    return {
+        "le": [None if le == float("inf") else le for le, _ in buckets],
+        "counts": [c for _, c in buckets],
+        "count": total_count,
+        "sum": total_sum,
+    }
+
+def bucket_deltas(
+    newer: dict[str, Any] | None, older: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """Two cumulative reads into "what happened between them", or None.
+
+    Returns None rather than a wrong number in every case where subtraction
+    would lie:
+
+    * no earlier read -- the first frame's only honest answer is "not yet".
+      Showing the lifetime total under a "last 5 minutes" heading is precisely
+      the lifetime-as-live mislabelling this page is being rebuilt to remove.
+    * counters went backwards -- an engine restart zeroes them, and subtracting
+      gives negative bars.
+    * boundaries moved -- an engine upgrade can change the bucket edges, and
+      subtracting across them compares different bins while looking fine.
+
+    A window in which nothing happened is NOT None: it is a distribution whose
+    counts are all zero, so the panel can say "no requests in this window"
+    instead of going blank, which is a different and more useful statement.
+    """
+    if newer is None or older is None:
+        return None
+    if newer.get("le") != older.get("le"):
+        return None
+    a, b = newer.get("counts") or [], older.get("counts") or []
+    if len(a) != len(b):
+        return None
+    if any(x < y for x, y in zip(a, b, strict=True)):
+        return None
+    n_count, o_count = newer.get("count"), older.get("count")
+    if n_count is None or o_count is None or n_count < o_count:
+        return None
+    n_sum, o_sum = newer.get("sum") or 0.0, older.get("sum") or 0.0
+    return {
+        "le": list(newer["le"]),
+        "counts": [x - y for x, y in zip(a, b, strict=True)],
+        "count": n_count - o_count,
+        "sum": max(0.0, n_sum - o_sum),
+    }
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
-
 
 def _null_frame(
     model, model_id, max_model_len, scrape_error: str, backend: str | None = None
@@ -182,11 +247,10 @@ def _null_frame(
         "throughput": None,
         "cache": None,
         "latency": None,
-        "mfu": None,
+
         "finished": None,
         "scrape_error": scrape_error,
     }
-
 
 def build_frame(
     r,  # EngineReading
@@ -265,7 +329,7 @@ def build_frame(
     }
 
     ttft, itl, tpot, e2e = r.ttft_hist, r.itl_hist, r.tpot_hist, r.e2e_hist
-    latency = {
+    latency: dict[str, Any] = {
         "ttft_p50": _pct(ttft, 0.5),
         "ttft_p90": _pct(ttft, 0.9),
         "ttft_p99": _pct(ttft, 0.99),
@@ -278,14 +342,21 @@ def build_frame(
         "e2e_p99": _pct(e2e, 0.99),
     }
 
-    # MFU (Model FLOPs Utilization). We expose the cumulative estimated-FLOPs
-    # counter the engine reports; a true MFU% needs peak device FLOPs
-    # (dtype-specific) which we don't resolve in v1, so ``mfu_estimate`` stays
-    # null. Formula for a later iteration:
-    #   mfu = (d(flops_per_gpu_total)/dt) / peak_flops_per_gpu(dtype)
-    # i.e. the per-second FLOPs rate divided by the GPU's advertised peak FLOPs
-    # for the engine's compute dtype.
-    mfu = {"flops_per_gpu_total": r.flops_per_gpu_total, "mfu_estimate": None}
+    # The raw buckets, so the client can render the measured distribution
+    # rather than five numbers reduced from it. See buckets_payload.
+    latency["buckets"] = {
+        "ttft": buckets_payload(ttft),
+        "itl": buckets_payload(itl),
+        "tpot": buckets_payload(tpot),
+        "e2e": buckets_payload(e2e),
+    }
+
+    # MFU is gone, panel and field together. `mfu_estimate` was a literal None
+    # left for "a later iteration" -- nothing ever resolved peak device FLOPs --
+    # and the cumulative FLOPs counter beside it was rendered through a
+    # per-second formatter, so its unit was wrong even when its value was not
+    # zero. Measured GPU utilisation and power (the host charts) answer the
+    # question MFU was meant to answer, with numbers the box actually reports.
 
     finished = {
         "stop": _int_or_none(r.finished_stop),
@@ -306,7 +377,7 @@ def build_frame(
         "throughput": throughput,
         "cache": cache,
         "latency": latency,
-        "mfu": mfu,
+
         "finished": finished,
         "scrape_error": None,
     }
@@ -320,11 +391,9 @@ def build_frame(
     )
     return frame, state
 
-
 # --------------------------------------------------------------------------- #
 # Shared TTL scrape cache (mirror of ``_ProbeCache``, keyed by model_id)
 # --------------------------------------------------------------------------- #
-
 
 @dataclass
 class ScrapeResult:
@@ -333,7 +402,6 @@ class ScrapeResult:
     metrics: EngineReading | None
     error: str | None
     monotonic: float
-
 
 async def _default_fetch(host: str, port: int, at: float, backend) -> ScrapeResult:
     """Scrape the backend's metrics path once and parse. Never raises — a failed
@@ -353,7 +421,6 @@ async def _default_fetch(host: str, port: int, at: float, backend) -> ScrapeResu
         return ScrapeResult(
             metrics=None, error=str(exc) or exc.__class__.__name__, monotonic=at
         )
-
 
 class _MetricsCache:
     """One in-process cache for the vLLM ``/metrics`` scrape, keyed by model_id.
@@ -392,14 +459,12 @@ class _MetricsCache:
             self._cache[model_id] = res
             return res
 
-
 def _get_cache(request: Request) -> _MetricsCache:
     cache = getattr(request.app.state, "stats_live_cache", None)
     if cache is None:
         cache = _MetricsCache()
         request.app.state.stats_live_cache = cache
     return cache
-
 
 async def _loaded_models(
     db_path,
@@ -430,11 +495,9 @@ async def _loaded_models(
         rows = await cur.fetchall()
     return [(r[0], r[1], r[2], r[3]) for r in rows]
 
-
 # --------------------------------------------------------------------------- #
 # SSE endpoint
 # --------------------------------------------------------------------------- #
-
 
 def envelope(blocks: list[dict]) -> dict:
     """Wrap per-model blocks into the frame the dashboard receives.
@@ -460,7 +523,6 @@ def envelope(blocks: list[dict]) -> dict:
     """
     lead = blocks[0] if blocks else _null_frame(None, None, None, "no model loaded")
     return {**lead, "models": blocks}
-
 
 @router.get("/live")
 async def stream_live(request: Request, _user: str = Depends(require_sse_ticket)):

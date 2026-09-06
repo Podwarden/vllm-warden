@@ -7,6 +7,282 @@ release ships.
 
 ## [Unreleased]
 
+## [v2026.09.06.4] — 2026-09-06
+
+### Fixed
+
+- **Stats: the interconnect graph dropped GPU 0 and overlapped its own hub.**
+  `nvidia-smi topo -m` UNDERLINES its header row, so the first column arrives
+  as `\x1b[4mGPU0` rather than `GPU0`. Matching `GPU<n>` skipped it, and a
+  four-card host rendered as THREE cards — with a legend that counted three
+  and advised on splitting a model across them. Escapes are stripped before
+  parsing, and the regression test carries the real header verbatim, escapes
+  included, so a naive matcher fails it. Separately the ring radius was a
+  bare 120: a node beside the hub needs half of each box plus a gap, 124px,
+  and the worst case is a three-card ring whose lower nodes sit at 30°, where
+  120 buys 104px — an 8px collision. The radius is now derived from the box
+  sizes and the angle, so it cannot drift out of agreement with them, and the
+  SVG width follows from the ring rather than a second unrelated constant.
+  Both were found by opening the deployed page; the branch had passed lint,
+  types, 2291 Python tests and 712 frontend tests.
+
+
+## [v2026.09.06.3] — 2026-09-06
+
+### Added
+
+- **Stats: the GPU cards are dials, and the cards' interconnect is drawn.**
+  The card's head is a large utilisation number beside two bar gauges —
+  load, and temperature with a tick at the driver's throttle point. The
+  earlier concentric arcs were rejected twice: hard to read, ~120 px for
+  two numbers, and a meaningless stub at 0 %. Core and memory clock now
+  read against their own ceilings (`1350 / 2100 MHz`), because the ceiling
+  is what makes a low reading readable — 210 MHz idle is normal, 1200 MHz
+  at full load is a card being held back. The specs pair onto three lines
+  (Driver | CUDA, Link, NVLink | ECC) divided by a hairline, wrapping
+  independently on a narrow card, and a spec that disagrees with the other
+  cards on the host is marked "◂ differs". Under the name: the generation,
+  `Ampere · compute 8.6`, derived from the CUDA compute capability alone —
+  nvidia-smi has no architecture field, the map is fixed, and an
+  unrecognised capability shows its raw number and says the generation is
+  not recognised rather than inventing a label the day a new one ships.
+  The throttle verdict now comes from the driver's
+  `clocks_throttle_reasons`, not a temperature ratio: on one live host all
+  four cards report `sw_thermal_slowdown = Active` at 91–95 °C holding
+  57–74 % of max clock, and the card says "Thermal slowdown — clock held at
+  64 %". Thermal, power cap and hardware slowdown are named separately (they
+  are different problems); a hardware slowdown is a fault, a software one
+  a warning. That family is queried on its own because an unknown field
+  name rejects the whole nvidia-smi query — a driver that dropped the old
+  spelling gets the `clocks_event_reasons` spelling tried next, and one
+  that knows neither leaves the verdict "not reported", never "not
+  throttled". Below the cards, a new "How the cards reach each other"
+  graph from `nvidia-smi topo -m`. No NVLink (both real hosts): a hub star
+  to a `CPU · PCIe host bridge` node with each spoke labelled by the card's
+  negotiated lane width, dashed and fault-coloured when it gets fewer lanes
+  than it can use — and no GPU-to-GPU line, because `PHB` means the pair
+  has no direct path. Bridged pairs: thick `NV2` edges card-to-card plus
+  the PCIe spokes. Every pair NVLink: one NVSwitch node they all join, not
+  a 28-line mesh. Up to four cards sit on an ellipse; past that, two rows,
+  scrolling — 16-GPU hosts exist. `GET /api/system/gpus` gains
+  `architecture`, `sm_clock_max_mhz`, `mem_clock_mhz`, `mem_clock_max_mhz`,
+  a `throttle` block per card, and a top-level `topology` matrix.
+
+## [v2026.09.06.2] — 2026-09-06
+
+### Added
+
+- **Stats: the GPU cards carry real per-card telemetry.** Each card on the
+  System configuration panel now shows VRAM used / total with a meter, GPU
+  utilisation, temperature against the driver's own throttle point, fan
+  speed, power draw against *that card's* power limit, ECC mode, NVLink
+  standing, SM clock and P-state — next to the driver and CUDA versions it
+  already had. Fleets are heterogeneous: an RTX A4000 (16376 MiB, 140 W, ECC
+  off) sits beside a Quadro RTX 5000 (15360 MiB, 230 W, ECC on) on a real
+  host, so nothing is shared across cards. NVLink is a separate
+  `nvidia-smi nvlink -s` call with three distinct answers — "not supported by
+  this card", "supported, all links inactive", "N of M links active" — and
+  the panel words each one; a card without NVLink silicon never reads as
+  "inactive". A metric the hardware does not report renders as the words
+  "not reported", never 0 and never blank: a fan-less card in a VM, a card
+  with no power sensor and a card reading 0 W now look different. The live
+  feed (`GET /api/system/gpus`, new `telemetry` block per card) degrades
+  independently of the static inventory, so a failed probe leaves the
+  static rows in place and says the live feed is unavailable.
+- **Stats: PCIe generation and link width per card, read honestly.** Two
+  traps from a real host. Both cards idle at PCIe Gen 1 against a max of
+  Gen 3 — that is power saving, not a fault, and the card shows "Gen 1 now
+  · up to Gen 3" without flagging it. GPU 0 negotiated x4 lanes of a
+  possible x16 — a x4 slot or a riser, permanent, and on a host with no
+  usable NVLink the only path between cards for tensor-parallel serving;
+  that IS flagged, as a "reduced link width" chip in words and shape.
+  The generation ceiling shown is the *negotiated* max (what the link will
+  actually do); when the newer `gpumax`/`hostmax` fields say both
+  endpoints can do more ("card Gen 4, host Gen 4 — link settled at Gen 3")
+  that appears as a labelled note rather than a flattering substitute. A
+  driver that lacks those fields loses only that note — they are queried
+  separately so an unknown field name cannot take the rest of the
+  telemetry down with it.
+- **Stats: a hot idle card is said, not just coloured.** Temperature is
+  shown against the driver's slowdown point with a meter, and gains a
+  worded chip when it matters: "near throttle point" within 15% of it, or
+  "hot for an idle card" within 25% at ≤5% utilisation — the case of four
+  cards at 78–84 °C in P2 doing nothing, which a meter alone would bury.
+
+### Removed
+
+- **Stats: the VRAM-over-time chart.** It only moved when a model was
+  loaded or unloaded — the deployed 7-day chart was one flat block at
+  59.4 GiB with median equal to peak. That is structural, not a quirk of
+  one box: vLLM pre-allocates its KV cache from `gpu_memory_utilization`
+  at load, and llama.cpp allocates weights plus a KV cache sized to
+  `n_ctx` at load, so on both engines VRAM is a step function while
+  serving. Current VRAM lives on the per-GPU cards instead. The `vram`
+  series stays in `GET /api/stats/v2/overview` and the sampler is
+  untouched; only the chart is gone.
+
+- **Stats: per-request history is persisted, and the latency distributions
+  and the requests chart honour the window.** Two operator complaints had one
+  cause: "recently finished makes little sense" (ten identical-looking rows,
+  kept 15 minutes, nothing aggregated) and "why are the TTFT/ITL charts only
+  5 minutes" (the engine publishes only cumulative histograms, so the page
+  kept bucket snapshots in React state — the "last 5 minutes" it drew was
+  really "since you opened the tab, capped at 5 minutes"). Nothing persisted a
+  request. Now `_deregister` enqueues every completed request and a background
+  writer lands it in a new `request_history` table (migration 0031); the
+  proxy never touches the database on the slot-release path, and bookkeeping
+  still cannot fail a request. Retention is 30 days by age AND 200k rows by
+  count (`VW_REQUEST_HISTORY_RETENTION_DAYS`, `VW_REQUEST_HISTORY_MAX_ROWS`),
+  pruned hourly with the other stats tables: 30 days is four times the widest
+  window so 7d is always served in full and a last-N basis keeps depth when
+  traffic is thin; the row cap bounds a load test to ~40 MB whatever its rate.
+  `GET /api/stats/v2/requests` serves the rows over the window (every k-th row
+  when there are more than 2000, and it says which k — a newest-N cut would
+  leave the left of a time axis empty) and `GET /api/stats/v2/latency` serves
+  TTFT, per-request mean ITL and duration distributions with exact quantiles,
+  on the window or on the last 500 requests. Every response carries a
+  `coverage` block, so a window the store cannot serve in full — history
+  younger than the window, or a retention shorter than it — is stated
+  precisely rather than drawn narrower than the button promises.
+
+  The latency panels now come from the PROXY's own measurements (TTFT at the
+  first streamed frame, duration at the end of the stream), which exist
+  identically for every backend: **llama.cpp models get a latency panel for
+  the first time** — that engine publishes no histogram at all. The engine
+  histograms are no longer shown on the page: two "TTFT" panels from two
+  sources over two windows would silently disagree. What is given up is the
+  engine's per-token ITL resolution; the store's ITL is the mean gap per
+  request and is labelled "mean per request" wherever it appears.
+
+  "Recently finished" is replaced by a requests chart: time on x, duration on
+  a log y, one mark per request, colour by client (or by model when one
+  client dominates, or nothing when there is one of each — the legend says
+  which), size by generated tokens, finish reason by SHAPE (filled / hollow /
+  cross — never by colour, which is already carrying identity and is the same
+  amber for positive and warn in retro-dark). Prompt tokens and TTFT ride in
+  the tooltip. Clicking a legend chip isolates that client. The table
+  survives as a collapsed detail view under the chart, newest first, with the
+  window's depth rather than a ring's. `GET /api/stats/live/finished` remains
+  for a UI image older than this API and reads the same store.
+
+### Fixed
+
+- **Stats: the GPU card's CUDA version was always "—".** `nvidia-smi
+  --version` on R610 drivers prints `CUDA version : Deprecated, see "CUDA
+  UMD version" instead` and puts the number under `CUDA UMD version : 13.3`;
+  the parser wanted a capital-V `CUDA Version` followed by digits, matched
+  neither, and left the slot null. It now reads either key
+  (case-insensitively, digits required), and falls back to the plain
+  `nvidia-smi` banner for drivers that predate `--version`.
+- **Stats: the 24h reference labels were clipped, and overlapped each other.**
+  They were pinned to fixed corners, which fails in two ordinary cases. A line
+  at the TOP of the scale had its label drawn above it, outside the plot, where
+  the panel clipped it — GPU utilisation pinned at 100% is not an edge case,
+  and VRAM sitting at the card total is another. And median and peak both hugged
+  the right edge, so when the two values are close they collided: a 511 W median
+  under a 555 W peak was an unreadable smear. Placement is now computed from
+  where each line sits in its own domain — upper part gets its label below,
+  otherwise above, so neither edge can clip it — and peak keeps the right edge
+  while median takes the left, so the two can never overlap at any values.
+
+## [v2026.09.06.1] — 2026-09-06
+
+### Added
+
+- **Stats: a finished request outlives its own completion.** The live registry
+  holds only in-flight requests and dropped each one in the streaming
+  `finally`, so its duration, time-to-first-token and finish reason — the three
+  things that only become knowable at that instant — were discarded exactly
+  when they became worth having. That is why the dashboard went blank the
+  moment something interesting ended. A bounded ring now keeps them, served by
+  `GET /api/stats/live/finished`, scoped by the same `?models=` rules as every
+  other stats endpoint. TTFT is measured by the proxy at the first streamed
+  frame rather than taken from the engine: llama.cpp publishes no latency
+  histogram at all, and the proxy is the one vantage point that sees every
+  backend identically. Bounded by count *and* age, because either alone fails —
+  a burst would blow the memory bound, and a quiet week would show last Tuesday
+  as though it were current. In memory and process-local: it survives a reload
+  and a navigation away, not a warden restart.
+- **Stats: latency is emitted as a distribution, not only five quantiles.** The
+  engine's full histogram buckets were fetched and then reduced to p50/p90/p99,
+  throwing away the shape. TTFT is bimodal by construction — a prefix-cache hit
+  lands near 0.3 s and a cold prefill near 6 s — so a single percentile falls in
+  the valley between the two humps and describes a request that never happened.
+  The buckets now ride alongside the quantiles, with `+Inf` encoded as `null`
+  because JSON has no infinity and dropping that bucket would discard the whole
+  tail. `bucket_deltas` turns two cumulative reads into a real windowed
+  distribution, and returns nothing rather than a wrong number when there is no
+  earlier read, when an engine restart has zeroed the counters, or when an
+  engine upgrade has moved the bucket boundaries.
+
+### Fixed
+
+- **Stats: a finished-request record's `model_id` held the SERVED model name,
+  so scoping the panel matched nothing.** Every other stats endpoint filters
+  `?models=` on the models table's row id — `/api/stats/v2/overview` validates
+  exactly that — but the proxy wrote the served name under `model_id`, so the
+  same selection that scoped the overview correctly matched no finished rows
+  at all whenever a model's id and served name differ (they usually do). The
+  failure was silent: an empty table reads as "no requests", not as a bug. The
+  record now carries `model` (served name, for display) and `model_id` (row id,
+  for filtering) as distinct values, and the page scopes the endpoint instead
+  of narrowing client-side. That also fixes a second fault in the workaround:
+  the endpoint applies its row limit BEFORE the page could narrow, so a busy
+  unselected model could push every selected row out of the response.
+
+  Building the record was inline in the proxy's `_deregister` and the ring's
+  tests inject records of their own making, so nothing ever checked what the
+  proxy actually wrote — which is how this shipped. It is now
+  `request_registry.finished_record()`, tested directly.
+
+### Changed
+
+- **Stats: one page.** Everything from `/ui/stats/live` moves into `/ui/stats`,
+  next to the minute-level history that page already kept — which was the
+  existing answer to "the charts reset"; Live's ~80 seconds of client-side
+  React state was the anomaly. The merged page keeps one control bar (models +
+  window), and the scoping rules are explicit rather than implied: the model
+  selection scopes tokens, latency, KV, requests and preemptions, but NOT
+  VRAM, GPU utilisation or power — two engines share a card, so watts cannot
+  be attributed to one model, and those panels carry a `host` badge instead of
+  silently re-scoping. KV and context are never combined across models (each
+  engine has its own pool and its own `max_model_len`); the window governs
+  history panels only, with live panels saying "not the window"; longer
+  windows bucket up (1 min → 5 min → 30 min) and the heading says which; the
+  history charts carry a fixed 24h reference (dashed median of busy minutes,
+  dotted peak, the peak included in the y-scale); latency renders as the
+  measured windowed distribution with percentile markers on it, and says "not
+  reported" for an engine that publishes no histograms; every cumulative
+  figure is greyed and labelled "since engine start". The model control adapts:
+  inline chips up to four models, a summary button with a filterable checklist
+  above that.
+
+### Removed
+
+- **`/ui/stats/live` — 404, not a redirect.** There is one stats page, and a
+  silent redirect would leave people believing the old route still exists. The
+  nav link went with it; the app's 404 page names Stats for the bookmark or
+  the tab left open.
+- **The MFU panel, and the `mfu` block from the live frame.** `mfu_estimate`
+  was a literal `None` left for "a later iteration" — nothing ever resolved
+  peak device FLOPs — and the `0 FLOP/s` line beneath it was a *cumulative*
+  counter rendered through a per-second formatter, so its unit was wrong even
+  when its value was not zero. Measured GPU utilisation and power answer the
+  same question with numbers the box actually reports.
+
+### Fixed
+
+- **A scrape error no longer risks the whole stats page.** `_null_frame`
+  emits `engine`/`throughput`/`cache`/`latency` as JSON null while keeping
+  `model_id`, so the block reached a render path whose TypeScript types
+  falsely declared those non-nullable and dereferenced them unguarded — and
+  there was no error boundary under `/stats` to contain the crash. The types
+  now say null, every render site guards, and the route has an error boundary.
+- **The scrape-error banner no longer claims "showing the last good values".**
+  Nothing holds a last good frame — the stream replaces state on every
+  message — so the banner now says what actually happens: that model's live
+  panels pause until the next successful scrape.
+
 ## [v2026.09.05.2] - 2026-09-05
 
 ### Changed

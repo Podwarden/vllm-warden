@@ -38,10 +38,6 @@
       "ttft_p99": 1.8
     },
     "max_model_len": 4096,
-    "mfu": {
-      "flops_per_gpu_total": 1200000000000000.0,
-      "mfu_estimate": null
-    },
     "model": "m",
     "model_id": "mid",
     "scrape_error": null,
@@ -91,10 +87,6 @@
       "ttft_p99": 1.8
     },
     "max_model_len": 4096,
-    "mfu": {
-      "flops_per_gpu_total": 1200000000000000.0,
-      "mfu_estimate": null
-    },
     "model": "m",
     "model_id": "mid",
     "scrape_error": null,

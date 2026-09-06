@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass
@@ -36,7 +37,15 @@ class LiveRequest:
     token_id: str | None
     token_name: str | None
     client_ip: str | None
+    #: The SERVED model name -- what the client asked for and what a human
+    #: reads in the requests table.
     model: str
+    #: The models table's row id. Kept separately because it, not the served
+    #: name, is what every stats endpoint filters on: /api/stats/v2/overview
+    #: validates ``?models=`` against this id (``_resolve_selection``), so a
+    #: finished record keyed by the served name silently matches nothing
+    #: whenever the two differ.
+    model_row_id: str
     path: str
     prompt_tokens: int
     max_model_len: int | None
@@ -45,6 +54,14 @@ class LiveRequest:
     completion_tokens: int = 0
     phase: str = "prefill"
     orphan: bool = False
+    #: Monotonic clock at the first streamed frame — the proxy's own TTFT.
+    #: Measured here rather than taken from the engine because llama.cpp
+    #: publishes no latency histogram at all, and this is the one vantage point
+    #: that sees every backend identically.
+    first_token_monotonic: float | None = None
+    #: Set from the terminal SSE frame (or the non-streaming body) when it
+    #: carries one. None means "not observed", never "stop" by assumption.
+    finish_reason: str | None = None
 
 
 class RequestRegistry:
@@ -80,3 +97,36 @@ class RequestRegistry:
     def snapshot(self) -> list[LiveRequest]:
         """Lock-free copy of the current in-flight requests."""
         return list(self._reqs.values())
+
+
+def finished_record(req: LiveRequest, *, now: float) -> dict[str, Any]:
+    """The row the finished-request ring keeps once ``req`` has ended.
+
+    Extracted from the proxy's ``_deregister`` so the record's shape is
+    testable on its own. It was inline, and the ring's tests inject records of
+    their own making, so nothing checked what the proxy actually wrote --
+    which is how ``model_id`` came to hold the served model name.
+
+    ``now`` is a monotonic reading, taken by the caller at the moment the
+    request ended.
+    """
+    ttft = (
+        req.first_token_monotonic - req.started_monotonic
+        if req.first_token_monotonic is not None
+        else None
+    )
+    return {
+        "id": req.id,
+        # Served name for display, row id for filtering. See LiveRequest.
+        "model": req.model,
+        "model_id": req.model_row_id,
+        "token_name": req.token_name,
+        "client_ip": req.client_ip,
+        "prompt_tokens": req.prompt_tokens,
+        "completion_tokens": req.completion_tokens,
+        "duration_s": round(now - req.started_monotonic, 3),
+        "ttft_s": round(ttft, 3) if ttft is not None else None,
+        "finish_reason": req.finish_reason,
+        "orphan": req.orphan,
+        "started_iso": req.started_iso,
+    }
