@@ -32,7 +32,7 @@ RUN_DEPS = set -e; . ./scripts/ci-deps-image.sh; \
 	  -v "$(PWD)":/app -w /app "$$VW_RUN_IMAGE" \
 	  sh -c 'eval "$$VW_PIP" && export PATH=/tmp/.local/bin:$$PATH && '
 
-.PHONY: install test test-unit test-integration lint typecheck typecheck-baseline format deps-image docker-build docker-run shell generate-api-types smoke conformance
+.PHONY: install test test-unit test-integration lint typecheck typecheck-baseline format deps-image docker-build docker-run shell generate-api-types sync-shared-docs check-shared-docs smoke conformance
 
 # Pull the prebuilt dependency image for the current requirements pair, build
 # it locally if the registry does not have it, and push what we built so the
@@ -123,6 +123,20 @@ generate-api-types:
 	docker run --rm -u $(shell id -u):$(shell id -g) -e HOME=/tmp -v $(PWD):/work -w /work/frontend node:20-slim \
 	  npx -y openapi-typescript@7 ../openapi.json -o src/lib/api-types.generated.ts
 
+# The hazard sections shared between README.md (which ships to GitHub) and the
+# Hub catalogue listing are single-sourced from docs/shared/. Same contract as
+# generate-api-types above: the marked regions are generated, hand edits are
+# reverted, and CI diffs them (lint:shared-docs). Stdlib only, so it runs in a
+# bare python image rather than the deps image.
+sync-shared-docs:
+	docker run --rm -u $(shell id -u):$(shell id -g) -e HOME=/tmp \
+	  -v $(PWD):/app -w /app python:3.11-slim python scripts/sync-shared-docs.py
+
+check-shared-docs:
+	docker run --rm -u $(shell id -u):$(shell id -g) -e HOME=/tmp \
+	  -v $(PWD):/app:ro -w /app python:3.11-slim \
+	  python scripts/sync-shared-docs.py --check
+
 # Front-door base URL for `make smoke`. Overridable so the installer CI job
 # can point it at the port it published (SMOKE_URL=http://127.0.0.1:NNNN).
 SMOKE_URL ?= http://localhost:8080
@@ -144,9 +158,40 @@ smoke:
 	#   /ui/         → 200 (Next.js root page, possibly /ui/models or /ui/login)
 	#   /api/csrf    → 200 (CSRF bootstrap, no auth required)
 	#   /healthz     → 200 (uptime probe — Caddy → Next /healthz alias)
+	#
+	# `|| rc=$$?` is load-bearing, not defensive clutter. Under `set -e` a bare
+	# `code=$$(curl ...)` assignment aborts the whole recipe the instant curl
+	# exits non-zero, so neither the printf below nor the FAIL branch ever runs
+	# and make reports a naked `*** [smoke] Error 7`. That says nothing about
+	# WHICH url failed or why — which is the one thing a smoke test exists to
+	# tell you. Trapping the status keeps the shell alive long enough to say it.
+	#
+	# The two failure kinds are genuinely different and must not be merged:
+	# a non-zero curl exit means the request never completed (wrong port, stack
+	# down, hung app), while a completed request carrying a non-200 means the
+	# stack is up and a route is broken. They send you to different places.
 	@set -e; \
 	for path in / /_landing /ui/ /api/csrf /healthz; do \
-	  code=$$(curl -sL -o /dev/null -w "%{http_code}" "$(SMOKE_URL)$$path"); \
+	  rc=0; \
+	  code=$$(curl -sL -o /dev/null -w "%{http_code}" --max-time 15 "$(SMOKE_URL)$$path") || rc=$$?; \
+	  if [ "$$rc" -ne 0 ]; then \
+	    case "$$rc" in \
+	      6)  why="could not resolve the host";; \
+	      7)  why="could not connect - nothing is listening there";; \
+	      28) why="timed out after 15s - the port answered but the app did not";; \
+	      52) why="empty reply from the server";; \
+	      56) why="the connection broke mid-response";; \
+	      *)  why="the request did not complete";; \
+	    esac; \
+	    echo "FAIL: GET $(SMOKE_URL)$$path" >&2; \
+	    echo "      $$why (curl exit $$rc)" >&2; \
+	    echo "" >&2; \
+	    echo "      The stack has to be up before smoke can test it:" >&2; \
+	    echo "        docker compose ps    # api, ui and caddy should all be healthy" >&2; \
+	    echo "      If it is published somewhere other than $(SMOKE_URL):" >&2; \
+	    echo "        make smoke SMOKE_URL=http://127.0.0.1:PORT" >&2; \
+	    exit 1; \
+	  fi; \
 	  printf "GET %-15s -> %s\n" "$$path" "$$code"; \
 	  if [ "$$code" != "200" ]; then \
 	    echo "FAIL: $$path returned $$code (expected 200)" >&2; \

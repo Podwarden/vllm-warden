@@ -7,6 +7,147 @@ release ships.
 
 ## [Unreleased]
 
+## [v2026.09.06.6] — 2026-09-06
+
+### Fixed
+
+- **`make smoke` swallowed the one thing it existed to report.** Under `set -e`
+  the bare `code=$(curl ...)` assignment aborted the recipe the moment curl
+  exited non-zero, so neither the per-path `printf` nor the `FAIL:` branch ever
+  ran and make printed a naked `*** [smoke] Error 7`. The carefully worded
+  failure message was unreachable for exactly the failure people actually hit —
+  running smoke against a stack that is not up, or published on a different
+  port. The curl status is now trapped, and the message names the full URL, what
+  went wrong in English (connection refused, DNS, timeout, empty reply, broken
+  mid-response), the curl exit code, and how to point `SMOKE_URL` somewhere
+  else. A `--max-time 15` also stops a hung app from hanging the smoke run
+  indefinitely. Found by a from-source install trial following the public
+  README on a clean host.
+
+### Added
+
+- **`INSTALL.md` — a step-by-step installation manual written from a recorded
+  install trial.** Two people-facing routes as separate top-level paths: run the
+  published images, or build both images from source (including
+  `@podwarden/chat-ui`, compiled from its public GitHub mirror at the pinned
+  SHA). Every command and every block of expected output is taken from the trial
+  transcripts rather than from what the software is meant to print, and each
+  failure a first-time reader actually hit is documented inline at the step where
+  it happens, with the verbatim error and the remedy: the Container Toolkit
+  installed-but-not-registered preflight refusal, the Docker-daemon restart that
+  `GPU_TOOLKIT_INSTALL=yes` performs, the `make restart && make smoke` race and
+  its bare `Error 56`, `jq` being needed but absent from the requirements, the
+  `403 {"detail":"csrf token invalid"}` that means either the wrong JSON field or
+  a missing `-b jar`, the bare `vllm subprocess exited unexpectedly (rc=1)` that
+  is really another process holding the card, the GPU-already-claimed refusal as
+  an exclusive ownership claim that no amount of `gpu_memory_utilization` can
+  satisfy, the benign first-load log-rotation traceback, the seven red pip
+  `ERROR:` lines a clean build prints, and `make uninstall` freeing 4 GB of 62
+  while leaving ~58 GB of images behind and refusing to run without a tty.
+  Closes with a symptom-to-cause table.
+
+  It lives at the repository root rather than under `docs/`, which
+  `publish/exclude.txt` strips from the public snapshot in full — a manual for
+  strangers has to reach the strangers. Its three new screenshots are under
+  `assets/screenshots/install/`, which ships for the same reason.
+
+- **The hazards the README and the Hub catalogue listing both document are now
+  single-sourced.** Seven of them — the 64 MiB `/dev/shm` default and the
+  tensor-parallel `SIGBUS` that follows minutes into serving, one loaded model
+  per GPU as an exclusive claim rather than a VRAM check,
+  `gpu_memory_utilization` reserving a fraction of the whole card, what fits on
+  a 16 GiB card, why a first load takes minutes, the mandatory
+  `VW_COOKIE_SECRET`, and the headless first-run sequence — were two
+  hand-maintained copies, one in `README.md` and one in the catalogue row's
+  long `content_md`. Copies drift, and the copy that is wrong is always the one
+  someone is reading when it matters; `deploy/hub/` is this repo's standing
+  proof, an unpublished mirror of that row that fell to 5 `env_schema` entries
+  against the row's 16.
+
+  Each hazard is now one self-contained fragment under `docs/shared/`, and both
+  surfaces carry marker pairs — an opening `<!-- shared:shm-sigbus -->` and a
+  closing `<!-- /shared:shm-sigbus -->` — that `scripts/sync-shared-docs.py`
+  fills. `--check` re-assembles and diffs instead of writing, and runs in CI as
+  `lint:shared-docs`; `make sync-shared-docs` / `make check-shared-docs` are
+  the local wrappers. Same contract as
+  `frontend/src/lib/api-types.generated.ts`: the marked regions are generated,
+  they are never hand-edited, and CI computes the diff rather than trusting
+  anyone to remember.
+
+  **Marker blocks, deliberately not a generated README.** Only the seven fenced
+  regions are machine-managed; every other line of `README.md` stays
+  hand-written, so a contributor who opens it to fix a typo just fixes it. A
+  wholly generated README would make the cheapest possible contribution
+  require knowing an assembler exists — which is how a documentation pipeline
+  quietly stops being used. The script's docstring says so, at length, so the
+  design is not "simplified" away later.
+
+  Fragments hold the body of a hazard, never its heading: the README's headings
+  are linked from within the README (`#one-loaded-model-per-gpu`,
+  `#first-run-without-a-browser`) and the catalogue words some of its own for a
+  reader looking at a deployment form. Surface-specific material stays out —
+  the `x-podwarden` block, `storage_class`/Longhorn, "the GPU lands on the
+  primary service because Caddy owns the published port" and the topology table
+  are catalogue-only; building from source, the pinned chat-ui SHA, the `make`
+  targets and the contributing section are README-only. A hazard that is mostly
+  shared with a surface-specific tail is split, with the tail after the closing
+  marker — `/dev/shm` is the worked example.
+
+  `publish/exclude.txt` strips `/docs/`, so the fragments never reach GitHub;
+  they are a build input and `README.md` links to none of them. The assembler
+  therefore reports and exits 0 in a public clone, where its inputs are absent
+  by design. The catalogue half is staged in `docs/catalog-shared-regions.md`,
+  which carries the assembled regions plus the mapping and splice procedure for
+  the Hub row — the row itself is a hand-curated column this repo does not own
+  and no script here writes it.
+
+### Changed
+
+- **The public README is restructured around the second engine, the reader's
+  objections, and the gaps a trial install found.** The old one was accurate
+  and opened by describing a control plane over vLLM; it barely mentioned that
+  this product now runs two mainline backends, and it buried the four things a
+  stranger following it literally had to reverse-engineer from source.
+
+  What is new. A **"Two engines, and the model that made us add the second"**
+  section that argues from the worked example rather than a feature list:
+  `ISTA-DASLab/Qwen3.8-27B-3Bit-GSQ` quantises the embedding table, mainline
+  vLLM's loader has no entry for `embed_tokens.weight_packed`, the model card's
+  remedy is a monkeypatch the product invariant forbids, and the same authors'
+  GGUF conversion runs unmodified on llama.cpp — with the measured single-card
+  numbers from `docs/tested-stacks.md`. It states the cost in the same breath:
+  llama.cpp publishes no latency histograms, which is why the latency panels
+  are measured by the proxy and why "not reported" is never rendered as `0`.
+  An **accusation audit** naming the objections a reader arrives with (another
+  wrapper, a Gradio script with a Dockerfile, it won't support my GPU, it will
+  phone home, lock-in, the demo works and then nothing does) and conceding what
+  is fair — including that the shipped llama.cpp is compiled `75-real;86-real`
+  with no PTX fallback, so any other card needs a rebuild. A **"Don't use this
+  if…"** section of real disqualifiers. And a **Hazards** section carrying the
+  `/dev/shm` SIGBUS floor, the exclusive one-model-per-GPU claim (an ownership
+  rule, not a VRAM check — lowering `gpu_memory_utilization` cannot get past
+  it), the whole-card reservation with its 10.55 GiB measurement, what fits on
+  16 GiB Ampere/Turing cards, why first loads take minutes, and the mandatory
+  `VW_COOKIE_SECRET`.
+
+  Those hazard sections and *First run without a browser* are written as
+  **self-contained blocks** — no sentence in one depends on its neighbours or
+  on README-only framing — so the same text can serve the catalogue listing
+  without a rewrite. `docs/catalog-copy.md` (internal; `docs/` is stripped from
+  the public snapshot) carries the derived catalogue copy.
+
+  Two corrections. The architecture table said `/healthz` was served by
+  Next.js; the Caddyfile proxies it to `api`, and it now says so. The old
+  "Why you might want it" table credited an automatic request reaper; the
+  wall-clock reaper is `request_max_wall_s` and defaults to `0.0`, so the
+  README now says it is off by default rather than implying otherwise.
+
+  Screenshots are **unreferenced for now**. Every image under
+  `assets/screenshots/` predates the LLM Warden rename — the nav wordmark in
+  each still reads "vLLM Warden" — and `03-stats-dashboard.png` shows a page
+  the stats rebuild removed. The files are left in place and the README carries
+  commented slots naming what each fresh capture should show, rather than
+  shipping a shop window that is eight releases out of date.
 ## [v2026.09.06.5] — 2026-09-06
 
 ### Fixed

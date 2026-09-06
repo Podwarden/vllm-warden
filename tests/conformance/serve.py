@@ -244,15 +244,30 @@ def _credentials(base: str) -> tuple[str, str, str]:
 
 def _announce() -> None:
     base = f"http://127.0.0.1:{PORT}"
-    deadline = time.monotonic() + 30
+    # 90s, matching the CI job's READY budget. 30s was a full application boot
+    # on a runner that also builds images, and it failed on a branch that
+    # touched neither this harness nor the app. Raising the CI-side READY wait
+    # from 30s to 90s simply moved the failure here: the harness now reaches
+    # this line and times out one layer down. Both waits are the same budget
+    # for the same boot, so they are now the same number.
+    deadline = time.monotonic() + 90
+    last_err: BaseException | None = None
     while time.monotonic() < deadline:
         try:
             urllib.request.urlopen(f"{base}/healthz", timeout=1)
             break
-        except (urllib.error.URLError, OSError):
+        except (urllib.error.URLError, OSError) as exc:
+            last_err = exc
             time.sleep(0.1)
     else:
-        print("FAILED /healthz never answered", flush=True)
+        # Say WHY, not just that it happened: "never answered" is the same
+        # message whether the port was refused for 90 seconds or the app
+        # returned an error, and the two want different fixes.
+        print(
+            f"FAILED /healthz never answered within 90s on {base} "
+            f"(last error: {last_err!r})",
+            flush=True,
+        )
         os._exit(1)
     try:
         _seed(data / "vllm-warden.db")
