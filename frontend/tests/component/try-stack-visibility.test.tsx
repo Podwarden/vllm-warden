@@ -41,9 +41,9 @@ class InertEventSource {
 }
 
 const DRIVER_REASON =
-  'This deployment runs the in-container engine driver, which cannot swap the ' +
-  'engine image, so a version pin would be silently discarded. Version ' +
-  'selection requires the docker engine driver.';
+  'This deployment runs the in-container engine driver: the engine version ' +
+  'is fixed by the warden image, so a pin is refused rather than applied. ' +
+  'Version selection requires the docker engine driver (VW_ENGINE_DRIVER=docker).';
 
 const BACKEND_REASON =
   'llama.cpp cannot be version-pinned on any driver: its binary is compiled ' +

@@ -162,7 +162,13 @@ class Supervisor:
                     "engine pin on this model, or run LLM Warden with "
                     "VW_ENGINE_DRIVER=docker to select engine versions."
                 )
-            self.gpus.claim(model.id, model.gpu_indices)
+            # Pass the served name so a refusal can say which model is in the
+            # way; the id alone is meaningless to whoever reads last_error.
+            self.gpus.claim(
+                model.id,
+                model.gpu_indices,
+                label=getattr(model, "served_model_name", None),
+            )
             try:
                 hf_token_path = Path(self.settings.hf_token_path)
 

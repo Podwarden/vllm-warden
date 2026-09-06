@@ -63,11 +63,23 @@ class LocalSubprocessDriver:
         if self._log_max_bytes <= 0:
             return
         try:
-            if log_path.stat().st_size < self._log_max_bytes:
-                return
-            log_path.replace(log_path.with_suffix(".log.1"))
+            size = log_path.stat().st_size
+        except FileNotFoundError:
+            # The FIRST load of a model has no log yet, so there is nothing to
+            # rotate. This used to fall into the OSError handler below and
+            # print a full FileNotFoundError traceback on every first load --
+            # harmless (spawn creates the file a moment later) but it reads
+            # like a fault at exactly the moment a new operator is watching.
+            return
         except OSError:
             # Rotation is housekeeping; never let it stop an engine starting.
+            log.warning("could not stat %s", log_path, exc_info=True)
+            return
+        if size < self._log_max_bytes:
+            return
+        try:
+            log_path.replace(log_path.with_suffix(".log.1"))
+        except OSError:
             log.warning("could not rotate %s", log_path, exc_info=True)
 
     def _write_run_sentinel(self, log_fd: int) -> None:

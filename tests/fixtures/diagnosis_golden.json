@@ -20,6 +20,10 @@
     "message": "GPU has no room for the KV cache after loading the weights \u2014 the model is too large for the selected GPU(s) at this gpu_memory_utilization. Use more/larger GPUs or raise gpu_memory_utilization.",
     "recommended_max_model_len": null
   },
+  "preflight_free_memory_on_startup": {
+    "message": "Not enough free VRAM on cuda:1 to start: 0.8 GiB free of 24.0 GiB, but this model asks for 21.6 GiB (gpu_memory_utilization 0.90). Something else is holding the card \u2014 free it, pick another GPU, or lower gpu_memory_utilization.",
+    "recommended_max_model_len": null
+  },
   "trust_remote_code_config_echo_is_not_a_match": null,
   "trust_remote_code_genuinely_required": {
     "message": "This model requires trust_remote_code to load. Enable trust_remote_code for this model (it executes code from the model repo \u2014 only do this for repos you trust), then retry.",

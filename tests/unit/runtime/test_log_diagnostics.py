@@ -195,3 +195,79 @@ def test_real_requirement_still_detected_among_noise():
     diag = diagnose_engine_log(_CONFIG_ECHO + _TRUST_REMOTE_CODE_LOG)
     assert diag is not None
     assert "trust_remote_code" in diag.message
+
+
+# --- Variant 0: the card was already occupied (pre-flight) -------------------
+
+# VERBATIM from a real first-run failure on a host whose GPUs were already
+# held by another service. This is the single most likely first failure a new
+# operator hits, and until this rule existed it produced nothing better than
+# "vllm subprocess exited unexpectedly (rc=1)".
+_FREE_MEM_PREFLIGHT_LOG = (
+    "(EngineCore pid=640064) ERROR 09-06 17:03:09 [core.py:1330] "
+    "ValueError: Free memory on device cuda:0 (1.65/15.6 GiB) on startup is "
+    "less than desired GPU memory utilization (0.13, 2.03 GiB). Decrease GPU "
+    "memory utilization or reduce GPU memory used by other processes.\n"
+)
+
+
+def test_preflight_free_memory_names_the_actual_shortfall():
+    diag = diagnose_engine_log(_FREE_MEM_PREFLIGHT_LOG)
+    assert diag is not None
+    msg = diag.message
+    # Which card, how much was free, how big the card is, and how much the
+    # model asked for -- the four numbers that make this actionable.
+    assert "cuda:0" in msg
+    assert "1.65" in msg
+    assert "15.6" in msg
+    assert "2.03" in msg
+    assert "0.13" in msg
+    # It is not a context problem; never suggest capping max_model_len.
+    assert "max_model_len" not in msg
+    assert diag.recommended_max_model_len is None
+
+
+def test_preflight_free_memory_survives_wording_drift():
+    """Keyed on stable tokens, not on vLLM's exact sentence."""
+    diag = diagnose_engine_log(
+        "ValueError: FREE MEMORY ON DEVICE cuda:1 ( 0.4 / 24.0 GiB ) is less "
+        "than desired GPU memory utilization (0.90, 21.6 GiB).\n"
+    )
+    assert diag is not None
+    assert "cuda:1" in diag.message
+    assert "0.4" in diag.message
+
+
+def test_preflight_free_memory_without_the_desired_half_still_diagnoses():
+    """The requested figures are captured opportunistically, never required."""
+    diag = diagnose_engine_log(
+        "ValueError: Free memory on device cuda:0 (1.65/15.6 GiB) on startup "
+        "is less than desired.\n"
+    )
+    assert diag is not None
+    assert "1.65" in diag.message
+
+
+def test_preflight_rule_does_not_pair_unrelated_lines():
+    """A free-memory INFO line and a far-away "less than desired" sentence are
+    not one sentence. The bounded, single-line match is what stops the parser
+    inventing a diagnosis out of two unrelated log lines."""
+    text = (
+        "INFO 09-06 17:03:00 Free memory on device cuda:0 (14.9/15.6 GiB)\n"
+        + "INFO 09-06 17:03:01 warming up\n" * 40
+        + "ValueError: something is less than desired somewhere else\n"
+    )
+    assert diagnose_engine_log(text) is None
+
+
+def test_preflight_beats_the_cuda_oom_rule_when_both_appear():
+    """Ordering guard. The pre-flight check aborts before any allocation, so
+    when both strings are present the pre-flight sentence is the real cause
+    and the generic OOM advice would send the operator the wrong way."""
+    diag = diagnose_engine_log(
+        _FREE_MEM_PREFLIGHT_LOG
+        + "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 22.00 MiB\n"
+    )
+    assert diag is not None
+    assert "cuda:0" in diag.message
+    assert "1.65" in diag.message

@@ -160,6 +160,55 @@ export function __resetLoginRedirectInFlightForTests(): void {
   loginRedirectInFlight = false;
 }
 
+/**
+ * Send the browser to /login, at most once per page lifetime.
+ *
+ * Extracted from `authFetch`'s 401 branch so `SessionGate` can use exactly
+ * the same navigation — same de-dup flag, same same-page guard — rather than
+ * open a second, subtly different route to /login.
+ *
+ * Same-page guard: `replace('/login')` from /login is a full-page reload that
+ * re-imports this module with `loginRedirectInFlight = false`, so without it
+ * a 401-eliciting fetch on /login loops. Exact-matched (not `startsWith`) so
+ * a hypothetical /login-help page keeps normal bounce-to-login behaviour.
+ *
+ * Note the bare '/login' target: the UI is served under basePath '/ui', and
+ * the front door 308s /login → /ui/login (deploy/caddy/Caddyfile). That
+ * indirection is deliberate and long-standing; do not "fix" it to /ui/login,
+ * which would break the dev server where no such redirect exists.
+ */
+export function redirectToLogin(): void {
+  const pathname =
+    typeof window !== 'undefined' ? window.location?.pathname ?? '' : '';
+  const onLogin = pathname === '/login' || pathname === '/login/';
+  if (loginRedirectInFlight || onLogin) return;
+  loginRedirectInFlight = true;
+  window.location.replace('/login');
+}
+
+/** What a session check concluded. Mirrors `RefreshResult`, flattened. */
+export type SessionCheck = 'ok' | 'invalid' | 'transient';
+
+/**
+ * Resolve whether this browser currently holds a usable session, without
+ * issuing an application request.
+ *
+ * `SessionGate` calls this before rendering the app shell. Pre-gate, the
+ * shell rendered immediately and the page's own SWR fetchers discovered the
+ * dead session a round trip later — so a logged-out visitor to /ui/ was shown
+ * a Models page with skeleton cards before being bounced to /login, which
+ * reads as "the product is broken" rather than "you are signed out".
+ *
+ * Costs nothing extra: `authFetch`'s eager-refresh guard was already going to
+ * make this exact call before its first request, and `refresh()` de-dupes
+ * concurrent callers through the shared `refreshing` promise.
+ */
+export async function ensureSession(): Promise<SessionCheck> {
+  if (accessToken !== null) return 'ok';
+  const result = await refresh();
+  return 'error' in result ? result.error : 'ok';
+}
+
 // ---------------------------------------------------------------------------
 // CSRF token caching
 // ---------------------------------------------------------------------------
@@ -451,33 +500,11 @@ export async function authFetch(input: RequestInfo | URL, init: RequestInit = {}
       // Response back to their caller so error handling can run. See
       // the loginRedirectInFlight comment at the top of this module.
       //
-      // Same-page redirect guard (v2026.05.15.4). The
-      // `loginRedirectInFlight` flag's invariant — "fires at most once
-      // per page lifetime" — breaks when the redirect target equals the
-      // current page: `replace('/login')` from /login is a full-page
-      // reload that re-imports this module with `loginRedirectInFlight =
-      // false`, and the next 401 fires `replace('/login')` again → loop.
-      // The primary fix is the NavBar SWR gate (see nav-bar.tsx), but
-      // any component mounted on /login that issues a 401-eliciting
-      // authFetch would regress the same way. Belt-and-suspenders:
-      // never call `replace('/login')` when we're already on /login.
-      // The 401 Response is still returned so the caller's error
-      // branch runs normally.
-      // #39 fix: exact-match the login path (with/without trailing
-      // slash) instead of ``startsWith('/login')``. A hypothetical
-      // /login-help or /login.json page would otherwise inherit the
-      // same-page redirect suppression and lose the bounce-to-login
-      // behaviour that the rest of the app depends on. The nav-bar
-      // guard (``isUnauthRoute`` in nav-bar.tsx) carries the same
-      // tightened semantics — see the comment block there for
-      // motivation.
-      const pathname =
-        typeof window !== 'undefined' ? window.location?.pathname ?? '' : '';
-      const onLogin = pathname === '/login' || pathname === '/login/';
-      if (!loginRedirectInFlight && !onLogin) {
-        loginRedirectInFlight = true;
-        window.location.replace('/login');
-      }
+      // The de-dup flag and the same-page guard both live in
+      // `redirectToLogin` above (v2026.05.15.4 + #39), so this path and
+      // `SessionGate`'s cannot drift apart. The 401 Response is still
+      // returned either way, so the caller's error branch runs normally.
+      redirectToLogin();
       return r;
     }
     headers.set('Authorization', `Bearer ${result.token}`);

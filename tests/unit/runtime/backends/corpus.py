@@ -207,6 +207,12 @@ LOG_CASES: list[tuple[str, str]] = [
     ("empty", ""),
     ("whitespace_only", "   \n\t  "),
     ("unrecognised", "ERROR 08-31 10:00:00 something entirely unfamiliar\n"),
+    # Variant 0 -- vLLM's pre-flight free-memory check, which fires before it
+    # profiles anything. Paraphrased like its neighbours (different card,
+    # different numbers) so a tightened regex shows up here.
+    ("preflight_free_memory_on_startup",
+     "ValueError: Free memory on device cuda:1 (0.8/24.0 GiB) on startup is "
+     "less than desired GPU memory utilization (0.90, 21.6 GiB).\n"),
     ("no_cache_blocks",
      "ValueError: No available memory for the cache blocks. "
      "Available KV cache memory (-1.2 GiB)\n"),

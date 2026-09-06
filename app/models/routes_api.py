@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import fnmatch
 import json
@@ -10,7 +12,7 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app.auth.deps import require_jwt
 from app.db.constants import ACTIVE_STATUSES
@@ -296,10 +298,56 @@ def _effective_file_size(filename: str, files: list[dict[str, Any]]) -> int:
     return total
 
 
+# Weights kinds a repo can offer, in the order we would pick one when the
+# caller names no file. safetensors first because that is what vLLM loads by
+# default; a shard is a fine stand-in for its whole set, because
+# ``_effective_file_size`` re-aggregates the glob anyway.
+_WEIGHTS_KIND_PREFERENCE = ("safetensors_single", "safetensors_sharded", "pytorch_bin")
+
+
+def _default_weights_filename(files: list[dict[str, Any]]) -> str | None:
+    """The one file a fit verdict is obviously about, or None if ambiguous.
+
+    A normal HF repo carries exactly one weights format, so asking the caller
+    to name a file is asking them to repeat what discovery already knows --
+    which is why ``POST /api/models`` makes ``filename`` optional. GGUF repos
+    are the exception: they publish many INDEPENDENT quantisations side by
+    side (Q4_K_M, Q8_0, ...) that fit very differently, so picking one for the
+    caller would answer a question they did not ask. Those still have to name
+    a file, and the 422 below says so.
+    """
+    for kind in _WEIGHTS_KIND_PREFERENCE:
+        candidates = [f for f in files if f.get("kind") == kind]
+        if candidates:
+            # Deterministic: the first shard by name, not "whichever the Hub
+            # listed first", so the same repo always yields the same verdict.
+            return str(min(candidates, key=lambda f: f["filename"])["filename"])
+    return None
+
+
 class FitPreviewRequest(BaseModel):
-    repo_id: str = Field(..., min_length=1)
+    """Ask whether a candidate model fits on the selected GPUs.
+
+    ``hf_repo`` and ``filename`` deliberately match ``POST /api/models``:
+    these two endpoints describe the same model moments apart in the Add
+    Model flow, and they used to disagree on both -- ``repo_id`` here vs
+    ``hf_repo`` there, and ``filename`` required here vs optional there. A
+    caller who wrote the create body and then tried the pre-check got a bare
+    ``Field required`` naming a field they had never heard of.
+
+    ``repo_id`` remains accepted for the existing frontend and any client
+    written against the old shape; exactly one of the two must be given.
+    """
+
+    # The create endpoint's spelling, and the one the docs use.
+    hf_repo: str | None = Field(default=None, min_length=1)
+    # The original spelling. Kept working; not documented for new callers.
+    repo_id: str | None = Field(default=None, min_length=1)
     revision: str = "main"
-    filename: str = Field(..., min_length=1)
+    # Optional, as on POST /api/models. Omit it and the repo's weights file is
+    # resolved from discovery; a GGUF repo has no single answer, so naming one
+    # is required there (see _default_weights_filename).
+    filename: str | None = Field(default=None, min_length=1)
     gpu_indices: list[int] = Field(..., min_length=1)
     max_batch_size: int = Field(default=1, ge=1, le=64)
     gpu_memory_utilization: float = Field(0.9, gt=0, le=1.0)
@@ -312,6 +360,21 @@ class FitPreviewRequest(BaseModel):
     # Allow the FE to override max_model_len for the math; when None we fall
     # back to ``config.max_position_embeddings`` (the natural ceiling).
     max_model_len: int | None = Field(default=None, gt=0)
+
+    @property
+    def repo(self) -> str:
+        """The repo id, from whichever spelling the caller used."""
+        return self.hf_repo or self.repo_id or ""
+
+    @model_validator(mode="after")
+    def _exactly_one_repo_field(self) -> FitPreviewRequest:
+        if self.hf_repo and self.repo_id and self.hf_repo != self.repo_id:
+            raise ValueError(
+                "give either hf_repo or repo_id, not both with different values"
+            )
+        if not self.repo:
+            raise ValueError("hf_repo is required")
+        return self
 
 
 class FitPreviewBreakdown(BaseModel):
@@ -354,14 +417,16 @@ async def fit_preview(
     settings = request.app.state.settings
     cache = _get_discovery_cache(request)
     warnings: list[str] = []
+    # One name for the repo from here down, whichever spelling arrived.
+    repo = body.repo
 
     async def _fetch() -> dict[str, Any]:
         token = await load_hf_token(settings)
-        result = await discover_repo_files(body.repo_id, body.revision, token)
+        result = await discover_repo_files(repo, body.revision, token)
         return result.to_dict()
 
     try:
-        discovery = await cache.get_or_fetch((body.repo_id, body.revision), _fetch)
+        discovery = await cache.get_or_fetch((repo, body.revision), _fetch)
     except DiscoveryAuthRequired as e:
         raise HTTPException(
             401,
@@ -369,7 +434,7 @@ async def fit_preview(
                 "error_code": "auth_required",
                 "message": "HuggingFace Hub requires authentication for this repo "
                 "(gated or private). Update the HF token in Settings.",
-                "repo_id": body.repo_id,
+                "repo_id": repo,
                 "revision": body.revision,
             },
         ) from e
@@ -378,26 +443,50 @@ async def fit_preview(
             404,
             detail={
                 "error_code": "repo_not_found",
-                "message": f"HuggingFace repo '{body.repo_id}' (revision '{body.revision}') not found.",
-                "repo_id": body.repo_id,
+                "message": f"HuggingFace repo '{repo}' (revision '{body.revision}') not found.",
+                "repo_id": repo,
                 "revision": body.revision,
             },
         ) from e
     except Exception as e:  # noqa: BLE001
         logger.exception("fit-preview discovery failed for %s@%s",
-                         body.repo_id, body.revision)
+                         repo, body.revision)
         raise HTTPException(
             502,
             detail={
                 "error_code": "discovery_failed",
                 "message": "HuggingFace Hub request failed; check connectivity and try again.",
-                "repo_id": body.repo_id,
+                "repo_id": repo,
                 "revision": body.revision,
             },
         ) from e
 
     files = discovery["files"]
-    file_size = _effective_file_size(body.filename, files)
+    # `filename` is optional, matching POST /api/models. Resolve it from
+    # discovery when the caller left it out; a GGUF repo publishes several
+    # independent quantisations, so there the caller must still choose.
+    filename = body.filename or _default_weights_filename(files)
+    if filename is None:
+        raise HTTPException(
+            422,
+            detail={
+                "error_code": "filename_required",
+                "message": (
+                    f"repo '{repo}' offers no single weights file to size — "
+                    "name one in `filename`. GGUF repos publish several "
+                    "independent quantisations that fit very differently, so "
+                    "there is no safe default."
+                ),
+                "repo_id": repo,
+                "revision": body.revision,
+                "candidates": sorted(
+                    f["filename"] for f in files
+                    if f.get("kind") in ("gguf", "safetensors_single",
+                                         "safetensors_sharded", "pytorch_bin")
+                ),
+            },
+        )
+    file_size = _effective_file_size(filename, files)
     if file_size == 0:
         # Either the filename wasn't in the repo or all matched siblings had
         # null size metadata. Either way the verdict isn't meaningful — fail
@@ -406,11 +495,11 @@ async def fit_preview(
             422,
             detail={
                 "error_code": "filename_not_found",
-                "message": f"filename '{body.filename}' not found in repo "
-                f"'{body.repo_id}' (or had no size metadata).",
-                "repo_id": body.repo_id,
+                "message": f"filename '{filename}' not found in repo "
+                f"'{repo}' (or had no size metadata).",
+                "repo_id": repo,
                 "revision": body.revision,
-                "filename": body.filename,
+                "filename": filename,
             },
         )
 
@@ -546,7 +635,7 @@ async def fit_preview(
         if rec is not None and max_pos_emb > 0:
             rec = min(rec, max_pos_emb)
 
-    is_gguf = body.filename.lower().endswith(".gguf")
+    is_gguf = filename.lower().endswith(".gguf")
     if is_gguf:
         warnings.append(
             "gguf_dequant_peak: actual VRAM during weight load may spike to "

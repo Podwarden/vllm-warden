@@ -2099,17 +2099,32 @@ export interface components {
             /** Max Model Len Used */
             max_model_len_used: number;
         };
-        /** FitPreviewRequest */
+        /**
+         * FitPreviewRequest
+         * @description Ask whether a candidate model fits on the selected GPUs.
+         *
+         *     ``hf_repo`` and ``filename`` deliberately match ``POST /api/models``:
+         *     these two endpoints describe the same model moments apart in the Add
+         *     Model flow, and they used to disagree on both -- ``repo_id`` here vs
+         *     ``hf_repo`` there, and ``filename`` required here vs optional there. A
+         *     caller who wrote the create body and then tried the pre-check got a bare
+         *     ``Field required`` naming a field they had never heard of.
+         *
+         *     ``repo_id`` remains accepted for the existing frontend and any client
+         *     written against the old shape; exactly one of the two must be given.
+         */
         FitPreviewRequest: {
+            /** Hf Repo */
+            hf_repo?: string | null;
             /** Repo Id */
-            repo_id: string;
+            repo_id?: string | null;
             /**
              * Revision
              * @default main
              */
             revision: string;
             /** Filename */
-            filename: string;
+            filename?: string | null;
             /** Gpu Indices */
             gpu_indices: number[];
             /**

@@ -7,6 +7,145 @@ release ships.
 
 ## [Unreleased]
 
+## [v2026.09.06.5] — 2026-09-06
+
+### Fixed
+
+- **The published tree could not build its own UI image.** `frontend/Dockerfile`
+  copied `.npmrc` by name and demanded an npm credential as a `required=true`
+  BuildKit secret. The publish deliberately strips `.npmrc` — it routes the
+  `@podwarden` scope at an authenticated registry a public clone cannot reach —
+  so every `docker compose build ui` from GitHub died at
+  `"/.npmrc": not found`, and the empty-file workaround then died at
+  `secret npm: not found`. The exclusion was right and the consumer was wrong.
+  `.npmrc*` is now a glob and the secret is optional, guarded by an explicit
+  check so a checkout that DOES carry an `.npmrc` still fails fast and by name
+  when the secret is missing — the fail-fast `required=true` existed for, minus
+  the demand on builds with nothing to authenticate to. This also means
+  `docker compose build ui` works for the first time anywhere: the compose
+  `ui.build` block never declared a `secrets:` key, so it could not have passed
+  one internally either.
+
+### Added
+
+- **The UI image compiles `@podwarden/chat-ui` from source.** A new `chatui`
+  build stage clones `github.com/Podwarden/chat-ui` at a pinned 40-character
+  commit, runs that repo's own `npm ci && npm run build && npm pack`, and
+  overlays the result on what `npm ci` installed. `package-lock.json` still
+  pins chat-ui's ~20 runtime dependencies with integrity hashes — that closure
+  is what a lockfile is for — while the component's own code is now something
+  the operator compiled rather than a tarball they downloaded. Same shape as
+  the llama.cpp stage in the root `Dockerfile`, and for the same reason.
+
+  A plain npm git dependency was tried first and does not work: npm builds a
+  git dependency only when it declares `prepare`, chat-ui declares `prepack`,
+  and `files: ["dist", ...]` then filters `src/` out of the pack — npm 10.8.2
+  installs LICENSE/NOTICE/README/config/package.json and no code at all, which
+  fails at bundle time rather than install time. Making it work would mean
+  changing chat-ui's `package.json`, i.e. blocking this repo on another repo's
+  release cycle.
+
+  The pin is a SHA, not a tag, because the public chat-ui mirror carries no
+  tags — it receives one squashed "Release vX" commit per release.
+  `CHATUI_REPO` / `CHATUI_REF` / `CHATUI_VERSION` are overridable build args, so
+  a fork or an unreleased chat-ui needs no edit to this repo. The build asserts
+  the pinned version against both the lockfile and the freshly built tarball,
+  and `tests/unit/system/test_chatui_pin.py` fails if `CHATUI_VERSION` drifts
+  from `frontend/package.json`, if `CHATUI_REF` stops being a full SHA, or if
+  `CHATUI_REPO` stops being the public mirror.
+
+  Verified reproducible: the tarball built from source has sha1
+  `6296e1db...` / `sha512-AiBzIbTJCMtFw...DqVsyEoruMEJg==`, byte-identical to
+  the copy on `registry.npmjs.org` that `package-lock.json` already pins.
+
+### Changed
+
+- **README "Build from source" now describes a path that exists.** It said the
+  UI image needs a private-registry read token and told readers to keep running
+  the published image instead; neither is true any more. It now documents both
+  images end to end — the registry-free `./install.sh --no-pull --no-start`
+  bootstrap, `docker compose build`, the chat-ui pin and how to point it at a
+  fork, what needs x86_64 and disk, and what needs a GPU (running, not
+  building).
+- **Sessions survive a plain-HTTP install.** The refresh cookie was always set
+  `Secure`, and a browser silently discards a `Secure` cookie delivered over
+  `http://` — the URL the quick start tells you to open. The access token
+  lives only in memory, so `POST /api/auth/refresh` answered `401 missing
+  refresh cookie` and every page load, reload or pasted link signed the
+  operator out; on a 15-minute token even sitting still on the live dashboard
+  did it. In-app navigation kept working, which is what made it easy to miss.
+  Both session cookies now derive the flag from the scheme the browser
+  actually used: a trusted `X-Forwarded-Proto` when `VW_TRUST_PROXY_ORIGIN=1`,
+  else the connection's own scheme, else an all-`https://` `VW_FRONTEND_ORIGIN`
+  — so a TLS deployment keeps `Secure` with or without a terminating proxy,
+  and a LAN install stays signed in. The CSRF cookie, which was hardcoded the
+  other way, now agrees with it; that disagreement was the bug's sharpest
+  edge, leaving a session that looked half-alive rather than absent.
+- **A GPU that is already busy says which model has it.** Loading a second
+  model onto an occupied card reported `GPUs [0] already claimed`, naming
+  neither the occupant nor a remedy, and reading like a capacity problem —
+  so the natural response was to lower `gpu_memory_utilization`, which cannot
+  help, because the claim is refused before the engine starts. It now says
+  `GPU 0 is already serving 'qwen2.5-1.5b' — unload it first, or load this
+  model on a free GPU. LLM Warden runs one loaded model per GPU.`
+- **`fit-preview` and `POST /api/models` no longer disagree about their own
+  fields.** The pre-check demanded `repo_id` where the create call takes
+  `hf_repo`, and required a `filename` the create call leaves optional — so
+  writing one body and reusing it for the other produced `Field required` for
+  a field that appears in neither the UI nor the other endpoint. `fit-preview`
+  now accepts `hf_repo` (`repo_id` still works) and resolves the weights file
+  itself when `filename` is omitted. A GGUF repo, which publishes several
+  independent quantisations that fit very differently, still requires an
+  explicit `filename` — and now says so, listing the candidates.
+- **The most likely first-run failure is now diagnosed.** A card already held
+  by another process makes vLLM fail its pre-flight free-memory check before
+  it profiles anything; that error matched no rule, so the model showed only
+  `vllm subprocess exited unexpectedly (rc=1)`. It now reads `Not enough free
+  VRAM on cuda:0 to start: 1.65 GiB free of 15.6 GiB, but this model asks for
+  2.03 GiB (gpu_memory_utilization 0.13). Something else is holding the card
+  …`.
+- **No more `FileNotFoundError` traceback on a model's first load.** Log
+  rotation ran before the log file existed and logged the miss as a warning
+  with a stack trace. Nothing was ever lost; it simply looked like a fault at
+  the exact moment a new operator is watching.
+- **The engine-version control no longer describes itself as pointless.** On
+  the in-container engine driver it explained that a version pin "would be
+  silently discarded" — the pre-#177 behaviour. The supervisor has refused
+  such a pin outright since; the sentence now says so, and names the setting
+  that would enable the control.
+- **`/ui/` no longer flashes an empty Models page before sending you to the
+  sign-in form.** The shell rendered before the session was known, so a
+  signed-out visitor's first impression of the product was a page that
+  appeared broken and then threw them out. The app now waits for the one
+  session check it was already going to make.
+
+### Added
+
+- **The README documents a first run without a browser.** The setup wizard
+  was only ever described as a browser flow, so an unattended install had no
+  documented path at all: the six `/api/setup/*` calls, their order, the
+  400 that tells you which step you are actually on, the password rules
+  (6 characters minimum, 72 bytes maximum), and the CSRF bootstrap whose
+  response key is `csrf` and not `csrf_token` — a wrong guess there returns a
+  flat `403 csrf token invalid` that points at nothing.
+- **The README documents the model lifecycle API** — register, pull, load,
+  unload — including that the three are separate asynchronous steps and that
+  pull progress is a server-sent event stream rather than a JSON document.
+- **The README explains two things about GPUs that surprise everyone**: a GPU
+  hosts one loaded model at a time, and `gpu_memory_utilization` is a fraction
+  of the whole card rather than of the model — which is why a 1.5B model sits
+  in ~15 GB of a 16 GB card at the default 0.9, and why sizing a card by
+  weights alone is wrong.
+- `make smoke` is now offered as the post-install check for every install,
+  not only for a build from source.
+
+### Changed
+
+- The installer warns, before it acts, that installing the NVIDIA Container
+  Toolkit restarts the Docker daemon — which restarts every container on the
+  host, not only this stack's. The README's flag table and requirements say
+  the same.
+
 ## [v2026.09.06.4] — 2026-09-06
 
 ### Fixed

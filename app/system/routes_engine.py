@@ -130,10 +130,18 @@ def _version_pin_obstacle(
             f"image catalogue to pin against."
         )
     if not driver_swaps_images:
+        # The old wording -- "a version pin would be silently discarded" --
+        # described the pre-#177 bug, not what happens now: Supervisor.load
+        # raises EnginePinUnsupported before claiming a GPU, precisely so a
+        # pin can never be discarded silently. Left uncorrected it read as a
+        # control confessing it does nothing, which is a fair thing to
+        # conclude from a sentence saying the input is thrown away. It is a
+        # deployment choice, and the sentence should say so.
         return "driver", (
-            "This deployment runs the in-container engine driver, which cannot "
-            "swap the engine image, so a version pin would be silently "
-            "discarded. Version selection requires the docker engine driver."
+            "This deployment runs the in-container engine driver: the engine "
+            "version is fixed by the warden image, so a pin is refused rather "
+            "than applied. Version selection requires the docker engine "
+            "driver (VW_ENGINE_DRIVER=docker)."
         )
     return None, None
 

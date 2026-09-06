@@ -11,7 +11,14 @@ versions and even contains typos (the real observed string says ``models's``). W
 off invariants and capture numbers opportunistically. No match → ``None`` so
 the caller keeps its existing generic message.
 
-The two failure modes we distinguish carefully (both observed live in production):
+The failure modes we distinguish carefully (all observed live):
+
+  0. **The card was already occupied.** vLLM's pre-flight free-memory check
+     fires before it profiles anything ("Free memory on device cuda:0
+     (1.65/15.6 GiB) on startup is less than desired GPU memory utilization").
+     This is the most likely first-run failure on a host that already runs
+     something, and it used to fall through every rule here, leaving the
+     operator with a bare "vllm subprocess exited unexpectedly (rc=1)".
 
   1. **KV cache too small for context.** vLLM prints its OWN profiled fit
      estimate ("the estimated maximum model length is N"). That estimate beats
@@ -48,6 +55,34 @@ class EngineDiagnosis:
     message: str
     recommended_max_model_len: int | None = None
 
+
+# --- Variant 0: another process already holds the card (pre-flight). --------
+# vLLM's very first memory check, before it profiles anything:
+#   ValueError: Free memory on device cuda:0 (1.65/15.6 GiB) on startup is less
+#   than desired GPU memory utilization (0.13, 2.03 GiB). Decrease GPU memory
+#   utilization or reduce GPU memory used by other processes.
+# It is the single most likely first-run failure on a box that already runs
+# something -- and it used to fall through every rule below, so the operator
+# saw only "vllm subprocess exited unexpectedly (rc=1)" with no hint that the
+# card was simply occupied. Checked FIRST: the check aborts startup before
+# profiling, so no other variant's vocabulary can be present, and the numbers
+# it prints are the whole diagnosis.
+# Deliberately single-line (no DOTALL) and length-bounded between the two
+# halves: vLLM prints this as one sentence, and an unbounded gap would let a
+# stray "Free memory on device ..." INFO line pair up with a "less than
+# desired" sentence hundreds of lines later and invent a diagnosis.
+_FREE_MEM_PREFLIGHT_RE = re.compile(
+    r"free\s+memory\s+on\s+device\s+(\S+?)\s*"
+    r"\(\s*([\d.]+)\s*/\s*([\d.]+)\s*GiB\s*\)"
+    r"[^\n]{0,80}?less\s+than\s+desired",
+    re.IGNORECASE,
+)
+# The requested side of the same sentence: "(0.13, 2.03 GiB)".
+_FREE_MEM_DESIRED_RE = re.compile(
+    r"less\s+than\s+desired\s+GPU\s+memory\s+utilization\s*"
+    r"\(\s*([\d.]+)\s*,\s*([\d.]+)\s*GiB\s*\)",
+    re.IGNORECASE,
+)
 
 # --- Variant 2: no room for the cache blocks (weights/util, NOT context). ----
 # Checked FIRST because this line co-occurs with "KV cache" text and would
@@ -111,6 +146,30 @@ def diagnose_engine_log(text: str) -> EngineDiagnosis | None:
     """Scan an engine-log tail and return an actionable diagnosis, or None."""
     if not text or not text.strip():
         return None
+
+    # Variant 0 — the card was already occupied when the engine started. This
+    # never reaches profiling, so it cannot collide with the variants below.
+    preflight = _FREE_MEM_PREFLIGHT_RE.search(text)
+    if preflight is not None:
+        device, free_gib, total_gib = preflight.groups()
+        parts = [
+            f"Not enough free VRAM on {device} to start: "
+            f"{free_gib} GiB free of {total_gib} GiB"
+        ]
+        desired = _FREE_MEM_DESIRED_RE.search(text)
+        if desired is not None:
+            util, want_gib = desired.groups()
+            parts.append(
+                f", but this model asks for {want_gib} GiB "
+                f"(gpu_memory_utilization {util})"
+            )
+        parts.append(
+            ". Something else is holding the card — free it, pick another GPU, "
+            "or lower gpu_memory_utilization."
+        )
+        return EngineDiagnosis(
+            message="".join(parts), recommended_max_model_len=None
+        )
 
     # Variant 2 first — it shares vocabulary with Variant 1 but the fix differs.
     if _NO_CACHE_BLOCKS_RE.search(text):

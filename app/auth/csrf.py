@@ -6,6 +6,8 @@ from fastapi.responses import JSONResponse
 from starlette.requests import Request
 from starlette.responses import Response
 
+from app.auth.cookies import cookie_secure
+
 
 def generate_csrf_token(session_id: str, *, secret: str) -> str:
     return hmac.new(secret.encode(), session_id.encode(), sha256).hexdigest()
@@ -49,12 +51,18 @@ async def ensure_csrf_id(request: Request, call_next) -> Response:
     response: Response = await call_next(request)
 
     if minted_new:
+        # Same derivation as the refresh cookie (app/auth/cookies.py). These
+        # two used to disagree -- refresh hardcoded Secure, this one hardcoded
+        # not-Secure -- so on the documented plain-HTTP quick start the
+        # browser kept the CSRF cookie and dropped the refresh cookie, and
+        # the session looked half-alive instead of absent. They must agree:
+        # they describe the same connection.
         response.set_cookie(
             _CSRF_COOKIE,
             binding_id,
             httponly=True,
             samesite="strict",
-            secure=False,
+            secure=cookie_secure(request),
             max_age=60 * 60 * 24,
         )
 

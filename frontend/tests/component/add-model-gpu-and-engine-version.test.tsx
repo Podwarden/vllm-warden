@@ -128,7 +128,7 @@ const BACKENDS_NO_PIN = {
       supports_version_pin: true,
       version_pin_available: false,
       version_pin_reason:
-        "This deployment runs the in-container engine driver, which cannot swap the engine image, so a version pin would be silently discarded. Version selection requires the docker engine driver.",
+        "This deployment runs the in-container engine driver: the engine version is fixed by the warden image, so a pin is refused rather than applied. Version selection requires the docker engine driver (VW_ENGINE_DRIVER=docker).",
     },
     {
       name: "vllm",
@@ -137,7 +137,7 @@ const BACKENDS_NO_PIN = {
       supports_version_pin: true,
       version_pin_available: false,
       version_pin_reason:
-        "This deployment runs the in-container engine driver, which cannot swap the engine image, so a version pin would be silently discarded. Version selection requires the docker engine driver.",
+        "This deployment runs the in-container engine driver: the engine version is fixed by the warden image, so a pin is refused rather than applied. Version selection requires the docker engine driver (VW_ENGINE_DRIVER=docker).",
     },
   ],
 };

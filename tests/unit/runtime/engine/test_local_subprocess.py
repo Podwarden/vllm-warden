@@ -67,6 +67,46 @@ async def test_spawn_delimits_each_run_and_keeps_history(tmp_path):
     assert "run-one-output" not in lines[sentinels[1]:]
 
 
+@pytest.mark.asyncio
+async def test_first_load_rotation_is_silent(tmp_path, caplog):
+    """A model's FIRST load has no log file yet -- rotating must say nothing.
+
+    ``_rotate`` stat()s the log before every spawn. On a first load that
+    raised FileNotFoundError, which the blanket ``except OSError`` logged as
+    ``could not rotate ...`` with a full traceback. Nothing was lost (spawn
+    creates the file immediately afterwards and the engine log was captured
+    correctly) but it is the very first thing a new operator sees in the logs
+    and it reads like a fault.
+    """
+    caplog.set_level("WARNING")
+    driver = LocalSubprocessDriver(log_dir=str(tmp_path), log_max_bytes=1024)
+    spec = EngineSpec(model_id="fresh", model_arg="x",
+                      argv=["/bin/sh", "-c", "exit 0"], env={}, port=8010)
+    await (await driver.spawn(spec)).wait()
+
+    assert (tmp_path / "fresh.log").exists()
+    assert caplog.records == [], [r.getMessage() for r in caplog.records]
+
+
+@pytest.mark.asyncio
+async def test_rotation_still_happens_once_the_log_is_big(tmp_path):
+    """The silence above must not have cost us the rotation itself.
+
+    The log shares /data with the SQLite DB; filling that volume takes the
+    database down with it, which is the whole reason rotation exists.
+    """
+    driver = LocalSubprocessDriver(log_dir=str(tmp_path), log_max_bytes=64)
+    log_path = tmp_path / "big.log"
+    log_path.write_text("x" * 200)
+
+    spec = EngineSpec(model_id="big", model_arg="x",
+                      argv=["/bin/sh", "-c", "exit 0"], env={}, port=8011)
+    await (await driver.spawn(spec)).wait()
+
+    assert (tmp_path / "big.log.1").read_text() == "x" * 200
+    assert "x" * 200 not in log_path.read_text()
+
+
 def test_driver_has_no_binary_kwarg():
     """The 'binary' escape hatch existed only so tests could inject /bin/sh
     past the hard-coded head. With argv[0] on the spec it is dead weight, and

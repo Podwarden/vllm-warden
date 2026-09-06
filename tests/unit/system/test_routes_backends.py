@@ -234,6 +234,26 @@ def test_the_reason_names_the_driver_when_the_driver_is_the_blocker(
     assert "docker" in vllm["version_pin_reason"]
 
 
+def test_the_driver_reason_does_not_claim_a_pin_is_discarded(tmp_data_dir, client):
+    """The sentence must describe what happens NOW, not the #177 bug.
+
+    It used to say a version pin "would be silently discarded". Since #177 the
+    supervisor raises EnginePinUnsupported before claiming a GPU -- a pin is
+    refused, loudly, never discarded. Read literally, the old sentence said
+    the control's input is thrown away, which makes the (deliberately visible,
+    deliberately disabled) control look like one that does nothing at all
+    rather than one this deployment could enable.
+    """
+    auth = _ready(tmp_data_dir, client)
+    body = client.get("/api/system/backends", headers=auth).json()
+    vllm = next(b for b in body["backends"] if b["name"] == "vllm")
+    reason = vllm["version_pin_reason"]
+    assert "discard" not in reason.lower()
+    assert "refused" in reason.lower()
+    # And it still names the way out, which is the whole point of the field.
+    assert "VW_ENGINE_DRIVER=docker" in reason
+
+
 def test_the_reason_names_the_backend_when_the_backend_is_the_blocker(
     tmp_data_dir, client
 ):

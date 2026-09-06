@@ -339,7 +339,7 @@ describe("TryStackPanel vLLM-version combobox (#177)", () => {
 
 // #177 driver-capability guard: when the deployment runs the in-container
 // subprocess engine (GET /api/system/engine -> supports_version_select:false),
-// the version selector is meaningless — the pin would be silently discarded.
+// the version selector cannot take effect — the supervisor refuses the pin.
 // The panel must DISABLE the controls and show an explanatory note instead of
 // letting the operator pin a version that won't take effect.
 describe("TryStackPanel driver-capability guard (#177)", () => {
@@ -382,10 +382,10 @@ describe("TryStackPanel driver-capability guard (#177)", () => {
               version_pin_available: opts.supports,
               version_pin_reason: opts.supports
                 ? null
-                : "This deployment runs the in-container engine driver, which " +
-                  "cannot swap the engine image, so a version pin would be " +
-                  "silently discarded. Version selection requires the docker " +
-                  "engine driver.",
+                : "This deployment runs the in-container engine driver: the " +
+                  "engine version is fixed by the warden image, so a pin is " +
+                  "refused rather than applied. Version selection requires " +
+                  "the docker engine driver (VW_ENGINE_DRIVER=docker).",
               version_pin_reason_code: opts.supports ? null : "driver",
             },
           ],

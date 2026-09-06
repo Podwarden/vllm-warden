@@ -681,3 +681,131 @@ def test_kv_reserve_reads_head_dim_and_discounts_sliding_layers(
     body = _post_fit(client, auth, backend="llamacpp").json()
     expected = 2048 * (12 * 131072 + 12 * 128)
     assert body["breakdown"]["kv_reserve"] == expected
+
+
+# ---- Field parity with POST /api/models ---------------------------------
+#
+# These two endpoints describe the same model moments apart in the Add Model
+# flow, and they used to disagree on both of their headline fields:
+# ``repo_id`` here vs ``hf_repo`` on create, and ``filename`` required here
+# vs optional there. A caller who wrote the create body and then tried the
+# pre-check got ``{"type":"missing","loc":["body","repo_id"]}`` -- a field
+# name that appears nowhere in the endpoint they had just used.
+
+
+def test_fit_preview_accepts_hf_repo_the_create_endpoints_spelling(
+    tmp_data_dir, client, monkeypatch,
+):
+    client.get("/healthz")
+    _seed_done(tmp_data_dir / "vllm-warden.db")
+    auth = _jwt_login(client)
+    _install_fake_discover(monkeypatch, info=_qwen_info(), config=_QWEN_CONFIG)
+    _install_fake_gpus(client, [
+        _FakeGpuLive(index=0, name="NVIDIA RTX A4000", memory_total_mib=16376),
+        _FakeGpuLive(index=1, name="NVIDIA RTX A4000", memory_total_mib=16376),
+    ])
+
+    r = client.post("/api/models/fit-preview", json={
+        "hf_repo": "Qwen/Qwen2.5-7B-Instruct",
+        "filename": "model-00001-of-00002.safetensors",
+        "gpu_indices": [0, 1],
+        "max_model_len": 4096,
+    }, headers={**auth, **csrf_header(client)})
+    assert r.status_code == 200, r.text
+    assert r.json()["verdict"] == "green"
+
+
+def test_fit_preview_still_accepts_repo_id(tmp_data_dir, client, monkeypatch):
+    """The frontend and any existing client send ``repo_id``; it must keep
+    working, or aligning the names would be a breaking change dressed up as
+    a consistency fix."""
+    client.get("/healthz")
+    _seed_done(tmp_data_dir / "vllm-warden.db")
+    auth = _jwt_login(client)
+    _install_fake_discover(monkeypatch, info=_qwen_info(), config=_QWEN_CONFIG)
+    _install_fake_gpus(client, [
+        _FakeGpuLive(index=0, name="NVIDIA RTX A4000", memory_total_mib=16376),
+    ])
+
+    r = client.post("/api/models/fit-preview", json={
+        "repo_id": "Qwen/Qwen2.5-7B-Instruct",
+        "filename": "model-00001-of-00002.safetensors",
+        "gpu_indices": [0],
+        "max_model_len": 4096,
+    }, headers={**auth, **csrf_header(client)})
+    assert r.status_code == 200, r.text
+
+
+def test_fit_preview_requires_one_of_the_two_repo_fields(tmp_data_dir, client):
+    client.get("/healthz")
+    _seed_done(tmp_data_dir / "vllm-warden.db")
+    auth = _jwt_login(client)
+    r = client.post("/api/models/fit-preview", json={
+        "filename": "model-00001-of-00002.safetensors",
+        "gpu_indices": [0],
+    }, headers={**auth, **csrf_header(client)})
+    assert r.status_code == 422
+    assert "hf_repo is required" in r.text
+
+
+def test_fit_preview_resolves_the_weights_file_when_filename_is_omitted(
+    tmp_data_dir, client, monkeypatch,
+):
+    """``filename`` is optional, as on POST /api/models. An ordinary
+    multi-file HF repo carries exactly one weights format, so making the
+    caller name a shard was asking them to repeat what discovery knew."""
+    client.get("/healthz")
+    _seed_done(tmp_data_dir / "vllm-warden.db")
+    auth = _jwt_login(client)
+    _install_fake_discover(monkeypatch, info=_qwen_info(), config=_QWEN_CONFIG)
+    _install_fake_gpus(client, [
+        _FakeGpuLive(index=0, name="NVIDIA RTX A4000", memory_total_mib=16376),
+        _FakeGpuLive(index=1, name="NVIDIA RTX A4000", memory_total_mib=16376),
+    ])
+
+    r = client.post("/api/models/fit-preview", json={
+        "hf_repo": "Qwen/Qwen2.5-7B-Instruct",
+        "gpu_indices": [0, 1],
+        "max_model_len": 4096,
+    }, headers={**auth, **csrf_header(client)})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # Resolving a shard must still aggregate the WHOLE set -- the same answer
+    # naming shard 1 explicitly gives.
+    assert body["breakdown"]["file_size"] == 5 * GIB + (2 * GIB + GIB // 2)
+    assert body["verdict"] == "green"
+
+
+def test_fit_preview_will_not_guess_between_gguf_quantisations(
+    tmp_data_dir, client, monkeypatch,
+):
+    """A GGUF repo publishes several INDEPENDENT quantisations that fit very
+    differently. Picking one would answer a question the caller did not ask,
+    so this is the one case where ``filename`` is still required -- and the
+    error lists the candidates instead of saying "Field required"."""
+    info = FakeModelInfo(
+        id="unsloth/Llama-3.3-70B-GGUF",
+        siblings=[
+            FakeSibling("Llama-3.3-70B-Q5_K_M.gguf", size=40 * GIB),
+            FakeSibling("Llama-3.3-70B-Q3_K_S.gguf", size=22 * GIB),
+            FakeSibling("README.md", size=4096),
+        ],
+    )
+    client.get("/healthz")
+    _seed_done(tmp_data_dir / "vllm-warden.db")
+    auth = _jwt_login(client)
+    _install_fake_discover(monkeypatch, info=info, config=None)
+    _install_fake_gpus(client, [
+        _FakeGpuLive(index=0, name="NVIDIA RTX A4000", memory_total_mib=16376),
+    ])
+
+    r = client.post("/api/models/fit-preview", json={
+        "hf_repo": "unsloth/Llama-3.3-70B-GGUF",
+        "gpu_indices": [0],
+    }, headers={**auth, **csrf_header(client)})
+    assert r.status_code == 422, r.text
+    detail = r.json()["detail"]
+    assert detail["error_code"] == "filename_required"
+    assert set(detail["candidates"]) == {
+        "Llama-3.3-70B-Q5_K_M.gguf", "Llama-3.3-70B-Q3_K_S.gguf",
+    }

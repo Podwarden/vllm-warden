@@ -3,6 +3,7 @@ import jwt as pyjwt
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 
+from app.auth.cookies import cookie_secure
 from app.auth.deps import require_jwt
 from app.auth.jwt import decode, mint_access, mint_refresh
 from app.auth.origin import origin_check_dep
@@ -39,10 +40,13 @@ async def login(body: LoginBody, request: Request, response: Response):
     refresh_ttl = settings.session_refresh_ttl_days
     access = mint_access(user.username, secret, ttl_minutes=access_ttl)
     refresh = mint_refresh(user.username, secret, ttl_days=refresh_ttl)
+    # `secure` is derived, never hardcoded: a Secure cookie is discarded by
+    # the browser on a plain-http:// origin, which is the documented quick
+    # start. See app/auth/cookies.py for the derivation and the bug it fixes.
     response.set_cookie(
         "vw_refresh", refresh,
         max_age=refresh_ttl * 86400,
-        httponly=True, secure=True, samesite="strict",
+        httponly=True, secure=cookie_secure(request), samesite="strict",
         path="/api/auth",
     )
     return {"access_token": access, "expires_in": access_ttl * 60}
@@ -53,7 +57,14 @@ async def login(body: LoginBody, request: Request, response: Response):
 async def logout(request: Request, response: Response,
                  user: str = Depends(require_jwt)):
     request.app.state.stream_registry.cancel_user(user)
-    response.delete_cookie("vw_refresh", path="/api/auth")
+    # Match every attribute the cookie was SET with. A browser keys a cookie
+    # on (name, domain, path), so the expiry alone does the deletion -- but a
+    # deletion that disagrees on `secure`/`samesite` is rejected outright by
+    # some browsers, which would leave a live refresh token behind on logout.
+    response.delete_cookie(
+        "vw_refresh", path="/api/auth",
+        httponly=True, secure=cookie_secure(request), samesite="strict",
+    )
     return None
 
 

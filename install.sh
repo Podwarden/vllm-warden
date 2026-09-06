@@ -91,6 +91,8 @@ Environment:
   GPU_TOOLKIT_INSTALL=yes|no   Install the NVIDIA Container Toolkit without
                                asking when Docker lacks the nvidia runtime
                                (yes), or never (no). Unset: ask on a terminal.
+                               "yes" RESTARTS THE DOCKER DAEMON, bouncing every
+                               container on this host, not only LLM Warden's.
   VW_SOURCE_URL                Tarball to download when not run from a checkout.
   VW_REGISTRY                  Image registry prefix (${VW_REGISTRY}).
 EOF
@@ -390,14 +392,24 @@ ensure_nvidia_runtime() {
   warn "  Starting the stack as-is fails with:"
   warn "    could not select device driver \"nvidia\" with capabilities: [[gpu]]"
 
+  # Registering the runtime means writing /etc/docker/daemon.json and
+  # RESTARTING dockerd, which restarts every container on this host -- not
+  # just ours. On a box that already runs other services that is a real
+  # outage, and it must never be a surprise. Said before the prompt so the
+  # answer is informed, and before the unattended run so the log records it.
+  warn "  Doing that RESTARTS the Docker daemon: every container on this host"
+  warn "  stops and starts again, including ones that have nothing to do with"
+  warn "  LLM Warden. Containers with a restart policy come back; anything"
+  warn "  started without one does not."
+
   _do=$GPU_TOOLKIT_INSTALL
   if [ -z "$_do" ]; then
-    if interactive && ask_yn "  Install and configure it now?" y; then _do=yes; else _do=no; fi
+    if interactive && ask_yn "  Install it and restart Docker now?" y; then _do=yes; else _do=no; fi
   fi
   if [ "$_do" != "yes" ]; then
     warn "Skipping. Install it yourself and re-run ./install.sh (or: make preflight):"
     warn "  https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html"
-    warn "  Unattended: GPU_TOOLKIT_INSTALL=yes ./install.sh ..."
+    warn "  Unattended: GPU_TOOLKIT_INSTALL=yes ./install.sh ...  (restarts Docker)"
     return 1
   fi
   if toolkit_installed || install_nvidia_toolkit; then
