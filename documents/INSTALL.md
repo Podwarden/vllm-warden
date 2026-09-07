@@ -653,7 +653,7 @@ fills it.
 
 ### Failure: the load says `failed` with an out-of-memory error
 
-![The Models page showing a model in the failed state, with the error text rendered inline on the card](assets/screenshots/install/model-load-failed-oom.jpg)
+![The Models page showing a model in the failed state, with the error text rendered inline on the card](../assets/screenshots/install/model-load-failed-oom.jpg)
 
 ```
 [17:05:30] failed | GPU ran out of memory loading the model. Use fewer/larger
@@ -692,7 +692,7 @@ fraction, no `max_model_len` tuning.
 
 ### Failure: `GPU 0 is already serving '…'` — this is not a VRAM problem
 
-![The Models page with a second model in the failed state, its error explaining that GPU 0 is already serving another model and that LLM Warden runs one loaded model per GPU](assets/screenshots/install/gpu-already-claimed.jpg)
+![The Models page with a second model in the failed state, its error explaining that GPU 0 is already serving another model and that LLM Warden runs one loaded model per GPU](../assets/screenshots/install/gpu-already-claimed.jpg)
 
 Register a second model on a GPU that already has one loaded and you get:
 
@@ -713,7 +713,7 @@ The remedies are the two the message names: unload the occupant, or pick a free
 GPU index. That is what the trial did, and both models then loaded — one per
 card:
 
-![The Models page with two models both in the loaded state, one on GPU index 0 and one on GPU index 1](assets/screenshots/02-models-list.jpg)
+![The Models page with two models both in the loaded state, one on GPU index 0 and one on GPU index 1](../assets/screenshots/02-models-list.jpg)
 
 Two related things to know:
 
@@ -1139,7 +1139,7 @@ Once `make smoke` passes, the rest is identical to Path A:
 source-built images and got the same answers, including a real completion from a
 model on GPU 0.
 
-![The Stats page after a from-source build, showing host VRAM 15.0 of 31.0 GiB, GPU utilisation, power draw and tokens per second](assets/screenshots/install/stats-after-source-build.jpg)
+![The Stats page after a from-source build, showing host VRAM 15.0 of 31.0 GiB, GPU utilisation, power draw and tokens per second](../assets/screenshots/install/stats-after-source-build.jpg)
 
 ## B7. If you are installing a release older than v2026.09.06.5
 

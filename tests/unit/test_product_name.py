@@ -36,19 +36,55 @@ OLD_PRODUCT_NAME = re.compile(r"vllm\s+warden", re.IGNORECASE)
 
 PRODUCT_NAME = "LLM Warden"
 
-# The surfaces a human actually reads. An explicit allowlist rather than a
-# repo walk: the CI runner's build directory keeps untracked node_modules and
-# root-owned caches from sibling jobs, and this test must not wander into
-# them (nor into changelog.md or docs/superpowers/, which are historical
-# records of work done under the old name and are left as written).
+# The surfaces a human actually reads. DISCOVERY, NOT AN ENUMERATION -- that
+# distinction is the whole point of this block, so do not "simplify" it back
+# into a list of filenames.
+#
+# This used to carry `SCANNED_FILES = ("README.md",)`, and that tuple went
+# stale the moment the README was split by section: five public documents and
+# CONTRIBUTING.md appeared, none of them named here, so the majority of the
+# public prose had no guard at all and nobody was told. `MANAGED_DOCUMENTS` in
+# scripts/sync-shared-docs.py has the same failure mode for the same reason,
+# and the catalogue row is the proof it is not theoretical -- its name, its
+# About text and the template's `stack_label` all still said "vLLM Warden"
+# because no check enumerated them.
+#
+# So the surfaces are found, not listed: every `.md` at the repository root,
+# every `.md` under `documents/` and `.github/` at any depth, plus the code
+# and catalogue trees below. A document added next month is guarded the day it
+# lands.
+#
+# A repo-wide walk is still wrong, hence named trees rather than
+# `REPO_ROOT.rglob`: the CI runner's build directory keeps untracked
+# node_modules and root-owned caches from sibling jobs, and `docs/` is the
+# internal tree, whose plans and postmortems are historical records of work
+# done under the old name and are left as written.
 SCANNED_TREES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("app", (".py", ".html")),
     ("frontend/src", (".ts", ".tsx", ".html", ".svg", ".css")),
     ("deploy/hub", (".md", ".json")),
     ("publish", (".md", ".txt", ".sh")),
+    # The public documentation folder (INSTALL, API, HAZARDS, OPERATING,
+    # ARCHITECTURE today). Published verbatim to GitHub, so it is the largest
+    # block of prose a stranger reads.
+    ("documents", (".md",)),
+    # CONTRIBUTING.md, and any community-health file added beside it
+    # (SECURITY.md, CODE_OF_CONDUCT.md, issue templates) -- GitHub renders
+    # every one of them.
+    (".github", (".md",)),
 )
 
-SCANNED_FILES: tuple[str, ...] = ("README.md",)
+# Every Markdown file at the repository root is public prose and is scanned,
+# with ONE deliberate exemption. Deny-by-default, the same posture as
+# publish/exclude.txt: a new root document is guarded the moment it lands, and
+# opting one out means editing this set in the open rather than forgetting to
+# opt one in.
+#
+# changelog.md is the exemption. It is a historical record -- every release
+# written before the display rename is quoted in it under the old name -- and
+# rewriting history to satisfy a guard would destroy the record it exists to
+# keep.
+ROOT_MARKDOWN_EXEMPT: frozenset[str] = frozenset({"changelog.md"})
 
 
 def _iter_surfaces() -> list[Path]:
@@ -60,21 +96,51 @@ def _iter_surfaces() -> list[Path]:
         for path in sorted(root.rglob("*")):
             if path.is_file() and path.suffix in suffixes:
                 out.append(path)
-    for rel in SCANNED_FILES:
-        path = REPO_ROOT / rel
-        if path.is_file():
+    for path in sorted(REPO_ROOT.glob("*.md")):
+        if path.is_file() and path.name not in ROOT_MARKDOWN_EXEMPT:
             out.append(path)
     return out
 
 
 def test_the_scan_actually_covers_something() -> None:
-    """Self-check: an allowlist that silently matched nothing would make
-    every assertion below vacuously true."""
+    """Self-check: a discovery that silently matched nothing would make every
+    assertion below vacuously true. Each name below stands for one branch of
+    _iter_surfaces, so a tree that stops resolving fails here by name rather
+    than by turning the guard into a no-op."""
     surfaces = _iter_surfaces()
     assert len(surfaces) > 50, f"surface scan found only {len(surfaces)} files"
     assert any(p.name == "landing.html" for p in surfaces)
     assert any(p.name == "nav-bar.tsx" for p in surfaces)
     assert any(p.name == "README.md" for p in surfaces)
+
+    rels = {str(p.relative_to(REPO_ROOT)) for p in surfaces}
+
+    # The root Markdown glob.
+    assert "README.md" in rels
+
+    # The public documentation folder. Asserted as a set relation, not a
+    # hard-coded list: whatever `documents/` holds must be scanned in full,
+    # so a sixth document is covered without touching this test.
+    on_disk = {
+        str(p.relative_to(REPO_ROOT))
+        for p in (REPO_ROOT / "documents").rglob("*.md")
+        if p.is_file()
+    }
+    assert on_disk, "documents/ holds no Markdown -- has the public docs folder moved?"
+    assert on_disk <= rels, f"documents/ files not scanned: {sorted(on_disk - rels)}"
+
+    # The community-health folder GitHub renders.
+    assert ".github/CONTRIBUTING.md" in rels
+
+
+def test_the_root_markdown_exemption_is_deliberate_and_minimal() -> None:
+    """The root glob is deny-by-default; exactly one file opts out.
+
+    A second name appearing here means somebody silenced the guard instead of
+    fixing prose, so it is pinned rather than merely documented."""
+    assert ROOT_MARKDOWN_EXEMPT == frozenset({"changelog.md"})
+    assert (REPO_ROOT / "changelog.md").is_file(), "the exemption names a file that is gone"
+    assert not any(p.name == "changelog.md" for p in _iter_surfaces())
 
 
 def test_no_user_visible_surface_says_vllm_warden() -> None:

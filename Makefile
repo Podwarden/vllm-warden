@@ -123,9 +123,9 @@ generate-api-types:
 	docker run --rm -u $(shell id -u):$(shell id -g) -e HOME=/tmp -v $(PWD):/work -w /work/frontend node:20-slim \
 	  npx -y openapi-typescript@7 ../openapi.json -o src/lib/api-types.generated.ts
 
-# The hazard sections shared between the root docs (HAZARDS.md, INSTALL.md,
-# API.md -- all ship to GitHub) and the Hub catalogue listing are
-# single-sourced from docs/shared/. Same contract as
+# The hazard sections shared between the public docs (documents/HAZARDS.md,
+# documents/INSTALL.md, documents/API.md -- all ship to GitHub) and the Hub
+# catalogue listing are single-sourced from docs/shared/. Same contract as
 # generate-api-types above: the marked regions are generated, hand edits are
 # reverted, and CI diffs them (lint:shared-docs). Stdlib only, so it runs in a
 # bare python image rather than the deps image.

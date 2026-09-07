@@ -5,7 +5,7 @@
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Engines](https://img.shields.io/badge/engines-vLLM%200.26.0%20%C2%B7%20llama.cpp%20b10731-4b8bbe.svg)](#two-engines-and-the-model-that-made-us-add-the-second)
-[![Deploy](https://img.shields.io/badge/deploy-Docker%20Compose-2496ed.svg)](INSTALL.md)
+[![Deploy](https://img.shields.io/badge/deploy-Docker%20Compose-2496ed.svg)](documents/INSTALL.md)
 
 ![LLM Warden stats — a week of GPU utilisation, power draw and throughput across four cards](assets/screenshots/01-stats-overview.jpg)
 
@@ -24,7 +24,7 @@ HuggingFace, load it, mint a key, see what that key spent, watch what the card
 is actually doing. One published port, so your own TLS terminator, ingress,
 SSO or network policy sits in front of it unchanged. Nothing leaves the host:
 no account, no licence check, no analytics, and an
-[offline install](INSTALL.md#a7-offline--air-gapped-install) for machines with
+[offline install](documents/INSTALL.md#a7-offline--air-gapped-install) for machines with
 no route out at all.
 
 The engines themselves are upstream and unmodified — that is a hard rule, and
@@ -55,7 +55,7 @@ calls only when you ask it to: huggingface.co to pull weights
 (`HF_HUB_OFFLINE=1` stops even that), Docker Hub to list published vLLM tags
 when you open the engine-version picker, and the release registry for the
 images — which `docker load` replaces entirely, see
-[Offline / air-gapped install](INSTALL.md#a7-offline--air-gapped-install). On a
+[Offline / air-gapped install](documents/INSTALL.md#a7-offline--air-gapped-install). On a
 host with no route out, none of the three is needed.
 
 **Leaving is a `base_url` change.** Apache-2.0, OpenAI-compatible on the way
@@ -76,13 +76,13 @@ The whole path — install, wizard, key, register, pull, load, a real completion
 — was walked end to end from the published release, on a host it had not been
 developed on, following only what was written down. Four things the
 documentation did not say then have sections of their own now:
-[a first run with no browser](API.md#first-run-without-a-browser), that
-[pull and load are separate asynchronous steps](API.md#adding-a-model-from-the-api)
+[a first run with no browser](documents/API.md#first-run-without-a-browser), that
+[pull and load are separate asynchronous steps](documents/API.md#adding-a-model-from-the-api)
 and pull progress is an SSE stream, that
-[a GPU serves one loaded model at a time](HAZARDS.md#one-loaded-model-per-gpu),
+[a GPU serves one loaded model at a time](documents/HAZARDS.md#one-loaded-model-per-gpu),
 and that
-[`gpu_memory_utilization` is a fraction of the whole card](HAZARDS.md#gpu_memory_utilization-reserves-a-fraction-of-the-whole-card).
-[INSTALL.md](INSTALL.md) is that kind of walk, recorded in full: every command
+[`gpu_memory_utilization` is a fraction of the whole card](documents/HAZARDS.md#gpu_memory_utilization-reserves-a-fraction-of-the-whole-card).
+[documents/INSTALL.md](documents/INSTALL.md) is that kind of walk, recorded in full: every command
 run, every block of output as the terminal printed it.
 
 ## Will it run on my hardware?
@@ -97,15 +97,15 @@ CUDA 13 can target** — Turing through Blackwell, including Ada, Hopper and the
 RTX 50-series — plus PTX, so a card newer than this release JIT-compiles on
 first load instead of finding no backend at all. Narrowing the list to your own
 cards is a build argument and makes the build much shorter:
-[the build works from a plain clone](CONTRIBUTING.md#build-from-source), which
+[the build works from a plain clone](.github/CONTRIBUTING.md#build-from-source), which
 is also where the current list is written down. And FP8 weights on Ampere are numerically
 broken upstream, not slow: the model loads, streams tokens, and emits garbage.
 The product warns about that rather than letting you discover it.
 
 Above the floor, the question is what fits. Measured on 16 GiB cards,
-[What fits on what](HAZARDS.md#what-fits-on-what) says which model classes run
+[What fits on what](documents/HAZARDS.md#what-fits-on-what) says which model classes run
 on one card, which need two, and which quantisations to avoid; the rest of
-[HAZARDS.md](HAZARDS.md) is what to know before the first load. If none of
+[documents/HAZARDS.md](documents/HAZARDS.md) is what to know before the first load. If none of
 this applies to your machine, the next section says so plainly.
 
 ## Don't use this if…
@@ -146,7 +146,7 @@ make smoke      # 200s across / /_landing /ui/ /api/csrf /healthz
 
 The installer checks the host, lets you pick GPUs, generates the secrets, pulls
 the release images and offers to start the stack — every route, every flag and
-the offline install are in [INSTALL.md](INSTALL.md). Open
+the offline install are in [documents/INSTALL.md](documents/INSTALL.md). Open
 `http://YOUR-HOST:8080/ui/`; a first-run wizard covers GPU selection, a
 HuggingFace token and your admin account. Then **Models → Add model**.
 
@@ -160,9 +160,9 @@ Point any OpenAI client at it — LangChain, OpenWebUI, the `openai` SDK, your
 agents. Only the `base_url` and the key change.
 
 Scripting the whole thing instead of clicking?
-[First run without a browser](API.md#first-run-without-a-browser) is the
+[First run without a browser](documents/API.md#first-run-without-a-browser) is the
 six-call version, and
-[Adding a model from the API](API.md#adding-a-model-from-the-api) is the rest.
+[Adding a model from the API](documents/API.md#adding-a-model-from-the-api) is the rest.
 
 ---
 
@@ -194,7 +194,7 @@ IQ3_XXS quant with its vision projector holds `--ctx-size 8192` at 12,039 MiB
 of 16,376 MiB with no CPU offload, and passes a multi-turn chat, arithmetic,
 format-compliance and image-description check through the product's own
 `/v1/chat/completions`, not against the engine port. The full measurement is
-in [ARCHITECTURE.md](ARCHITECTURE.md#two-engines-and-the-model-that-made-us-add-the-second).
+in [documents/ARCHITECTURE.md](documents/ARCHITECTURE.md#two-engines-and-the-model-that-made-us-add-the-second).
 
 The claim is narrow: *a model the product genuinely could not serve is served,
 unmodified, by a different mainline backend.* One row, one field. It is not
@@ -288,7 +288,7 @@ per-token line on someone's invoice.
   prompts, completions and inline images, off by default and held only in a
   bounded in-memory ring. It, and the one other feature that can capture
   content, are described together with their bounds under
-  [Where request content can end up](OPERATING.md#where-request-content-can-end-up).
+  [Where request content can end up](documents/OPERATING.md#where-request-content-can-end-up).
 - **HuggingFace cache manager** — see what is on disk, garbage-collect orphans,
   export and import the whole cache as a tarball.
 - **GPU observability** — per-card telemetry with engine process attribution,
@@ -301,7 +301,7 @@ per-token line on someone's invoice.
 - **Runs with no route out** — three image tarballs plus an optional
   model-cache tarball are the entire transport, and `HF_HUB_OFFLINE=1` stops
   the stack contacting huggingface.co at all. See
-  [Offline / air-gapped install](INSTALL.md#a7-offline--air-gapped-install).
+  [Offline / air-gapped install](documents/INSTALL.md#a7-offline--air-gapped-install).
 
 <table>
 <tr>
@@ -355,7 +355,7 @@ token ids on an explicit allowlist. Both are off by default, and with both off
 the proxy's forward path is the code it would be in a build that never had
 them. Their bounds, and what you must arrange yourself before switching the
 second one on, are under
-[Where request content can end up](OPERATING.md#where-request-content-can-end-up).
+[Where request content can end up](documents/OPERATING.md#where-request-content-can-end-up).
 
 ---
 
@@ -363,26 +363,26 @@ second one on, are under
 
 Each of these is one hop from here and says what it holds.
 
-- [INSTALL.md](INSTALL.md) — the step-by-step install manual, recorded from two
+- [documents/INSTALL.md](documents/INSTALL.md) — the step-by-step install manual, recorded from two
   real installs: the published images (Path A), a build from source (Path B),
   the unattended flags, the no-clone one-liner, the offline / air-gapped
   install, what `make uninstall` does and does not free, and a symptom-to-cause
   table.
-- [API.md](API.md) — driving it without a browser: the six-call first run,
+- [documents/API.md](documents/API.md) — driving it without a browser: the six-call first run,
   minting a key, and register / pull / load from the API, including the four
   fields only a llama.cpp row has.
-- [HAZARDS.md](HAZARDS.md) — five things that cost an afternoon to diagnose and
+- [documents/HAZARDS.md](documents/HAZARDS.md) — five things that cost an afternoon to diagnose and
   a paragraph to prevent: `/dev/shm` and tensor parallelism, one loaded model
   per GPU, what `gpu_memory_utilization` really reserves, what fits on a 16 GiB
   card, why first loads are slow — and how to measure `max_model_len` instead
   of bisecting it.
-- [OPERATING.md](OPERATING.md) — the day-to-day `make` targets, upgrading, the
+- [documents/OPERATING.md](documents/OPERATING.md) — the day-to-day `make` targets, upgrading, the
   URLs once it is running, HTTP against HTTPS, and where request content can
   end up.
-- [ARCHITECTURE.md](ARCHITECTURE.md) — one port and three containers, drivers
+- [documents/ARCHITECTURE.md](documents/ARCHITECTURE.md) — one port and three containers, drivers
   against backends, and the full account of the two engines and what the second
   one costs.
-- [CONTRIBUTING.md](CONTRIBUTING.md) — building both images from source, how
+- [.github/CONTRIBUTING.md](.github/CONTRIBUTING.md) — building both images from source, how
   long that takes and how to make it shorter, the dev targets, and how to add a
   third backend.
 

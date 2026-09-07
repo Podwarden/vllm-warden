@@ -7,9 +7,10 @@ first load is slow, the mandatory cookie secret, the headless first run) are
 true of this product however it was deployed, so both surfaces that document
 it need the same words:
 
-  * the root documents that ship verbatim to the public GitHub mirror --
-    `HAZARDS.md` (the five load-time hazards), `INSTALL.md` (the cookie
-    secret) and `API.md` (the headless first run); `README.md` used to carry
+  * the public documents that ship verbatim to the public GitHub mirror --
+    `documents/HAZARDS.md` (the five load-time hazards),
+    `documents/INSTALL.md` (the cookie secret) and `documents/API.md` (the
+    headless first run); `README.md` used to carry
     all seven before it was split by section, and
   * the PodWarden Hub catalogue row's long `content_md`, whose shared regions
     this script assembles into `docs/catalog-shared-regions.md`.
@@ -51,9 +52,9 @@ CI computes the diff rather than trusting anyone to remember.
 HEADINGS ARE NOT SHARED
 -----------------------
 A fragment holds the BODY of a hazard, never its heading. Each surface owns its
-own headings: the root documents' are linked from the README and from each
-other (`HAZARDS.md#one-loaded-model-per-gpu`,
-`API.md#first-run-without-a-browser`), so an assembler
+own headings: the public documents' are linked from the README and from each
+other (`documents/HAZARDS.md#one-loaded-model-per-gpu`,
+`documents/API.md#first-run-without-a-browser`), so an assembler
 that rewrote them would silently break in-page navigation, and the catalogue
 words some of its headings for a reader who is looking at a deployment form
 rather than a repository. The prose underneath is identical; the sign above the
@@ -79,7 +80,7 @@ Caddy" is catalogue-local and lives outside the markers.
 `docs/` IS STRIPPED FROM THE PUBLIC SNAPSHOT
 --------------------------------------------
 `publish/exclude.txt` drops `/docs/`, so the fragments never reach GitHub. They
-are a build input, not published reading, and NOTHING in a root document may
+are a build input, not published reading, and NOTHING in a published document may
 link to `docs/shared/*` -- the link would 404 for every public reader. The markers name
 a slug, not a path, for exactly that reason.
 
@@ -110,16 +111,17 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 FRAGMENT_DIR = REPO_ROOT / "docs" / "shared"
 
 # Every document whose marked regions this script owns. All are checked by
-# CI. The root documents ship to GitHub (publish/exclude.txt strips /docs/ but
-# nothing at the root); docs/catalog-shared-regions.md is the hand-off to the
-# Hub row. README.md carries no region today -- the hazards moved out to the
-# sectioned documents -- but stays listed so a marker added back to it is
-# still filled and checked rather than silently ignored.
+# CI. The public documents ship to GitHub (publish/exclude.txt strips /docs/
+# but not /documents/, and not the root README);
+# docs/catalog-shared-regions.md is the hand-off to the Hub row. README.md
+# carries no region today -- the hazards moved out to the sectioned documents
+# -- but stays listed so a marker added back to it is still filled and checked
+# rather than silently ignored.
 MANAGED_DOCUMENTS = (
     REPO_ROOT / "README.md",
-    REPO_ROOT / "INSTALL.md",
-    REPO_ROOT / "API.md",
-    REPO_ROOT / "HAZARDS.md",
+    REPO_ROOT / "documents" / "INSTALL.md",
+    REPO_ROOT / "documents" / "API.md",
+    REPO_ROOT / "documents" / "HAZARDS.md",
     REPO_ROOT / "docs" / "catalog-shared-regions.md",
 )
 

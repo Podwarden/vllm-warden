@@ -67,8 +67,8 @@ ARG LLAMACPP_BUILD=b10731
 # for "86-real", 240 s for the old "75-real;86-real", 1069 s for the default
 # below. The cost is linear -- about 77 s of fixed C++/link work plus ~81 s per
 # architecture -- so anyone compiling for one known card should pass the arg and
-# come out FASTER than the old two-card default. README.md and INSTALL.md carry
-# the full table and the 4-core figures.
+# come out FASTER than the old two-card default. README.md and
+# documents/INSTALL.md carry the full table and the 4-core figures.
 #
 # THE -virtual ENTRY IS NOT DECORATION. -real is native SASS for one
 # architecture; -virtual embeds PTX, which the driver JIT-compiles for any

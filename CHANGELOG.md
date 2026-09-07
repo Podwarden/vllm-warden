@@ -7,6 +7,55 @@ release ships.
 
 ## [Unreleased]
 
+## [v2026.09.07.3] — 2026-09-07
+
+### Changed
+
+- **The public documentation moved off the repository root into `documents/`,
+  and `CONTRIBUTING.md` into `.github/`.** A visitor arriving at the GitHub
+  mirror met eight Markdown files before any code. Now the root carries
+  `README.md` and the changelog only: `API.md`, `ARCHITECTURE.md`,
+  `HAZARDS.md`, `INSTALL.md` and `OPERATING.md` are `documents/`, and
+  `CONTRIBUTING.md` is `.github/CONTRIBUTING.md` — one of the three locations
+  GitHub reads community-health files from, so the "Contributing guidelines"
+  prompt on issues and pull requests keeps working. The new folder is
+  `documents/`, not `docs/`, deliberately: `docs/` is the *internal* directory
+  and `publish/exclude.txt` denies it wholesale, so a new internal note is
+  private the moment it is written. Publishing out of `documents/` leaves that
+  deny-by-default posture untouched rather than inverting it into an allow
+  list. `exclude.txt` gains no new rule, only a comment naming the invariant —
+  `docs/` is internal, `documents/` is public — and `docs/shared/` stays where
+  it is, a build input for `scripts/sync-shared-docs.py` rather than reading
+  material.
+- `MANAGED_DOCUMENTS` in `scripts/sync-shared-docs.py` now names
+  `documents/INSTALL.md`, `documents/API.md` and `documents/HAZARDS.md`
+  (`README.md` and `docs/catalog-shared-regions.md` are unchanged), so the
+  seven machine-managed `shared:` regions stay managed instead of silently
+  falling out of the check. Cross-links, the four `assets/screenshots/`
+  image paths in `INSTALL.md`, and the references from `install.sh`,
+  `.env.example`, `Dockerfile`, `Makefile`, `.gitlab-ci.yml` and the
+  headless-first-run test docstring were retargeted with them.
+
+### Fixed
+
+- **The "vLLM Warden" wordmark guard only ever scanned `README.md`, so the
+  documents the README was split into had no guard at all.** `SCANNED_FILES`
+  in `tests/unit/test_product_name.py` was `("README.md",)` and stayed that
+  way through v2026.09.07.2, which means five public documents and
+  `CONTRIBUTING.md` — the majority of the prose a stranger reads — could have
+  carried the old product name past CI. They happened to be clean, which is
+  luck rather than a guard; the catalogue row is what the same gap looks like
+  when the luck runs out, its name, About text and `stack_label` all still
+  branded "vLLM Warden" with no check that enumerated them. The guard now
+  *discovers* its surfaces instead of listing them: every `.md` at the
+  repository root, and every `.md` under `documents/` and `.github/` at any
+  depth, alongside the existing `app/`, `frontend/src/`, `deploy/hub/` and
+  `publish/` trees. A document added next month is covered without anyone
+  editing the test. The root glob is deny-by-default with exactly one named
+  exemption, `changelog.md`, pinned by its own assertion so a second one
+  cannot be added quietly — the file is a historical record and quotes the old
+  name three times by design. `docs/` stays unscanned for the same reason.
+
 ## [v2026.09.07.2] — 2026-09-07
 
 ### Changed

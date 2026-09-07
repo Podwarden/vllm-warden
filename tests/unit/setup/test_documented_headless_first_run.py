@@ -1,7 +1,8 @@
-"""The headless first run, exactly as API.md documents it.
+"""The headless first run, exactly as documents/API.md documents it.
 
-API.md's "First run without a browser" section (a shared fragment, once part
-of the README) prints a `curl` sequence. A stranger following it has no other
+documents/API.md's "First run without a browser" section (a shared fragment,
+once part of the README) prints a `curl` sequence. A stranger following it
+has no other
 reference — there is no OpenAPI link in the public docs and the wizard is
 otherwise browser-only — so if the endpoints,
 their order, their bodies or their response KEYS drift, that section becomes
