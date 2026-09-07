@@ -6,7 +6,7 @@
 # this machine: .env (secrets, port, release) and docker-compose.override.yml
 # (images, GPU passthrough, health checks). Nothing here talks to any server
 # other than the container registry you pull images from, and with --no-pull
-# not even that -- see README "Offline / air-gapped install".
+# not even that -- see INSTALL.md "Offline / air-gapped install".
 #
 # Usage, from a checkout:
 #   ./install.sh                       interactive: picks GPUs, asks to start
@@ -38,7 +38,8 @@ COMPOSE_MIN_MINOR=24
 # 9.2 GB compressed on the wire and unpacks to 19.7 GB of layers; with the
 # containerd image store (the default on a fresh Docker Engine 29) the
 # compressed layers are kept next to the unpacked ones, so the image costs
-# ~29 GB as Docker stores it. README "Requirements" carries the same numbers.
+# ~29 GB as Docker stores it. INSTALL.md "What it will cost you in disk"
+# carries the same numbers.
 DISK_IMAGE_GB=29     # the api image alone, as Docker stores it
 DISK_STACK_GB=40     # the stack with room to run, before any model is pulled
 DISK_FLOOR_GB=20     # under this the api image cannot even be unpacked
@@ -792,7 +793,7 @@ log "Compose configuration validates."
 
 if [ "$PULL" -eq 1 ]; then
   log "Pulling release images ($VERSION)..."
-  docker compose pull || die "Image pull failed. Offline? Load the images first (see README: Offline / air-gapped install) and re-run with --no-pull."
+  docker compose pull || die "Image pull failed. Offline? Load the images first (see INSTALL.md: Offline / air-gapped install) and re-run with --no-pull."
 else
   log "--no-pull: not pulling images; the stack expects them to be loaded already (make load-images)."
 fi

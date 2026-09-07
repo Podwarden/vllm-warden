@@ -1,15 +1,16 @@
-"""The headless first run, exactly as the README documents it.
+"""The headless first run, exactly as API.md documents it.
 
-The README's "First run without a browser" section prints a `curl` sequence.
-A stranger following it has no other reference — there is no OpenAPI link in
-the README and the wizard is otherwise browser-only — so if the endpoints,
+API.md's "First run without a browser" section (a shared fragment, once part
+of the README) prints a `curl` sequence. A stranger following it has no other
+reference — there is no OpenAPI link in the public docs and the wizard is
+otherwise browser-only — so if the endpoints,
 their order, their bodies or their response KEYS drift, that section becomes
 a set of instructions that cannot work, and the reader has no way to tell
 which line is wrong.
 
 This test walks the documented sequence and nothing else. It is a doc test as
-much as a route test: each assertion corresponds to a literal claim in the
-README, and the comment says which one.
+much as a route test: each assertion corresponds to a literal claim in that
+section, and the comment says which one.
 
 The claims under test:
   1. Six calls, in this order, with these bodies.

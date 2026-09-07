@@ -23,6 +23,10 @@ count. If you have no reason to build, take Path A.
 
 Both paths converge at [First run](#first-run-setting-up-without-a-browser).
 
+Path A has three variants that end in the same place: unattended
+([A5](#a5-unattended)), without a clone ([A6](#a6-without-a-clone)), and with
+no route to the internet ([A7](#a7-offline--air-gapped-install)).
+
 ---
 
 ## About the transcripts in this document
@@ -59,7 +63,8 @@ directory is written as `/home/you`, and host addresses are written as
 
 - **Linux x86_64** with Docker Engine and the Docker Compose v2 plugin, 2.24 or
   newer. Check with `docker compose version`. A v5.x plugin is fine — this host
-  ran `Compose 5.5.0` and the installer accepted it without comment.
+  ran `Compose 5.5.0` and the installer accepted it without comment. The
+  generated override uses Compose's `!override` tag.
 - **One or more NVIDIA GPUs** with the driver installed, such that `nvidia-smi`
   lists them.
 - **The NVIDIA Container Toolkit, registered with Docker.** A working
@@ -94,6 +99,41 @@ keeps the compressed layers alongside it. **Every release you keep costs another
 
 Models come on top of that and are not small. The HuggingFace cache — the
 `vw-hfcache` volume — grows with every model you pull and has no bound.
+
+The installer measures free space there, warns under 40 GB, and refuses a
+first pull under 20 GB, where the image cannot even be unpacked (`--check`
+reports the number without installing).
+
+### `VW_COOKIE_SECRET` is mandatory and has no fallback
+
+`install.sh` writes this one for you, so on Path A and Path B you will not
+meet it. Anyone starting the stack any other way will, on the first boot.
+
+<!-- The `shared:` marker pairs in this file fence generated regions. Their text
+     is shared with the PodWarden Hub catalogue listing for this app, and
+     `scripts/sync-shared-docs.py` rewrites them -- a hand edit inside a pair is
+     reverted on the next sync and fails CI in the meantime. Everything outside
+     those markers is hand-written: edit it freely. -->
+
+<!-- shared:cookie-secret -->
+`VW_COOKIE_SECRET` is the session-cookie signing key. It must be set and at
+least 32 characters; there is no default and no generated-on-first-boot
+fallback. A container started without it does not come up degraded — it raises
+`RuntimeError: VW_COOKIE_SECRET must be set and >=32 chars` during startup and
+exits.
+
+`install.sh` generates one into `.env` on a first run. Anywhere else — raw
+`docker compose`, an orchestrator, a CI job — supply it yourself:
+
+```bash
+openssl rand -hex 24
+```
+
+Keep it stable across restarts. Changing it invalidates every existing session
+cookie, so everyone is signed out. `VW_JWT_SECRET`, by contrast, is optional: left
+blank it is minted once and persisted under the data directory, and it only needs
+setting explicitly to share or rotate one across hosts.
+<!-- /shared:cookie-secret -->
 
 ---
 
@@ -287,6 +327,95 @@ make: *** [Makefile:147: smoke] Error 56
 
 Wait fifteen seconds and run `make smoke` again.
 
+## A5. Unattended
+
+The interactive run asks three things — which GPUs, whether to install the
+toolkit, whether to start — and each has a flag, so a script never prompts:
+
+```bash
+./install.sh --gpus all --yes --start                                   # all GPUs, start now
+./install.sh --gpus 0,1 --origin https://llm.example.com --port 8080 --yes
+GPU_TOOLKIT_INSTALL=yes ./install.sh --gpus all --yes                   # also install the toolkit
+./install.sh --gpus none --yes                                          # CPU-only control plane (evaluation, CI)
+./install.sh --check                                                    # preflight only, writes nothing
+```
+
+| Flag | Meaning |
+|---|---|
+| `--dir PATH` | install directory (default: the checkout; `/opt/vllm-warden` or `~/vllm-warden` when downloaded) |
+| `--version TAG` | release to run, e.g. `v2026.09.06.2` or `latest` (default: the newest release in `changelog.md`) |
+| `--gpus all\|none\|0,1` | GPUs passed to the engine, by `nvidia-smi` index |
+| `--origin URL[,URL]` | `VW_FRONTEND_ORIGIN`: the public URL(s) of the UI, enforced by the CSRF check once set |
+| `--port N` | `WARDEN_PORT`: host port of the single published front door (8080) |
+| `--no-generate-secrets` | leave `VW_COOKIE_SECRET` blank for you to fill in |
+| `--no-pull` | do not pull images (air-gapped: `make load-images` first) |
+| `--start` / `--no-start` | start when done / never (default: ask on a terminal) |
+| `-y`, `--yes` | never prompt |
+| `--check` | run the host preflight and stop |
+| `GPU_TOOLKIT_INSTALL=yes\|no` | install the NVIDIA Container Toolkit without asking / never. **`yes` restarts the Docker daemon** — see [A2](#a2-preflight-first) |
+
+Exit statuses are as in [A2](#a2-preflight-first), and so is the warning
+about `GPU_TOOLKIT_INSTALL=yes` restarting every container on the host.
+
+## A6. Without a clone
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Podwarden/vllm-warden/main/install.sh | sh -s -- --dir /opt/vllm-warden
+```
+
+Downloads the source tree into `--dir`, then proceeds exactly as above. Prompts
+still work when piped (the script reads them from the terminal, not stdin); add
+`--yes` for automation.
+
+## A7. Offline / air-gapped install
+
+Nothing in the stack needs the internet at run time except model pulls from
+HuggingFace, and those can be pre-seeded. The transport is three image tarballs
+plus, optionally, a tarball of the model cache; the `make` targets address the
+same image names and volume the stack uses, so nothing is typed twice.
+
+On a machine **with** internet access:
+
+```bash
+VERSION=v2026.09.06.2                                   # pick a release from changelog.md
+git clone https://github.com/Podwarden/vllm-warden.git && cd vllm-warden
+
+# 1. Stage an install (no GPU needed here) and save its images:
+#    vllm-warden, vllm-warden-ui and caddy:2-alpine, all at $VERSION.
+./install.sh --dir /tmp/vw-stage --version "$VERSION" --gpus none --yes
+make -C /tmp/vw-stage save-images IMAGES_FILE=/tmp/llm-warden-$VERSION.tar
+
+# 2. (Optional) pre-seed the model cache. The api pulls with
+#    snapshot_download(cache_dir=<volume root>), so download with the same
+#    layout: models--org--name directories at the top of the tarball.
+pip install -U huggingface_hub
+huggingface-cli download --cache-dir /tmp/hf-seed Qwen/Qwen2.5-7B-Instruct
+tar -C /tmp/hf-seed -cf /tmp/hf-cache.tar .
+```
+
+Copy the source tree (this checkout or the GitHub tarball),
+`llm-warden-$VERSION.tar` and `hf-cache.tar` to the isolated host. There:
+
+```bash
+# Docker, Compose 2.24+, the NVIDIA driver and the NVIDIA Container Toolkit
+# come from your own OS mirrors -- the installer cannot download them here.
+cd vllm-warden
+make load-images IMAGES_FILE=/path/llm-warden-$VERSION.tar
+./install.sh --version "$VERSION" --no-pull --gpus all --yes
+make import-hf-cache CACHE_FILE=/path/hf-cache.tar        # optional
+echo 'HF_HUB_OFFLINE=1' >> .env                           # never contact huggingface.co
+make start
+make smoke
+```
+
+Then add the model in the UI by its HuggingFace name
+(`Qwen/Qwen2.5-7B-Instruct`); with `HF_HUB_OFFLINE=1` the pull resolves from the
+seeded cache. `make export-hf-cache` does the reverse on a running install, so a
+cache warmed on one host can seed the next.
+
+`make smoke` is the right check after this route too: it asserts that the
+front door is really serving, whichever way the images arrived.
+
 ---
 
 # First run: setting up without a browser
@@ -295,7 +424,8 @@ Both paths arrive here. If you would rather click, open
 `http://YOUR-HOST:8080/ui/` and the first-run wizard covers the same ground —
 skip to [Adding a model](#adding-a-model). What follows is the scripted
 equivalent, which was run verbatim on the trial host and produced exactly these
-answers.
+answers. [API.md](API.md#first-run-without-a-browser) is the same sequence in
+compact form, followed by the model-lifecycle calls.
 
 Setup is a strict state machine. Posting out of order returns
 `400 not at <x> step (current: <y>)`. `/api/setup/*` is exempt from the CSRF

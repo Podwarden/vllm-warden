@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fill the marker-delimited shared regions of README.md and the catalogue copy.
+"""Fill the marker-delimited shared regions of the public docs and the catalogue copy.
 
 The operational hazards (the /dev/shm floor, one loaded model per GPU, what
 `gpu_memory_utilization` really reserves, what fits on a 16 GiB card, why the
@@ -7,7 +7,10 @@ first load is slow, the mandatory cookie secret, the headless first run) are
 true of this product however it was deployed, so both surfaces that document
 it need the same words:
 
-  * `README.md`, which ships verbatim to the public GitHub mirror, and
+  * the root documents that ship verbatim to the public GitHub mirror --
+    `HAZARDS.md` (the five load-time hazards), `INSTALL.md` (the cookie
+    secret) and `API.md` (the headless first run); `README.md` used to carry
+    all seven before it was split by section, and
   * the PodWarden Hub catalogue row's long `content_md`, whose shared regions
     this script assembles into `docs/catalog-shared-regions.md`.
 
@@ -26,8 +29,8 @@ Each managed document carries marker pairs:
     ...body, written by this script from docs/shared/shm-sigbus.md...
     <!-- /shared:shm-sigbus -->
 
-Only the region between a pair is machine-managed. Every other line of
-`README.md` is hand-written and stays that way.
+Only the region between a pair is machine-managed. Every other line of the
+managed documents is hand-written and stays that way.
 
 This is on purpose, and it is the part not to "simplify" later. A wholly
 generated README would make every edit -- a typo, a broken link, a sentence
@@ -35,10 +38,11 @@ that reads badly -- require first knowing that an assembler exists and where
 its input lives. Contributors do not know that, they edit the file in front of
 them, and their fix is silently reverted by the next sync. That is how a
 documentation pipeline stops being used: not by breaking, but by making the
-cheap contribution expensive. With markers, a contributor who opens README.md
-to fix a typo just fixes it, unless the typo happens to be inside one of seven
-clearly fenced regions -- and a comment above the first of them names this
-script, so the answer to "why did my edit come back" is one grep away.
+cheap contribution expensive. With markers, a contributor who opens HAZARDS.md
+to fix a typo just fixes it, unless the typo happens to be inside one of the
+clearly fenced regions -- and a comment above the first of them in each file
+names this script, so the answer to "why did my edit come back" is one grep
+away.
 
 The same contract as `frontend/src/lib/api-types.generated.ts`, and the same
 warning: the marked regions are generated, they must never be hand-edited, and
@@ -47,8 +51,9 @@ CI computes the diff rather than trusting anyone to remember.
 HEADINGS ARE NOT SHARED
 -----------------------
 A fragment holds the BODY of a hazard, never its heading. Each surface owns its
-own headings: the README's are linked from elsewhere in the README
-(`#one-loaded-model-per-gpu`, `#first-run-without-a-browser`), so an assembler
+own headings: the root documents' are linked from the README and from each
+other (`HAZARDS.md#one-loaded-model-per-gpu`,
+`API.md#first-run-without-a-browser`), so an assembler
 that rewrote them would silently break in-page navigation, and the catalogue
 words some of its headings for a reader who is looking at a deployment form
 rather than a repository. The prose underneath is identical; the sign above the
@@ -74,8 +79,8 @@ Caddy" is catalogue-local and lives outside the markers.
 `docs/` IS STRIPPED FROM THE PUBLIC SNAPSHOT
 --------------------------------------------
 `publish/exclude.txt` drops `/docs/`, so the fragments never reach GitHub. They
-are a build input, not published reading, and NOTHING in README.md may link to
-`docs/shared/*` -- the link would 404 for every public reader. The markers name
+are a build input, not published reading, and NOTHING in a root document may
+link to `docs/shared/*` -- the link would 404 for every public reader. The markers name
 a slug, not a path, for exactly that reason.
 
 That also means this script has no fragments to read in a public clone. It says
@@ -104,10 +109,17 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # One self-contained fragment per hazard.
 FRAGMENT_DIR = REPO_ROOT / "docs" / "shared"
 
-# Every document whose marked regions this script owns. Both are checked by
-# CI; README.md ships to GitHub, the other is the hand-off to the Hub row.
+# Every document whose marked regions this script owns. All are checked by
+# CI. The root documents ship to GitHub (publish/exclude.txt strips /docs/ but
+# nothing at the root); docs/catalog-shared-regions.md is the hand-off to the
+# Hub row. README.md carries no region today -- the hazards moved out to the
+# sectioned documents -- but stays listed so a marker added back to it is
+# still filled and checked rather than silently ignored.
 MANAGED_DOCUMENTS = (
     REPO_ROOT / "README.md",
+    REPO_ROOT / "INSTALL.md",
+    REPO_ROOT / "API.md",
+    REPO_ROOT / "HAZARDS.md",
     REPO_ROOT / "docs" / "catalog-shared-regions.md",
 )
 

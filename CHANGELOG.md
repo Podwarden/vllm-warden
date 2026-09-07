@@ -7,6 +7,56 @@ release ships.
 
 ## [Unreleased]
 
+## [v2026.09.07.2] — 2026-09-07
+
+### Changed
+
+- **The README is split by section: 1,176 lines became 399, and the rest moved
+  to six root documents it links to.** Nobody finishes a 1,200-line README.
+  What stays answers four questions in order — what this is, whether it runs
+  on your hardware, how to try it, and where the depth is: the opening, *What
+  it is, and what it is not*, a new *Will it run on my hardware?* section
+  (the NVIDIA-only and CUDA 13 floor paragraph, verbatim), *Don't use this
+  if…*, the quick start, the two-engine story in short form with every
+  limitation it carried (no llama.cpp latency histograms, "not reported" never
+  rendered as `0`, the fixed llama.cpp pin, the GGUF tokenizer fallback), the
+  *What you get* table and the nine screenshots, a short pointer on where
+  request content can end up, and a map of the other documents that says what
+  each one holds. Everything else moved, verbatim, to files at the repository
+  root — the only place the publish ships, since `publish/exclude.txt` strips
+  `/docs/`: the install variants (unattended flags, the no-clone one-liner,
+  the offline / air-gapped route) and the mandatory cookie secret merged into
+  `INSTALL.md` as A5–A7 and a *Before you start* subsection rather than
+  spawning a third install document; the headless first run and *Adding a
+  model from the API* are `API.md`; the five load-time hazards and *Measuring
+  instead of guessing* are `HAZARDS.md`; *Day-to-day*, upgrading, HTTP against
+  HTTPS and the full *Where request content can end up* are `OPERATING.md`;
+  the topology and the full two-engine account are `ARCHITECTURE.md`; building
+  from source, the image internals, the dev targets and adding a backend are
+  `CONTRIBUTING.md`. The seven machine-managed `shared:` regions moved with
+  their sections, so `scripts/sync-shared-docs.py` now lists `INSTALL.md`,
+  `API.md` and `HAZARDS.md` alongside `README.md` and the catalogue hand-off in
+  `MANAGED_DOCUMENTS`; the fragments, the check and the CI job are unchanged.
+  `install.sh` and `.env.example` now point at `INSTALL.md` for the offline
+  route instead of a README section that no longer exists.
+
+### Fixed
+
+- **The public content-log description understated its own protections.**
+  *Where request content can end up* — README until this change, now
+  `OPERATING.md` — still said the file "has no rotation and no retention" and
+  "is created with the process's default permissions", and that the
+  `VW_CONTENT_LOG_*` variables were absent from `.env.example`. All three were
+  overtaken by v2026.09.07.1, the same release the text shipped in: the file
+  is created `0600` in a `0700` directory at creation rather than at the umask
+  (an existing file keeps its mode, so a pre-v2026.09.07.1 log still wants one
+  `chmod 600`), `VW_CONTENT_LOG_MAX_BYTES` caps the file at 512 MiB and the
+  writer stops with one warning rather than rotating or deleting (`<= 0`
+  switches it off, as for `VW_ENGINE_LOG_MAX_BYTES`), and all five variables
+  are in `.env.example`. What was still true stays: nothing prunes the file,
+  it shares the volume with the SQLite database, and `VW_CONTENT_LOG_MAX_CHARS`
+  bounds a record, not the file.
+
 ## [v2026.09.07.1] — 2026-09-07
 
 ### Security
