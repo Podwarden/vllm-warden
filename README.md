@@ -9,86 +9,97 @@
 
 ![LLM Warden stats — a week of GPU utilisation, power draw and throughput across four cards](assets/screenshots/01-stats-overview.jpg)
 
-You have a box with GPUs in it. Possibly two cards bought eighteen months apart,
-because that is how a machine under a desk grows. You want what is on it to be
-reachable the way a hosted API is reachable — a base URL, a key, a client library
-that already exists — without one container per model, a
-`--tensor-parallel-size` you arrived at by bisection, and `nvidia-smi` open in a
-second terminal to find out why a request is slow.
+You have NVIDIA GPUs — in a rack, in a workstation, or two cards bought
+eighteen months apart in a box under a desk. You want what is on them to be
+reachable the way a hosted API is reachable: a base URL, a key, and a client
+library that already exists. And you want the things a hosted API gives you as
+a matter of course and a bare engine does not give you at all — a separate key
+per consumer, usage attributed to it, and a straight answer about what the
+hardware is doing — without one container per model, a
+`--tensor-parallel-size` you arrived at by bisection, and `nvidia-smi` open in
+a second terminal to find out why a request is slow.
 
 LLM Warden is the control plane around the engines. Pull a model from
-HuggingFace, load it, mint a key, watch what the card is actually doing. The
-engines themselves are upstream and unmodified — that is a hard rule, and
+HuggingFace, load it, mint a key, see what that key spent, watch what the card
+is actually doing. One published port, so your own TLS terminator, ingress,
+SSO or network policy sits in front of it unchanged. Nothing leaves the host:
+no account, no licence check, no analytics, and an
+[offline install](#offline--air-gapped-install) for machines with no route out
+at all.
+
+The engines themselves are upstream and unmodified — that is a hard rule, and
 [the second engine exists because of it](#two-engines-and-the-model-that-made-us-add-the-second).
 
 ---
 
-## What this probably looks like from here
+## What it is, and what it is not
 
-You have seen a lot of these. Some fair objections, answered as directly as they
-can be:
+It is a wrapper, and that is the whole claim. It does not make models faster,
+it does not fork an engine, and it will not do anything to your tokens that
+`vllm serve` would not. What it adds is the part nobody ships: model
+lifecycle, per-key auth with usage accounting, and an honest view of the GPU.
 
-**"Another LLM wrapper."** It is a wrapper, and that is the whole claim. It does
-not make models faster, it does not fork an engine, and it will not do anything
-to your tokens that `vllm serve` would not. What it adds is the part nobody
-ships: model lifecycle, per-key auth, and an honest view of the GPU.
+**The shape of it.** Three containers behind one Caddy front door on a single
+published port; JWT sessions with CSRF on the control plane and bearer tokens
+on `/v1/*`; a SQLite store with numbered migrations; an engine watchdog that
+probes `/health` rather than trusting the process tree; `mypy --strict`
+against a committed baseline, and a pytest suite that runs in a container.
+`make lint`, `make typecheck`, `make test` — all three on a clean checkout, no
+host Python.
 
-**"A Gradio script with a Dockerfile."** Three containers behind one Caddy front
-door, JWT sessions with CSRF on the control plane and bearer tokens on `/v1/*`,
-a SQLite store with numbered migrations, an engine watchdog that probes
-`/health` rather than trusting the process tree, `mypy --strict` against a
-committed baseline, and a pytest suite that runs in a container. `make lint`,
-`make typecheck`, `make test` — all three on a clean checkout, no host Python.
+**The hardware it runs on.** NVIDIA only — no ROCm, no Metal, no CPU serving
+path. vLLM's own support matrix applies unchanged, because it is upstream's
+image. **The floor is Turing (sm_75)**: the base image ships CUDA 13, which
+dropped Maxwell, Pascal and Volta, so a GTX 1080 Ti, a Titan X or a V100 will
+not work here and no rebuild changes that. Above that floor the llama.cpp
+binary shipped in the api image carries native SASS for **every architecture
+CUDA 13 can target** — Turing through Blackwell, including Ada, Hopper and the
+RTX 50-series — plus PTX, so a card newer than this release JIT-compiles on
+first load instead of finding no backend at all. Narrowing the list to your own
+cards is a build argument and makes the build much shorter:
+[the build works from a plain clone](#build-from-source), which is also where
+the current list is written down. And FP8 weights on Ampere are numerically
+broken upstream, not slow: the model loads, streams tokens, and emits garbage.
+The product warns about that rather than letting you discover it.
 
-**"It won't support my GPU."** Possibly true, and here is the specific shape of
-it. NVIDIA only — no ROCm, no Metal, no CPU serving path. vLLM's own support
-matrix applies unchanged, because it is upstream's image. The llama.cpp binary
-shipped in the api image is compiled as native SASS for **sm_75 and sm_86 only**
-(Turing and Ampere), with no PTX fallback, so any other card needs a rebuild with
-your own `CMAKE_CUDA_ARCHITECTURES` — one line in `Dockerfile`, and
-[the build works from a plain clone](#build-from-source). And FP8 weights on
-Ampere are numerically broken upstream, not slow: the model loads, streams
-tokens, and emits garbage. The product warns about that rather than letting you
-discover it.
+**Nothing reports to us.** No account, no licence check, no analytics, no
+callback — [`install.sh`](install.sh) and
+[`docker-compose.yml`](docker-compose.yml) are the entire deployment and you
+can read both. No part of a request leaves the host. The stack makes outbound
+calls only when you ask it to: huggingface.co to pull weights
+(`HF_HUB_OFFLINE=1` stops even that), Docker Hub to list published vLLM tags
+when you open the engine-version picker, and the release registry for the
+images — which `docker load` replaces entirely, see
+[Offline / air-gapped install](#offline--air-gapped-install). On a host with
+no route out, none of the three is needed.
 
-**"It will phone home."** Nothing reports to us. No account, no licence check, no
-analytics, no callback — [`install.sh`](install.sh) and
-[`docker-compose.yml`](docker-compose.yml) are the entire deployment and you can
-read both. It makes outbound calls only when you ask it to: huggingface.co to
-pull weights (`HF_HUB_OFFLINE=1` stops even that), Docker Hub to list published
-vLLM tags when you open the engine-version picker, and the release registry for
-the images — which `docker load` replaces entirely, see
-[Offline / air-gapped install](#offline--air-gapped-install).
-
-**"I'll be locked in."** Apache-2.0. OpenAI-compatible on the way in, so leaving
-is a `base_url` change. The weights sit in an ordinary HuggingFace cache volume
-that `make export-hf-cache` hands you as a tarball. The exact argv each engine
-was launched with is a GET away (`/api/models/{id}/effective-argv`), so
+**Leaving is a `base_url` change.** Apache-2.0, OpenAI-compatible on the way
+in. The weights sit in an ordinary HuggingFace cache volume that
+`make export-hf-cache` hands you as a tarball. The exact argv each engine was
+launched with is a GET away (`/api/models/{id}/effective-argv`), so
 reproducing a working configuration outside this product is copy and paste.
 
-**"The demo works and then nothing does."** The usual cause is a README written
-by people who already knew the answers. This one was walked end to end from the
-published release on a host it had not been developed on, following only what is
-written here — install, wizard, key, register, pull, load, a real completion.
-Four things it did not tell you then are now sections of their own:
+**What is automatic, and what is not.** A dead engine under a live wrapper is
+detected, its evidence is captured and the model is reloaded without you —
+that one exists because the engine core died four times in one day while the
+`vllm serve` wrapper stayed alive and the proxy kept forwarding to a corpse.
+Other things are deliberately not automatic: the wall-clock request reaper is
+**off by default** (`request_max_wall_s`), and a GPU is claimed by one model
+until you unload it.
+
+This README was walked end to end from the published release, on a host it had
+not been developed on, following only what is written here — install, wizard,
+key, register, pull, load, a real completion. Four things it did not say then
+are sections of their own now:
 [a first run with no browser](#first-run-without-a-browser), that
 [pull and load are separate asynchronous steps](#adding-a-model-from-the-api)
 and pull progress is an SSE stream, that
-[a GPU serves one loaded model at a time](#one-loaded-model-per-gpu),
-and that `gpu_memory_utilization` is a fraction of the whole card.
-
-**"I'll be babysitting it."** Partly. A dead engine under a live wrapper is
-detected, its evidence is captured and the model is reloaded without you — that
-one is genuinely automatic, and it exists because the engine core died four
-times in one day while the `vllm serve` wrapper stayed alive and the proxy kept
-forwarding to a corpse. Other things are not automatic and are not pretended to
-be: the wall-clock request reaper is **off by default**
-(`request_max_wall_s`), and a GPU is claimed by one model until you unload it.
+[a GPU serves one loaded model at a time](#one-loaded-model-per-gpu), and that
+`gpu_memory_utilization` is a fraction of the whole card.
 
 ## Don't use this if…
 
-Genuinely. These are not solvable by configuration, and finding out later is
-worse.
+None of these are solvable by configuration.
 
 - **You have no NVIDIA GPU.** There is no ROCm, Apple Silicon or CPU-serving
   path. `--gpus none` starts the control plane for evaluation and CI; nothing
@@ -104,8 +115,7 @@ worse.
   an ownership rule enforced before an engine starts. No amount of tuning gets
   past it.
 - **You want tensor parallelism out of llama.cpp.** It splits layers, not
-  tensors. For a model too large for one card, vLLM is still the right answer,
-  and this README will not pretend otherwise.
+  tensors. For a model too large for one card, vLLM is still the right answer.
 - **Your host is not Linux x86_64.** The api image is built on upstream's CUDA
   base and needs both.
 
@@ -190,12 +200,12 @@ exact format compliance, and a correct description of an image generated for the
 test — through the product's own `/v1/chat/completions`, not against the engine
 port.
 
-**This is not "vLLM is bad".** It is one sentence, and it is the entire
-argument: *a model the product genuinely could not serve is served, unmodified,
-by a different mainline backend.* One row, one field. Being locked to a single
-engine does not make the other models slower — it makes them unavailable.
+The claim is narrow: *a model the product genuinely could not serve is served,
+unmodified, by a different mainline backend.* One row, one field. It is not
+that vLLM is bad. It is that being locked to a single engine does not make the
+other models slower — it makes them unavailable.
 
-Three more true things, without the marketing:
+Three consequences:
 
 - **GGUF quantisation fits larger models onto smaller cards.** A 27B model on
   one 16 GiB card is a 3-bit quant's whole point.
@@ -243,13 +253,18 @@ that vLLM can also serve stays available to vLLM.
 
 ## What you get
 
-A bare engine is a single-model process. This is what sits around it:
+A bare engine is a single-model process. This is what sits around it — and
+once the hardware is bought, a request costs electricity rather than a
+per-token line on someone's invoice.
 
 | A bare engine | With LLM Warden |
 |---|---|
 | One model per container, restart to switch | Register, pull, load and unload from the browser |
 | One engine, take it or leave it | vLLM **and** llama.cpp, chosen per model |
-| A single shared API key, or none | Per-key tokens with rate limits, priority lanes, rotation grace windows |
+| A single shared API key, or none | A key per consumer, each with its own token-rate limit, priority lane and rotation grace window |
+| No record of who used what | Requests, prompt tokens and completion tokens rolled up per key and per client IP |
+| No way to see what a client actually sent | God Mode: an opt-in, in-memory live view of prompts and completions, off by default |
+| A port per engine to expose | One published port — your own TLS terminator, ingress, SSO or network policy goes in front of it |
 | `nvidia-smi` in a second terminal | Per-card VRAM, utilisation, power, temperature against the driver's own throttle point, PCIe width, ECC, NVLink |
 | No idea why a request is slow | Live request table, TTFT and duration distributions from the proxy, KV-cache pressure and preemptions where the engine reports them |
 | Hand-edited `--tensor-parallel-size` | Guided setup, a fit preview before you pull, and a stress test that measures the ceiling |
@@ -261,8 +276,23 @@ A bare engine is a single-model process. This is what sits around it:
   window.
 - **Model lifecycle** — pull from HuggingFace, hot-swap without restarting the
   container, per-model settings, GGUF on either engine.
-- **Multi-token auth** — per-key rate limits, priority lanes, rotation grace
-  windows, usage attributed by key and by client IP.
+- **Per-key auth and accounting** — one token per consumer, each with its own
+  token-per-second rate limit (`VW_RATE_LIMIT_WINDOW_S` sets the window it is
+  measured over), priority lane and rotation grace window. Requests, prompt
+  tokens and completion tokens are attributed to the key that spent them and
+  to the IP that called; `GET /api/tokens/{id}/usage` returns the same
+  1 h / 24 h / 7 d rollup the page draws, minute by minute.
+- **Request-level visibility** — a live table of what is in flight: key,
+  client IP, model, context used against `max_model_len`, prefill or decode,
+  and whether the caller has already disconnected. Finished requests are
+  persisted with TTFT, duration and how each one ended. All of that is
+  metadata: the `request_history` table has no column that holds prompt or
+  completion text.
+- **Reading what a client actually sent** — God Mode is an opt-in live view of
+  prompts, completions and inline images, off by default and held only in a
+  bounded in-memory ring. It, and the one other feature that can capture
+  content, are described together with their bounds under
+  [Where request content can end up](#where-request-content-can-end-up).
 - **HuggingFace cache manager** — see what is on disk, garbage-collect orphans,
   export and import the whole cache as a tarball.
 - **GPU observability** — per-card telemetry with engine process attribution,
@@ -270,7 +300,12 @@ A bare engine is a single-model process. This is what sits around it:
   whether two cards have a path to each other before splitting a model across
   them.
 - **Single-port topology** — one Caddy front door on `:8080` serves UI, control
-  API and the OpenAI shim, so one reverse-proxy rule covers everything.
+  API and the OpenAI shim, so one reverse-proxy rule covers everything. It does
+  not want to own your edge: terminate TLS where you already terminate it.
+- **Runs with no route out** — three image tarballs plus an optional
+  model-cache tarball are the entire transport, and `HF_HUB_OFFLINE=1` stops
+  the stack contacting huggingface.co at all. See
+  [Offline / air-gapped install](#offline--air-gapped-install).
 
 <table>
 <tr>
@@ -310,6 +345,64 @@ index each one holds.</td>
 and a suggestion pass driven by the model config and the VRAM actually detected.</td>
 </tr>
 </table>
+
+---
+
+## Where request content can end up
+
+By default no prompt or completion text is stored anywhere. `request_history`
+— the table behind the requests chart and the per-key rollups — has no column
+that holds it; it carries identifiers, token counts, timings and finish
+reasons, and that is the whole of the metadata path. Two diagnostic features
+can capture content. Both are off by default, and with both off the proxy's
+forward path is the code it would be in a build that never had them.
+
+**God Mode** (`VW_GODMODE_ENABLED`) streams prompts, completions and any
+inline images to one privileged viewer — the way to settle "the model said X"
+when the client is somebody else's code. What it keeps lives in a bounded
+in-memory ring: 2000 events and ~4 million characters by default
+(`VW_GODMODE_RING_EVENTS`, `VW_GODMODE_RING_CHARS`), oldest evicted first,
+with inline images in a separate bounded store beside it. Nothing reaches the
+database or the disk, and all of it is gone when the container restarts. A
+prompt longer than `VW_GODMODE_MAX_PROMPT_CHARS` (16000) is captured as its
+head plus a `VW_GODMODE_PROMPT_TAIL_CHARS` tail, so the newest turn survives a
+large repeated system prompt — display-only, and never a change to what is
+forwarded. The bearer token never reaches the viewer; only the key's name
+does. While it is on, that text sits in the api container's memory and any
+holder of the admin session can read it: there is no separate role that
+cannot, because the project has no roles.
+
+**The content log** (`VW_CONTENT_LOG_ENABLED`) is the one that writes to disk.
+Each logged request appends a JSON line — prompt, completion, token counts,
+finish reason — to `VW_CONTENT_LOG_PATH`, which defaults to
+`/data/logs/content.jsonl`. That is the persistent data volume, the same one
+that holds the SQLite database, so the file is inside whatever backs that
+volume up. It is scoped as well as gated: a request is logged only when the
+flag is on **and** its token id appears in `VW_CONTENT_LOG_TOKENS`, an
+explicit comma-separated allowlist that is empty by default. There is no "log
+everything" mode. `VW_CONTENT_LOG_MAX_CHARS` (40000) caps the prompt and the
+completion within each record.
+
+Three properties of that file to know before enabling it:
+
+- **It has no rotation and no retention.** `VW_CONTENT_LOG_MAX_CHARS` bounds
+  each line, not the file; nothing in the product prunes, truncates or rotates
+  it, and it is append-only for as long as the switch is on.
+- **It shares a volume with the database.** Letting it grow until that volume
+  is full is an outage, not merely a large file.
+- **It is created with the process's default permissions.** No restrictive
+  mode is set on the file or on the `logs` directory it lives in.
+
+Rotation, retention, permissions and shipping are yours to arrange.
+
+`VW_RUNAWAY_MODE=log` has no sink of its own. It attaches its trip signal to a
+record the content log was already going to write, so it captures nothing
+unless content logging is enabled *and* the request's token is on that
+allowlist.
+
+`VW_GODMODE_ENABLED` is in `.env.example`; the content-log variables are not.
+Set those in `.env` yourself, or in the environment of whatever runs the api
+container.
 
 ---
 
@@ -923,13 +1016,43 @@ make restart
 make smoke
 ```
 
-**How long the build takes depends on your core count, not your connection.**
-Measured cold on a 16-core/32-thread host: **5 min 09 s**, and **284 s of that
-— 92% — is compiling llama.cpp** for `sm_75;sm_86` at `-j32`. On 4-8 cores
-expect 20-40 minutes. Add roughly 9 GB of download if the CUDA base image is
-not already in your local Docker cache, and 1-3 minutes if the pip and npm
-cache mounts are cold. The base image is a one-time cost; the compile is paid
-on every `--no-cache` build.
+**How long the build takes depends on your core count, not your connection —
+and by default it is long.** Measured cold on a 16-core/32-thread host
+(Ryzen 9 5950X): **about 19 minutes**, of which **1069 s — 94% — is compiling
+llama.cpp** at `-j32` for the thirteen CUDA architectures the default targets.
+On 4-8 cores that one step is **1-3 hours**. Add roughly 9 GB of download if
+the CUDA base image is not already in your local Docker cache, and 1-3 minutes
+if the pip and npm cache mounts are cold. The base image is a one-time cost;
+the compile is paid on every `--no-cache` build, and BuildKit reuses it on
+every build after that.
+
+**If you are building for your own cards, say so and the build gets shorter
+than it ever was.** The architecture list is a build argument:
+
+```bash
+# one card, one architecture — sm_86 is Ampere (RTX 30xx, A4000, A100 is 80)
+docker compose build --build-arg LLAMACPP_CUDA_ARCHS="86-real" api
+```
+
+Measured on the same 32-thread host, the llama.cpp step alone:
+
+| `LLAMACPP_CUDA_ARCHS` | compile | `/opt/llamacpp` in the image |
+| --- | --- | --- |
+| `86-real` (one card) | 158 s | 68 MB |
+| `75-real;86-real` (what this repo shipped before) | 240 s | 85 MB |
+| the default: all 12 + `90-virtual` | 1069 s | 285 MB |
+
+The cost is linear — roughly 77 s of fixed work plus 81 s per architecture at
+`-j32` — so scale it by your own core count, but not past your RAM: the build
+allows one parallel compilation per 512 MiB and caps `-j` there, so a 4 GiB
+machine compiles 7-wide however many cores it has. Override with
+`--build-arg LLAMACPP_BUILD_JOBS=N`. Your card's number is its compute
+capability without the dot: `nvidia-smi --query-gpu=compute_cap --format=csv`.
+Use `-real` for a card you own; add `-virtual` only if you want PTX.
+
+The wide default exists because the *published* image has to run on hardware we
+do not have. If you are compiling anyway, you know your hardware, and one
+architecture is the right answer.
 
 Or one image at a time:
 
@@ -949,14 +1072,21 @@ this base is Ubuntu 22.04 with CUDA 13 — its `libggml-cuda.so` wants sonames
 this image does not ship, and carrying the CUDA 12.8 runtime to satisfy it would
 add ~2.4 GiB. Building from an upstream tag *inside* the base image makes glibc,
 libstdc++ and CUDA match by construction. Nothing about the source is modified,
-and the whole addition is ~85 MB of files — under 1% of the image.
+and the whole addition is ~285 MB of files at the default architecture list
+(85 MB if you narrow it to one card) — well under 1% of the image.
 
-CUDA architectures are pinned to `75-real;86-real` — Turing and Ampere, as
-native SASS with no PTX fallback. **If your cards are anything else, change that
-line before building**, or the shipped llama.cpp has no kernels for them.
-(Upstream's default compiles seven architectures and emits Turing as PTX only,
-costing a multi-second JIT on first load.) vLLM is unaffected: it comes from
-upstream's image with upstream's architecture support.
+CUDA architectures come from `ARG LLAMACPP_CUDA_ARCHS`, whose default is every
+architecture this base image's `nvcc --list-gpu-arch` accepts —
+`75 80 86 87 88 89 90 100 103 110 120 121`, all as `-real` native SASS — plus
+`90-virtual` for PTX. The PTX entry is the one that matters for hardware that
+does not exist yet: `-real` alone means an unrecognised card has no kernels at
+all, while PTX means the driver JIT-compiles once and the card works. It is
+`compute_90` rather than the numerically highest because llama.cpp's own CMake
+rewrites any `12X` to `12Xa`, and `-a` PTX is locked to that one architecture —
+`90` is the highest architecture-generic PTX the toolchain still offers, and is
+the same fallback upstream llama.cpp ships. `Dockerfile` explains all of this at
+the ARG. vLLM is unaffected either way: it comes from upstream's image with
+upstream's architecture support.
 
 The api image needs an x86_64 host. No GPU is needed to *build* it — only to run
 it. Expect a large download and 40+ GB of free disk. Every patch it applies is

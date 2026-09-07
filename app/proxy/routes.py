@@ -799,7 +799,7 @@ async def _forward(request: Request, model, host: str, port: int, path: str, tok
                 # plus the trip signal + think-token count as an incident.
                 if do_content_log:
                     if detector is not None and detector.tripped:
-                        content_log.write_entry(
+                        await content_log.write_entry(
                             request.app.state.settings,
                             token_id=token_id,
                             model_id=model.id,
@@ -818,7 +818,7 @@ async def _forward(request: Request, model, host: str, port: int, path: str, tok
                             },
                         )
                     else:
-                        content_log.write_entry(
+                        await content_log.write_entry(
                             request.app.state.settings,
                             token_id=token_id,
                             model_id=model.id,
@@ -896,7 +896,7 @@ async def _forward(request: Request, model, host: str, port: int, path: str, tok
             await _release_slot()
             if do_content_log:
                 if detector.tripped:
-                    content_log.write_entry(
+                    await content_log.write_entry(
                         request.app.state.settings,
                         token_id=token_id,
                         model_id=model.id,
@@ -918,7 +918,7 @@ async def _forward(request: Request, model, host: str, port: int, path: str, tok
                     nat_finish = None
                     if out.get("choices"):
                         nat_finish = out["choices"][0].get("finish_reason")
-                    content_log.write_entry(
+                    await content_log.write_entry(
                         request.app.state.settings,
                         token_id=token_id,
                         model_id=model.id,
@@ -1042,7 +1042,7 @@ async def _forward(request: Request, model, host: str, port: int, path: str, tok
         completion, finish_reason = content_log.parse_nonstream(
             content, path.endswith("/chat/completions")
         )
-        content_log.write_entry(
+        await content_log.write_entry(
             request.app.state.settings,
             token_id=token_id,
             model_id=model.id,

@@ -7,6 +7,310 @@ release ships.
 
 ## [Unreleased]
 
+## [v2026.09.07.1] — 2026-09-07
+
+### Security
+
+- **The content log was created at the process umask — world-readable prompts.**
+  `content_log.py` created `/data/logs/` and `content.jsonl` with no mode at
+  all, so on a stock image (umask 0o022) a file holding users' prompts and
+  completions verbatim landed as 0o644 in a 0o755 directory. The directory is
+  now created 0700 and the file 0600, both applied by `mkdir(2)`/`open(2)` at
+  creation, so there is no window in which the file exists world-readable and
+  the modes do not depend on the umask. An **existing** file or directory keeps
+  the mode it has: this runs on every logged request and must not undo an
+  operator's deliberate widening once per request. The flip side is that a
+  content log written by an earlier build keeps its old mode — if you have one,
+  `chmod 600` it once.
+
+### Added
+
+- **The five content-logging variables are in the configuration contract at
+  last.** `VW_CONTENT_LOG_ENABLED`, `VW_CONTENT_LOG_TOKENS`,
+  `VW_CONTENT_LOG_PATH`, `VW_CONTENT_LOG_MAX_CHARS` and `VW_RUNAWAY_MODE` have
+  been read by `app/config.py` since the content logger shipped, but appeared
+  in neither `.env.example` nor the PodWarden Hub catalogue's `env_schema` —
+  while `VW_GODMODE_ENABLED`, which only ever holds content in RAM, was in
+  both. An operator auditing what this stack can retain, by reading the file
+  the README calls the configuration contract, concluded it retains nothing.
+  The entries spell out what the defaults do not: content logging is off and
+  needs *both* the flag and the request's token id allowlisted (there is no
+  log-everything mode); the destination is the persistent data volume, shared
+  with the SQLite database; nothing rotates or prunes it — `stats_pruner.py`
+  covers `request_history` and the sample tables only — so filling that volume
+  is an outage, not a disk-space nuisance; `VW_CONTENT_LOG_MAX_CHARS` caps a
+  record, not the file; and `VW_RUNAWAY_MODE=log` writes *through* the
+  content-log sink, so it captures nothing on its own. No default changed.
+
+- **`VW_CONTENT_LOG_MAX_BYTES` — a ceiling on the content log itself, default
+  512 MiB.** `VW_CONTENT_LOG_MAX_CHARS` has only ever bounded one *record*; the
+  file had no cap at all, on the volume that also holds the SQLite database.
+  512 MiB because the Hub template pins `vllm-warden-data` at 10 GiB shared
+  with that database, so it leaves the database an order of magnitude of
+  headroom while still holding roughly 6,000 records at the ~80 KB a
+  default-capped record costs. **On reaching the ceiling the logger stops
+  writing and logs one warning naming the file and the limit. It does not
+  rotate and it does not delete.** The hazard here is an outage rather than a
+  tidiness problem, so the right response is a human looking at it — and
+  keeping one rotated generation, as `VW_ENGINE_LOG_MAX_BYTES` does for engine
+  logs, would both make the real budget 2x the number in the variable and
+  throw away the incidents the logger was armed to capture. Archive or remove
+  the file, or turn `VW_CONTENT_LOG_ENABLED` off, to resume. `0` or negative
+  switches the ceiling off, the same convention `VW_ENGINE_LOG_MAX_BYTES`
+  uses. In `.env.example`, in the Hub `env_schema` **and** in both compose
+  `environment:` blocks that reach a container.
+
+### Fixed
+
+- **The content log wrote synchronously on the event loop.** `write_entry` did
+  open/write/close with no `await`, called straight from the async forward
+  path (five call sites in `app/proxy/routes.py`). The image runs a **single**
+  uvicorn worker, so nothing absorbed it: every *other* in-flight request —
+  SSE chunks being pumped to other clients included — stalled for the duration
+  of an ~80 KB synchronous disk write, once per logged request. The module's
+  own contract claimed it "never breaks or delays the response", which was
+  true only of the request being logged, whose scheduler slot is released
+  first. The write now happens on a worker thread via
+  `anyio.to_thread.run_sync`, and `write_entry` is a coroutine the forward path
+  awaits. Ordering survives the move: a thread pool is exactly the interleaving
+  the single worker used to rule out, so each record's place in the file is
+  fixed on the event loop before the offload and the worker drains that queue
+  under a lock — order in the file is submission order, and concurrent callers
+  coalesce into one append instead of one apiece. Only reachable with content
+  logging enabled; disabled, the forward path is unchanged.
+
+- **`VW_CONTENT_LOG_PATH` silently escaped the data volume.** It defaulted to
+  the literal `/data/logs/content.jsonl` while the volume it belongs on comes
+  from `VW_DATA_DIR` — a knob the Hub template exposes and interpolates. Move
+  the data directory and the content log kept writing to `/data/logs/`, which
+  is then no longer the mount: the records landed on the container's writable
+  layer, filled the **node's** disk instead of the volume, and vanished on
+  restart, silently on all three counts. It now defaults to
+  `<VW_DATA_DIR>/logs/content.jsonl`; an explicit `VW_CONTENT_LOG_PATH` still
+  wins, and blank counts as unset (the compose files render it as
+  `"${VW_CONTENT_LOG_PATH:-}"`, and an empty value would otherwise become
+  `Path(".")` — the process working directory). Both compose sources and the
+  Hub `env_schema` dropped their hardcoded `/data/logs/content.jsonl`, which
+  had been overriding the derivation on every install. For anyone on the
+  default `VW_DATA_DIR=/data` the path is byte-identical to before.
+
+- **`VW_CONTENT_LOG_MAX_CHARS=-1` disabled the per-record cap.** `_cap` read
+  `if max_chars >= 0 and len(text) > max_chars`, so a negative value wrote
+  every record in full — flatly contradicting the module's contract, and `-1`
+  is exactly the value an operator reaches for, since `VW_REQUEST_MAX_WALL_S=0`
+  does mean "no cap" a few lines away in the same `.env.example`. An
+  undocumented escape hatch on the only bound the records had. A character
+  count has no negative reading, so a negative one is now clamped to 0 —
+  capture nothing, keep the record's metadata — with a warning at start-up
+  naming the variable. That is the fail-safe direction: an operator who meant
+  "unlimited" sees empty prompts immediately and fixes the value, where the old
+  behaviour handed them unbounded records and an eventual full volume with no
+  warning at all. `.env.example`, the config comment and the docstring now all
+  say the same thing: there is no value that means unlimited.
+
+- **The write-failure handler amplified the failure it reports.** Every
+  exception was swallowed with `log.warning(..., exc_info=True)` — a full
+  traceback per logged request. The failure this file causes is a full volume,
+  so once it arrived the handler added write pressure to a disk already out of
+  space, once per request, for as long as the logger stayed armed. The first
+  failure is now logged in full, naming the path; identical repeats (keyed on
+  the exception's type and message, so a *different* fault still gets its own
+  report) are counted and suppressed. A successful write clears the
+  suppression and reports how many were swallowed, so a transient fault cannot
+  silence the warning permanently.
+
+- **Those same five knobs reached no container.** `install.sh` writes the api
+  service's `environment:` block explicitly, and Compose passes nothing to a
+  service that does not name a variable — so setting any of them in `.env` did
+  nothing whatever. They are now forwarded in the generated
+  `docker-compose.override.yml` with their existing defaults, and added to the
+  Hub template's compose source for the same reason (an `env_schema` entry
+  alone advertises a knob that never arrives). Behaviour for anyone not setting
+  them is unchanged.
+
+- **The shipped llama.cpp only had kernels for the two cards on one developer's
+  desk.** `Dockerfile` compiled it with
+  `-DCMAKE_CUDA_ARCHITECTURES="75-real;86-real"` — Turing and Ampere as native
+  SASS, and `-real` emits SASS and nothing else. `cuobjdump --list-elf` on the
+  published `libggml-cuda.so` returned exactly `sm_75, sm_86`, and
+  `--list-ptx` returned nothing at all, so there was no JIT fallback either.
+  On an Ada (RTX 40-series, L4, L40S), Hopper (H100) or Blackwell (RTX 50-series,
+  B200) card the product's second engine was not slow, it was **absent** — on
+  hardware it should be good at. The narrowing was deliberate and documented,
+  but it optimised for one build host rather than for everyone who installs the
+  published image.
+
+  The list is now `ARG LLAMACPP_CUDA_ARCHS`, defaulting to every architecture
+  the base image's toolchain can target. Not assumed — read out of the pinned
+  base with `nvcc --list-gpu-arch` (CUDA 13.0, V13.0.88):
+  `75 80 86 87 88 89 90 100 103 110 120 121`, all as `-real`, **plus
+  `90-virtual`**. That PTX entry is the point of the change as much as the SASS
+  is: it is the difference between a card nobody has heard of yet being slow for
+  a few seconds on first load and it not working at all. It is `compute_90`
+  rather than the numerically highest because llama.cpp's own CMake rewrites any
+  plain `12X` to `12Xa` (verified by running it: *"Replacing 121-virtual … with
+  121a-virtual"*), and an `-a` PTX blob JITs for that one architecture and
+  nothing else — `90` is the highest architecture-generic PTX CUDA 13 offers and
+  is upstream llama.cpp's own forward-compatibility fallback.
+
+  Verified in the built binary rather than inferred from a clean compile:
+  `cuobjdump --list-elf` now reports `sm_75 80 86 87 88 89 90 100 103 110 120a
+  121a` — the list exactly, with `120a`/`121a` being upstream's deliberate FP4
+  substitution — and `--list-ptx` reports 142 blobs at `.target sm_90`. The
+  RPATH arrangement, the `GGML_STATIC` decision, the full clone and the `ldd`
+  assertion are untouched and still pass; `llama-server --version` from the
+  built image reports `build 10731`, and the rebuilt `libggml-cuda.so` was
+  loaded on real hardware (an sm_86 RTX A4000 and an sm_75 Quadro RTX 5000),
+  where it registers the CUDA backend and enumerates both cards.
+
+  **This costs build time, and it is a build argument precisely so you do not
+  have to pay it.** Measured on 16 cores / 32 threads, the llama.cpp compile
+  step alone: 158 s for `86-real`, 240 s for the old `75-real;86-real`, 1069 s
+  for the new default — about 77 s of fixed work plus 81 s per architecture, so
+  a cold `docker compose build` on that host goes from 5 min to ~19 min, and on
+  4–8 cores the step runs for 1–3 hours. `/opt/llamacpp` grows 85 MB → 285 MB
+  and the api image 28.9 GB → 29.3 GB (+1.4%). Anyone building from source for
+  a card they own should pass
+  `--build-arg LLAMACPP_CUDA_ARCHS="86-real"` and finish *faster than before
+  this change*. The wide list stays the default because the default is what CI
+  publishes and what an unknown card has to run on; the README and `INSTALL.md`
+  both carry the table and the 4-core figure up front.
+
+### Changed
+
+- **The llama.cpp compile no longer takes `-j$(nproc)` on trust — it is bounded
+  by memory as well as by cores.** Widening the architecture list is what made
+  the old `-j"$(nproc)"` unsafe: each `.cu` became 13 device compilations
+  instead of 2, so every parallel lane now holds a `cicc`/`cudafe++`/`ptxas`
+  child roughly 6.5x longer and all of them are heavy at once, where before
+  they were briefly heavy and then idle. Core count stopped describing the
+  peak. On the first CI run that ever attempted the full list this was not
+  subtle: on a 12-core, 3.7 GiB shared runner the 12 nvcc lanes' children held
+  1921 MB resident plus 797 MB swapped, and the kernel's OOM killer took
+  **buildkitd** — not any compiler — 14% into the compile, so the build died as
+  `rpc error: code = Unavailable ... EOF` with nothing in it naming memory. Any
+  other pipeline building on that host during the window would have failed the
+  same way.
+  The build now allows one job per 512 MiB of build memory, capped by `nproc`
+  and following a cgroup limit when the builder has one. 512 MiB is the largest
+  single lane measured in that OOM report, rounded down — not a small number
+  picked to feel safe. Because it is a per-lane budget rather than a ceiling it
+  binds only below 512 MiB per core, so the 16C/32T host the architecture
+  figures were measured on still gets all 32 lanes and is not slowed at all;
+  the 3.7 GiB runner drops to `-j7` and completes instead of being killed. The
+  chosen value is echoed into the build log, and
+  `--build-arg LLAMACPP_BUILD_JOBS=N` overrides the whole calculation.
+
+- **CI's merge-request image build compiles two CUDA architectures, not
+  thirteen.** No shipped behaviour changes here and no default moves — the
+  Dockerfile still defaults to the full list, which is what `docker build`
+  from a plain clone gets and what the published image is built from — but what
+  a green merge-request pipeline *means* does change, so it is written down.
+  `build-image` is a smoke test: it runs `--output type=cacheonly`, pushes
+  nothing, and nothing downstream reads it. With the widened list it took
+  3439 s, of which 3386.6 s was the llama.cpp compile alone (pipeline 21410,
+  job 244827), on one of only two runners with the disk for a ~9 GB CUDA base.
+  Worse, it was a trap: that run had 12 cores and 6966 MiB and so compiled at
+  `-j12`, while the other eligible runner has 3839 MiB and lands on `-j7`,
+  which extrapolates the same compile to ~5900 s against a 3600 s job timeout.
+  Both runs of the full list happened to be scheduled onto the roomier host;
+  the first one that was not would have failed as an unexplained timeout.
+  Merge-request builds now pass `LLAMACPP_CUDA_ARCHS=86-real;90-virtual` —
+  one of each kind, so both the SASS and the PTX code paths are still
+  exercised. Measured on the same runner at the same `-j12`, the compile step
+  goes **3386.6 s → 1368.6 s**. Those two points fit about 1000 s of fixed work
+  plus ~184 s per architecture, which is worth writing down because it is not
+  the shape the 16C/32T figures above imply: the architecture list was ~2020 s
+  of the old 3387 s and that is what this recovers, but the ~1370 s left is
+  llama.cpp's own C++ compile and link and no shorter list touches it. Dropping
+  to a single architecture would save ~184 s and cost a codegen path, so this
+  is the floor for the arg. The slow runner's `-j7` extrapolation comes down
+  from ~5900 s to ~2400 s, which is the point: inside the timeout instead of
+  past it. A narrow build can never hit the registry build cache, which `main`
+  writes with the full list — but it does hit the runner's own builder cache,
+  so that ~1370 s is paid once per build host per 24 h and the next push to the
+  same merge request came back green in **11.66 s**.
+  **A green merge-request build no longer proves the twelve-architecture
+  compile works.** That is proven, unnarrowed, on every push to `develop`,
+  again on `main` (which is also the sole writer of the BuildKit cache and so
+  must build the full list or leave the next release to compile it cold), and
+  finally on the tag by `publish:images`, which builds the artefact that
+  ships. To force the full compile on a branch before merging,
+  `glab ci run -b <branch> --variables VW_FORCE_IMAGE_BUILD:1` still does it:
+  that is not a merge-request event, so it gets the Dockerfile default.
+
+- **The public README speaks to whoever owns the GPUs, and stops narrating its
+  own argument.** Two problems, both in the front half. First, the
+  objection-handling scaffolding was visible: a section literally titled
+  *"What this probably looks like from here"* opened with *"You have seen a lot
+  of these"* and then answered seven quoted objections in bold. Every fact in
+  it survives — it is a wrapper and that is the whole claim; three containers,
+  JWT/CSRF, numbered migrations, the `/health` watchdog, `mypy --strict`; the
+  exact shape of the GPU support; nothing phones home; leaving is a `base_url`
+  change; what is automatic and what deliberately is not — but they now arrive
+  as plain statements under **What it is, and what it is not**, a title that
+  says what the section contains rather than what it is doing to the reader.
+  The quoted-objection format, the "you have seen"/"possibly true, and here is
+  the specific shape of it"/"partly"/"genuinely"/"without the marketing"
+  framing devices, and the two sentences that commented on how READMEs are
+  written are gone. `## Don't use this if…` stays: a real disqualification list
+  is information, not a move.
+- Second, the opening addressed only a hobbyist ("a machine under a desk").
+  It now names the frame both audiences share — NVIDIA GPUs in a rack, a
+  workstation or under a desk; an OpenAI-compatible API on them, with keys,
+  accounting and visibility — and surfaces capability that already shipped but
+  was under-sold or buried: per-key usage accounting (requests, prompt and
+  completion tokens, per key and per client IP, `GET /api/tokens/{id}/usage`),
+  per-token rate limiting and its `VW_RATE_LIMIT_WINDOW_S` window, the single
+  published port that expects your own TLS terminator/ingress/SSO in front of
+  it, request-level visibility over in-flight and finished requests, the
+  air-gapped install as a headline rather than an Install subsection, and the
+  fact that a request costs electricity rather than a per-token invoice line.
+- **New section: "Where request content can end up".** The README makes a
+  data-residency claim in its opening ("Nothing leaves the host"), and both
+  content-capture features are individually honest about their bounds — but a
+  reader assembling those into "this product never puts my prompts on disk"
+  would be wrong, and would find that out from a `content.jsonl` on a volume.
+  The question is now answered in one place, in order: the default (neither is
+  on, and with them off the forward path is the code it would be without
+  them); God Mode, in-memory and bounded and gone on restart; the content log,
+  which writes prompt and completion text to `/data/logs/content.jsonl` on the
+  same persistent volume as the SQLite database, gated by
+  `VW_CONTENT_LOG_ENABLED` **and** an explicit `VW_CONTENT_LOG_TOKENS`
+  allowlist that is empty by default, with `VW_CONTENT_LOG_MAX_CHARS` (40000)
+  capping each record; and what neither does — `request_history` has no
+  payload column, and the metadata path stays metadata. Three properties of
+  that file are stated because none is obvious from the switch: it has no
+  rotation and no retention and nothing ever prunes it, it shares a volume
+  with the database so filling that volume is an outage, and it is created
+  with default permissions. `VW_RUNAWAY_MODE=log` is documented as having no
+  sink of its own — it enriches a record the content log was already writing.
+- **God Mode is documented in the README for the first time, with its
+  constraints rather than as a bare feature.** It is the only way to read what
+  a client actually sent, and the qualifications are the load-bearing part for
+  anyone evaluating this for a team: off by default (`VW_GODMODE_ENABLED`),
+  and with it off the proxy forward path is the code it was before the feature
+  existed; a bounded in-memory ring (2000 events / ~4M characters by default)
+  that is evicted oldest-first and lost on restart; nothing written to the
+  database or to disk; long prompts captured head-plus-tail, display-only,
+  never altering what is forwarded; the bearer token never reaching the
+  viewer. Stated equally plainly: while it is enabled, prompt and completion
+  text is held in the api container's memory and any holder of the admin
+  session can read it, because the project has no roles. Documented as a
+  switch to turn on, use and turn off — not a posture to leave a shared
+  deployment in. The neighbouring `request_history` bullet now says explicitly
+  that the persisted table is metadata and has no prompt or completion column,
+  so the two are not confused.
+  No limitation was softened: NVIDIA-only, the FP8-on-Ampere warning, the
+  llama.cpp architecture pin, the tensor-parallelism limit and the cost of the
+  second engine (no latency histograms) all stay as plainly stated as before.
+- **The llama.cpp CUDA architecture list is stated in exactly one place.** It
+  was written out in three (the objections section, the build-timing note and
+  the build-from-source note); the canonical statement is now the one under
+  [Build from source](README.md#build-from-source), where the `Dockerfile` line
+  you would change actually lives, and the other mentions cross-reference it.
+  Widening the build is one line to update rather than three.
+
 ## [v2026.09.06.6] — 2026-09-06
 
 ### Fixed

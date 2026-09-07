@@ -13,12 +13,32 @@
 //
 // Fetch is stubbed globally so the auth-fetch wrapper runs end to end,
 // mirroring delete-model-modal.test.tsx.
+//
+// ---------------------------------------------------------------------------
+// NO WALL CLOCK ANYWHERE IN THIS FILE.
+// ---------------------------------------------------------------------------
+// This suite has failed twice in CI on a contended runner, both times on an
+// assertion whose correctness depended on how much real time had passed, and
+// both times it was retried green rather than investigated. Neither failure
+// was a defect in the component.
+//
+// Every wait here is therefore expressed as "yield until the thing I already
+// know has started has finished", with an ITERATION ceiling and no time
+// budget. `waitFor` and `findBy*` are deliberately absent: their 1 s
+// real-timer budget is the wrong instrument for that question, because a
+// descheduled worker expires the budget without the work ever being late.
+//
+// The mirror hazard is just as real and is what bit the second time: an
+// assertion is also unsound when the state it names is only true for a
+// BOUNDED window of real time. Fixtures here therefore hold a state open
+// until the test has finished looking at it, rather than letting the next
+// poll take it away. See the transient-poll-failure test.
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
+  act,
   render,
   screen,
   fireEvent,
-  waitFor,
   cleanup,
   within,
 } from "@testing-library/react";
@@ -65,11 +85,84 @@ function renderModal(props: Record<string, unknown> = {}) {
       modelId="m-1"
       servedModelName="qwen3-8b"
       maxModelLen={32768}
-      // Fast enough that waitFor sees several polls without fake timers.
+      // Fast enough that a handful of yields covers several polls without
+      // fake timers.
       pollIntervalMs={5}
       {...props}
     />,
   );
+}
+
+/**
+ * Yield the event loop once and flush React's response to whatever settled.
+ *
+ * The point is what it does NOT have: a deadline. `waitFor` gives up after a
+ * budget of real time, which is the wrong instrument for "the work I already
+ * know has started has finished" — a descheduled CI worker expires that budget
+ * without the work ever having been late. A `setTimeout(0)` drains the pending
+ * microtasks (fetch → Response → json → setState) and the `act` flush commits
+ * the render; a stalled process merely arrives at it later.
+ *
+ * Note the shape: the yield is OUTSIDE `act`, and the flush is `act`'s
+ * SYNCHRONOUS form. The obvious `await act(async () => { await sleep(0) })`
+ * looks equivalent and is not — its async form refuses to resolve until it
+ * observes an empty act queue, and this modal refills that queue on every
+ * turn of the loop as soon as its poll timer is chronically overdue, which is
+ * the normal condition on a contended runner with a 5 ms interval. Measured:
+ * with every poll retry late, the async form never returns and the test dies
+ * on the runner's own timeout after 60 s; this form passes with each poll
+ * 2000 ms late, just slower. The synchronous flush drains what is queued now
+ * and returns, so it is bounded by construction. Updates that land during the
+ * unwrapped yield are picked up by the very next flush, and React emits no
+ * act warning for them (verified: zero across the file).
+ */
+async function settle(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  act(() => {});
+}
+
+/**
+ * How many times `settleUntil` will yield before giving up.
+ *
+ * This is a COUNT OF TURNS, not a time budget, and that distinction is the
+ * whole point. A descheduled worker needs exactly as many turns as a fast one
+ * — each turn simply takes longer in wall clock — so no amount of scheduling
+ * delay can exhaust this, and a stall can only make the suite slower, never
+ * red. The ceiling exists solely so a genuinely broken component fails loudly
+ * here instead of hanging until the runner's own job timeout.
+ *
+ * Measured turns needed by the conditions in this file: 7 at worst (three
+ * failing polls), then 5, 4, 2, and 1 or 0 for the rest — and IDENTICAL under
+ * 24 busy loops on 10 cores, which is the evidence for the paragraph above.
+ * The 200 is therefore ~28x the worst case, not a budget anyone is spending.
+ */
+const MAX_SETTLES = 200;
+
+/**
+ * Yield until `holds()` is true, or fail after MAX_SETTLES turns.
+ *
+ * Only ever point this at a MONOTONE condition — one that, once true, stays
+ * true for the rest of the test. A condition that flips back (the poll-error
+ * banner, which the next successful poll clears) can be missed between two
+ * turns, and hardening the wait does not fix that: the fixture has to hold
+ * the state open instead.
+ */
+async function settleUntil(holds: () => boolean, what: string): Promise<void> {
+  for (let i = 0; i < MAX_SETTLES; i += 1) {
+    if (holds()) return;
+    await settle();
+  }
+  if (holds()) return;
+  throw new Error(
+    `settleUntil: ${what} — still false after ${MAX_SETTLES} yields. ` +
+      `This is a stuck component, not a slow one: the ceiling counts turns ` +
+      `of the event loop, not milliseconds.`,
+  );
+}
+
+/** Convenience: the commonest monotone condition in this file. */
+function present(testId: string): () => boolean {
+  return () => screen.queryByTestId(testId) !== null;
 }
 
 /** No runs at all — the usual state when the modal first opens. */
@@ -99,9 +192,15 @@ describe("StressTestModal — confirm phase", () => {
 
     fireEvent.click(ack);
     expect(screen.getByTestId("stress-start")).not.toBeDisabled();
+
+    // The mount-time adopt probe is still in flight. Drain it inside `act`
+    // rather than leaving it to resolve after `cleanup()` — an unowned
+    // setState landing in the next test's window is exactly the kind of
+    // cross-test ordering this file must not depend on.
+    await settle();
   });
 
-  it("never presents a mode as crash-free, and shows honest estimates", () => {
+  it("never presents a mode as crash-free, and shows honest estimates", async () => {
     installFetchStub((url) => {
       if (url.endsWith("/capabilities")) return json(NO_RUNS);
       throw new Error(`Unmocked: ${url}`);
@@ -123,6 +222,8 @@ describe("StressTestModal — confirm phase", () => {
     expect(screen.getByText("~15 min")).toBeInTheDocument();
     expect(screen.getByText("~30–45 min")).toBeInTheDocument();
     expect(screen.getByText("2.5–4 h")).toBeInTheDocument();
+
+    await settle(); // see the note in the test above
   });
 
   it("POSTs the selected mode with acknowledge_disruption and force:false", async () => {
@@ -139,9 +240,8 @@ describe("StressTestModal — confirm phase", () => {
     fireEvent.click(screen.getByTestId("stress-acknowledge"));
     fireEvent.click(screen.getByTestId("stress-start"));
 
-    await waitFor(() =>
-      expect(screen.getByTestId("stress-running")).toBeInTheDocument(),
-    );
+    // Monotone: with no matching run row the modal never leaves `running`.
+    await settleUntil(present("stress-running"), "the running phase");
     const post = calls.find((c) => c.method === "POST" && c.url.endsWith("/stress"));
     expect(post).toBeDefined();
     expect(JSON.parse(post!.body!)).toEqual({
@@ -178,10 +278,10 @@ describe("StressTestModal — confirm phase", () => {
     fireEvent.click(screen.getByTestId("stress-acknowledge"));
     fireEvent.click(screen.getByTestId("stress-start"));
 
-    await waitFor(() =>
-      expect(screen.getByTestId("stress-conflict")).toHaveTextContent(
-        /serving traffic/i,
-      ),
+    // Monotone: `conflict` is only ever cleared by another Start.
+    await settleUntil(present("stress-conflict"), "the 409 conflict notice");
+    expect(screen.getByTestId("stress-conflict")).toHaveTextContent(
+      /serving traffic/i,
     );
     // Refused and not yet forced: Start must not fire the same request again.
     expect(screen.getByTestId("stress-start")).toBeDisabled();
@@ -189,9 +289,7 @@ describe("StressTestModal — confirm phase", () => {
     fireEvent.click(screen.getByTestId("stress-force"));
     fireEvent.click(screen.getByTestId("stress-start"));
 
-    await waitFor(() =>
-      expect(screen.getByTestId("stress-running")).toBeInTheDocument(),
-    );
+    await settleUntil(present("stress-running"), "the running phase after force");
     const posts = calls.filter(
       (c) => c.method === "POST" && c.url.endsWith("/stress"),
     );
@@ -228,9 +326,7 @@ describe("StressTestModal — running phase", () => {
     renderModal();
     fireEvent.click(screen.getByTestId("stress-acknowledge"));
     fireEvent.click(screen.getByTestId("stress-start"));
-    await waitFor(() =>
-      expect(screen.getByTestId("stress-running")).toBeInTheDocument(),
-    );
+    await settleUntil(present("stress-running"), "the running phase");
     return calls;
   }
 
@@ -249,20 +345,22 @@ describe("StressTestModal — running phase", () => {
       ],
     }));
 
-    await waitFor(() =>
-      expect(screen.getAllByTestId("stress-probe-row")).toHaveLength(2),
+    // Monotone: every poll returns the same two observations, so once the
+    // rows are on screen they stay on screen.
+    await settleUntil(
+      () => screen.queryAllByTestId("stress-probe-row").length === 2,
+      "both probe rows",
     );
     expect(screen.getByText("pass")).toBeInTheDocument();
     expect(screen.getByText("degraded")).toBeInTheDocument();
     expect(screen.getByTestId("stress-phase")).toHaveTextContent("bracket");
 
     // More than one poll, and every one of them a plain GET — the design
-    // rejects SSE replay for progress outright.
-    await waitFor(() => {
-      const polls = calls.filter((c) => c.url.endsWith("/capabilities"));
-      expect(polls.length).toBeGreaterThan(1);
-      expect(polls.every((c) => c.method === "GET")).toBe(true);
-    });
+    // rejects SSE replay for progress outright. A call count only ever grows,
+    // so this too is monotone.
+    const pollsSoFar = () => calls.filter((c) => c.url.endsWith("/capabilities"));
+    await settleUntil(() => pollsSoFar().length > 1, "a second poll");
+    expect(pollsSoFar().every((c) => c.method === "GET")).toBe(true);
     expect(vi.isMockFunction(globalThis.EventSource)).toBe(false);
   });
 
@@ -270,9 +368,14 @@ describe("StressTestModal — running phase", () => {
     await startRun(() => ({
       runs: [{ id: "r-1", status: "running", observations: [] }],
     }));
-    const bar = await screen.findByRole("progressbar");
-    // Indeterminate ARIA: announcing 0% would be a lie, not a default.
-    expect(bar).not.toHaveAttribute("aria-valuenow");
+    await settleUntil(
+      () => screen.queryByRole("progressbar") !== null,
+      "the progress bar",
+    );
+    // Indeterminate ARIA: announcing 0% would be a lie, not a default. No
+    // poll in this stub ever carries a total, so the absence is permanent —
+    // this is not a snapshot of a passing moment.
+    expect(screen.getByRole("progressbar")).not.toHaveAttribute("aria-valuenow");
 
     cleanup();
 
@@ -286,21 +389,57 @@ describe("StressTestModal — running phase", () => {
         },
       ],
     }));
-    await waitFor(() =>
-      expect(screen.getByRole("progressbar")).toHaveAttribute(
-        "aria-valuenow",
-        "25",
-      ),
+    await settleUntil(
+      () =>
+        screen.queryByRole("progressbar")?.getAttribute("aria-valuenow") === "25",
+      "aria-valuenow=25",
     );
+    expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "25");
   });
 
+  // ANCHORED ON THE POLLS, NOT ON A WALL CLOCK — IN BOTH DIRECTIONS.
+  //
+  // First failure (pipeline 21384): the recovery half waited for the banner to
+  // CLEAR with `waitFor`, whose 1 s budget is real time, and real time on a CI
+  // runner is not the test's to spend. That host carried three other jobs
+  // (every phase 2-3x the green runs -- environment 140 s vs 47 s), the worker
+  // was descheduled for seconds, and the budget expired while the successful
+  // poll was still sitting in the timer queue. Anchoring on the poll and
+  // yielding with `settle()` fixed that half, and it has held.
+  //
+  // Second failure: the ARRIVAL half, on a 503 that the fixture served to
+  // exactly ONE poll. That made the banner true for exactly one poll interval
+  // — 5 ms here — and put the assertion in a race against the modal's own
+  // recovery. Measured: a deschedule of 5 ms or more between the failing poll
+  // scheduling its retry and the timer phase running is enough for the
+  // RECOVERY poll to fire inside the same `settle()`, so the banner arrives
+  // and is wiped before the assertion ever reads it. That is a 5 ms
+  // wall-clock deadline hidden in the fixture — two orders of magnitude
+  // tighter than the 1 s budget the first fix removed, and hardening the wait
+  // could not have fixed it: waiting LONGER makes it strictly more likely.
+  //
+  // So the failure is LATCHED. The stub keeps refusing until the test has
+  // finished looking at the banner, and only then recovers. Neither state can
+  // now expire under the test's feet, so no amount of scheduling delay can
+  // turn "not yet" into "never" or "already gone".
+  //
+  // Which poll fails is a flag rather than an ordinal, too: the old
+  // `polls === 2` silently assumed the mount-time adopt probe was poll 1, so
+  // any change to how the modal opens would have moved the 503 onto a poll
+  // this test was not talking about.
   it("keeps polling through a transient poll failure rather than declaring failure", async () => {
-    let polls = 0;
+    let failing = false;
+    let failedPolls = 0;
+    let okPollsSinceFailure = 0;
+
     installFetchStub((url, init) => {
       if (url.endsWith("/capabilities")) {
-        polls += 1;
         // The warden restarts the engine after a crash; the API can blip.
-        if (polls === 2) return json({ detail: "backend restarting" }, 503);
+        if (failing) {
+          failedPolls += 1;
+          return json({ detail: "backend restarting" }, 503);
+        }
+        if (failedPolls > 0) okPollsSinceFailure += 1;
         return json({ runs: [{ id: "r-1", status: "running", observations: [] }] });
       }
       if (url === "/api/models/m-1/stress" && init?.method === "POST") {
@@ -311,15 +450,35 @@ describe("StressTestModal — running phase", () => {
     renderModal();
     fireEvent.click(screen.getByTestId("stress-acknowledge"));
     fireEvent.click(screen.getByTestId("stress-start"));
+    await settleUntil(present("stress-running"), "the running phase");
 
-    await waitFor(() =>
-      expect(screen.getByTestId("stress-poll-error")).toBeInTheDocument(),
-    );
-    // Still running, and the notice clears once the next poll succeeds.
+    // ARRIVAL. Monotone while the latch is closed: nothing but a successful
+    // poll clears `pollError`, and no poll can succeed until the test says so.
+    failing = true;
+    await settleUntil(present("stress-poll-error"), "the poll-error banner");
+    expect(screen.getByTestId("stress-poll-error")).toBeInTheDocument();
+    // Still running — a poll that could not be answered is not a run that
+    // failed, which is the actual claim of this test.
     expect(screen.getByTestId("stress-running")).toBeInTheDocument();
-    await waitFor(() =>
-      expect(screen.queryByTestId("stress-poll-error")).not.toBeInTheDocument(),
+
+    // KEEPS POLLING. The old fixture could not assert this at all: it served
+    // one 503 and then recovered, so "it tried again" and "it gave up" looked
+    // identical. A failing poll count only grows, so this is monotone too.
+    await settleUntil(() => failedPolls >= 3, "three failing polls");
+    expect(screen.getByTestId("stress-running")).toBeInTheDocument();
+    expect(screen.queryByTestId("stress-failed")).not.toBeInTheDocument();
+    expect(screen.getByTestId("stress-poll-error")).toBeInTheDocument();
+
+    // RECOVERY. Monotone in the other direction once the latch opens: every
+    // poll from here on succeeds, so `pollError` goes null and stays null.
+    failing = false;
+    await settleUntil(() => okPollsSinceFailure > 0, "a poll to succeed again");
+    await settleUntil(
+      () => screen.queryByTestId("stress-poll-error") === null,
+      "the poll-error banner to clear",
     );
+    expect(screen.queryByTestId("stress-poll-error")).not.toBeInTheDocument();
+    expect(screen.getByTestId("stress-running")).toBeInTheDocument();
   });
 
   it("adopts a run that is already in flight instead of offering to start another", async () => {
@@ -332,9 +491,7 @@ describe("StressTestModal — running phase", () => {
       throw new Error(`Unmocked: ${url}`);
     });
     renderModal();
-    await waitFor(() =>
-      expect(screen.getByTestId("stress-running")).toBeInTheDocument(),
-    );
+    await settleUntil(present("stress-running"), "the adopted running phase");
     expect(screen.queryByTestId("stress-start")).not.toBeInTheDocument();
   });
 });
@@ -385,12 +542,11 @@ describe("StressTestModal — done phase", () => {
     });
     renderModal();
     // Through the real flow: start, then let the first poll observe a run row
-    // that is no longer `running`.
+    // that is no longer `running`. `done` is terminal — the poll loop stops
+    // rescheduling once it sees a non-running status — so this is monotone.
     fireEvent.click(screen.getByTestId("stress-acknowledge"));
     fireEvent.click(screen.getByTestId("stress-start"));
-    await waitFor(() =>
-      expect(screen.getByTestId("stress-done")).toBeInTheDocument(),
-    );
+    await settleUntil(present("stress-done"), "the done phase");
   }
 
   it("leads with the setting to apply, and says the config is not the live one", async () => {
@@ -458,9 +614,9 @@ describe("StressTestModal — failure phase", () => {
     renderModal();
     fireEvent.click(screen.getByTestId("stress-acknowledge"));
     fireEvent.click(screen.getByTestId("stress-start"));
-    await waitFor(() =>
-      expect(screen.getByTestId("stress-failed")).toBeInTheDocument(),
-    );
+    // Terminal, like `done`: the poll loop stops once the status is not
+    // `running`.
+    await settleUntil(present("stress-failed"), "the failed phase");
   }
 
   it("names a non-monotone verdict as unsound, not as a limit", async () => {
@@ -553,9 +709,7 @@ describe("StressTestModal — close", () => {
     const { rerender } = render(modal(true));
     fireEvent.click(screen.getByTestId("stress-acknowledge"));
     fireEvent.click(screen.getByTestId("stress-start"));
-    await waitFor(() =>
-      expect(screen.getByTestId("stress-done")).toBeInTheDocument(),
-    );
+    await settleUntil(present("stress-done"), "the done phase");
 
     // Scoped to the result body: the Modal chrome has its own "Close".
     fireEvent.click(
@@ -567,9 +721,14 @@ describe("StressTestModal — close", () => {
     rerender(modal(true));
     // A finished run is not adopted on reopen — only a running one is — so the
     // operator lands back on the confirm screen with the box unticked.
-    await waitFor(() =>
-      expect(screen.getByTestId("stress-acknowledge")).toBeInTheDocument(),
-    );
+    //
+    // The reopen fires a fresh adopt probe, and the confirm screen is on
+    // screen BEFORE that probe answers. Asserting immediately would therefore
+    // pass even if adoption were broken and about to replace it, so drain the
+    // probe first and assert on the state that survives it.
+    await settleUntil(present("stress-acknowledge"), "the confirm screen");
+    await settle();
+    expect(screen.getByTestId("stress-acknowledge")).toBeInTheDocument();
     expect(screen.getByTestId("stress-acknowledge")).not.toBeChecked();
   });
 });

@@ -604,6 +604,22 @@ write_override() {
     echo "      VW_HEADER_METRICS_INTERVAL_S: \"\${VW_HEADER_METRICS_INTERVAL_S:-2.0}\""
     echo "      VW_REQUEST_MAX_WALL_S: \"\${VW_REQUEST_MAX_WALL_S:-0.0}\""
     echo "      VW_GODMODE_ENABLED: \"\${VW_GODMODE_ENABLED:-false}\""
+    # Content logging + the runaway detector that reports through it. Off by
+    # default, and forwarded here only so that setting them in .env actually
+    # reaches the container -- Compose passes nothing to a service that does
+    # not name it, so without these lines the knobs .env.example documents
+    # would silently do nothing.
+    echo "      VW_CONTENT_LOG_ENABLED: \"\${VW_CONTENT_LOG_ENABLED:-false}\""
+    echo "      VW_CONTENT_LOG_TOKENS: \"\${VW_CONTENT_LOG_TOKENS:-}\""
+    # Deliberately NO literal default: blank means "derive from VW_DATA_DIR"
+    # (<VW_DATA_DIR>/logs/content.jsonl). Pinned to /data/logs/content.jsonl
+    # it escaped a moved VW_DATA_DIR onto the container's writable layer.
+    echo "      VW_CONTENT_LOG_PATH: \"\${VW_CONTENT_LOG_PATH:-}\""
+    echo "      VW_CONTENT_LOG_MAX_CHARS: \"\${VW_CONTENT_LOG_MAX_CHARS:-40000}\""
+    # File-size ceiling, 512 MiB. On reaching it the logger STOPS and warns
+    # once; it does not rotate and does not delete.
+    echo "      VW_CONTENT_LOG_MAX_BYTES: \"\${VW_CONTENT_LOG_MAX_BYTES:-536870912}\""
+    echo "      VW_RUNAWAY_MODE: \"\${VW_RUNAWAY_MODE:-off}\""
     echo "      HF_HUB_OFFLINE: \"\${HF_HUB_OFFLINE:-0}\""
     case "$GPU_MODE" in
       none) echo "      NVIDIA_VISIBLE_DEVICES: \"none\"" ;;

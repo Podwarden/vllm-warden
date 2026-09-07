@@ -1,6 +1,9 @@
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
+
+log = logging.getLogger("vllm_warden.config")
 
 _TRUTHY = {"1", "true", "yes", "on"}
 
@@ -86,13 +89,29 @@ class Settings:
     # without it. Hard-scoped to an explicit token allowlist so this can run on
     # a shared server without ever logging all traffic: a request is logged
     # only when content_log_enabled is True AND its token id is in
-    # content_log_tokens. The prompt/completion fields are capped at
-    # content_log_max_chars so the file can't grow unbounded on very long
-    # generations.
+    # content_log_tokens.
+    #
+    # Two independent caps, and NEITHER has a value meaning "unlimited":
+    #   content_log_max_chars bounds one RECORD (prompt and completion
+    #     separately). A negative value is clamped to 0 by load_settings and
+    #     again in content_log._cap -- it is not an escape hatch.
+    #   content_log_max_bytes bounds the FILE. On reaching it the sink STOPS
+    #     writing and warns once; it does not rotate and does not delete. The
+    #     Hub template pins vllm-warden-data at 10 GiB shared with the SQLite
+    #     database, so 512 MiB leaves the database an order of magnitude of
+    #     headroom while still holding roughly 6,000 records at the 80 KB an
+    #     80,000-char record costs. <= 0 switches the cap off, matching
+    #     engine_log_max_bytes above.
+    #
+    # content_log_path defaults to <data_dir>/logs/content.jsonl -- see
+    # load_settings. It MUST follow data_dir: pinned to a literal /data it
+    # escaped a moved VW_DATA_DIR onto the container's writable layer, filling
+    # the node's disk instead of the PVC and vanishing on restart.
     content_log_enabled: bool = False
     content_log_tokens: frozenset[str] = frozenset()
     content_log_path: Path = Path("/data/logs/content.jsonl")
     content_log_max_chars: int = 40000
+    content_log_max_bytes: int = 512 * 1024 * 1024
     # Runaway-generation detector (app/proxy/runaway.py) — see
     # docs/superpowers/specs/2026-07-21-runaway-detector-design.md. Off by
     # default: when runaway_mode == "off" the proxy forward path is
@@ -257,10 +276,43 @@ def load_settings() -> Settings:
         for t in os.environ.get("VW_CONTENT_LOG_TOKENS", "").split(",")
         if t.strip()
     )
-    content_log_path = Path(
-        os.environ.get("VW_CONTENT_LOG_PATH", "/data/logs/content.jsonl")
+    # Defaults UNDER data_dir rather than to a literal /data/logs. VW_DATA_DIR
+    # is a knob the PodWarden Hub template exposes and interpolates; with the
+    # literal, moving it left the content log writing to /data/logs -- no
+    # longer the mounted volume, so records landed on the container's writable
+    # layer, filled the NODE's disk instead of the PVC, and vanished on
+    # restart. Silent on all three counts. An explicit VW_CONTENT_LOG_PATH
+    # still wins: pointing it at another volume is a legitimate choice.
+    # Blank counts as unset -- the Hub compose renders "${VW_CONTENT_LOG_PATH:-}"
+    # and an empty value would otherwise become Path("") == Path("."), the
+    # process CWD.
+    _content_log_path_raw = os.environ.get("VW_CONTENT_LOG_PATH", "").strip()
+    content_log_path = (
+        Path(_content_log_path_raw)
+        if _content_log_path_raw
+        else data_dir / "logs" / "content.jsonl"
     )
+    # A character count has no negative reading. `-1` used to disable the cap
+    # entirely -- an undocumented escape hatch, and the value an operator
+    # naturally reaches for because VW_REQUEST_MAX_WALL_S=0 does mean "no cap".
+    # Clamped to 0 (capture nothing) and said out loud: fail-safe beats
+    # unbounded records on the volume that also holds the database.
     content_log_max_chars = int(os.environ.get("VW_CONTENT_LOG_MAX_CHARS", "40000"))
+    if content_log_max_chars < 0:
+        log.warning(
+            "VW_CONTENT_LOG_MAX_CHARS=%d is negative; there is no value that "
+            "means unlimited. Clamped to 0 (records keep their metadata and "
+            "capture no prompt or completion text). Raise the number to "
+            "capture more.",
+            content_log_max_chars,
+        )
+        content_log_max_chars = 0
+    # Bounds the FILE, not a record. Fail-safe: the sink stops writing and
+    # warns once on reaching this -- no rotation, no deletion. Same shape and
+    # same <= 0 = off convention as VW_ENGINE_LOG_MAX_BYTES.
+    content_log_max_bytes = int(
+        os.environ.get("VW_CONTENT_LOG_MAX_BYTES", str(512 * 1024 * 1024))
+    )
     # Unknown / typo'd modes fall back to "off" so the forward path stays
     # byte-identical rather than silently arming enforcement on shared prod.
     runaway_mode = os.environ.get("VW_RUNAWAY_MODE", "off").strip().lower()
@@ -311,6 +363,7 @@ def load_settings() -> Settings:
         content_log_tokens=content_log_tokens,
         content_log_path=content_log_path,
         content_log_max_chars=content_log_max_chars,
+        content_log_max_bytes=content_log_max_bytes,
         runaway_mode=runaway_mode,
         runaway_think_budget=runaway_think_budget,
         runaway_repeat_max=runaway_repeat_max,

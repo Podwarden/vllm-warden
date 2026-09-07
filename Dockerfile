@@ -44,8 +44,103 @@ ARG VW_BASE_DIGEST=sha256:ffb2d59b1c059a5bd8d781320c9f5189de8293693b7d95da54befd
 # upstream's own CMake on an upstream tag.
 ARG LLAMACPP_BUILD=b10731
 
+# CUDA architectures llama.cpp is compiled for. The default is EVERY
+# architecture this image's toolchain can target. Not asserted -- measured:
+# `nvcc --list-gpu-arch` inside vllm/vllm-openai@${VW_BASE_DIGEST} (CUDA 13.0,
+# V13.0.88) answers exactly
+#   compute_75 80 86 87 88 89 90 100 103 110 120 121
+# and that list is the hard ceiling. CUDA 13 dropped Maxwell, Pascal and
+# Volta, so 75 (Turing) is the floor and there is nothing below it to add.
+#
+# This was "75-real;86-real" until 2026-09-06 -- exactly the two cards on the
+# machine it was developed on (Quadro RTX 5000, RTX A4000). That is a fine
+# choice for a LOCAL build and the wrong one for a PUBLISHED image: -real emits
+# native SASS and nothing else, so on an Ada (RTX 40xx, L4, L40S), Hopper
+# (H100) or Blackwell (RTX 50xx, B200) card the llama.cpp backend did not run
+# slowly, it was ABSENT -- the product's second engine simply missing on
+# hardware it should be good at. The published image has to work wherever the
+# toolchain allows; narrowing is the local builder's call, so it is an ARG:
+#
+#   docker compose build --build-arg LLAMACPP_CUDA_ARCHS="86-real" api
+#
+# That is not a rounding error. Measured on 32 threads, this one step: 158 s
+# for "86-real", 240 s for the old "75-real;86-real", 1069 s for the default
+# below. The cost is linear -- about 77 s of fixed C++/link work plus ~81 s per
+# architecture -- so anyone compiling for one known card should pass the arg and
+# come out FASTER than the old two-card default. README.md and INSTALL.md carry
+# the full table and the 4-core figures.
+#
+# THE -virtual ENTRY IS NOT DECORATION. -real is native SASS for one
+# architecture; -virtual embeds PTX, which the driver JIT-compiles for any
+# newer one. It is the difference between "a card nobody here has heard of is
+# slow for a few seconds on first load" and "a card nobody here has heard of
+# does not work at all". Without it, the day NVIDIA ships compute capability
+# 13, this backend is gone on it and the fix is a rebuild.
+#
+# It is 90-virtual and NOT 121-virtual -- the numerically highest -- and that
+# was settled by running cmake, not by reading the number:
+#   * ggml/src/ggml-cuda/CMakeLists.txt rewrites any plain 12X to 12Xa
+#     (observed: "Replacing 121-virtual in CMAKE_CUDA_ARCHITECTURES with
+#     121a-virtual") because Blackwell's FP4 tensor-core instructions are not
+#     forwards compatible. An -a PTX blob JITs for that one architecture and
+#     nothing else, so 121-virtual would buy zero future coverage while looking
+#     like it bought all of it.
+#   * compute capability stopped being a linear feature ladder at Blackwell --
+#     sm_120 is consumer Blackwell and does not have sm_100's tcgen05 -- so PTX
+#     emitted above 9.0 is not a safe universal JIT source either.
+# 90 is the highest architecture-generic PTX the toolchain still offers, and is
+# the same fallback upstream llama.cpp ships in its own default list. Nothing
+# at or below 121 needs it -- all of that is covered by -real above -- so the
+# PTX only ever has to serve hardware that does not exist yet, which is
+# precisely the case where "generic" beats "newest".
+#
+# 87, 88 and 110 are Jetson/Thor SoC parts that cannot appear under this
+# x86_64-only image, and they are kept anyway with the cost stated so the next
+# person can drop them knowingly: about 4 minutes of the compile on 32 threads
+# and ~50 MB. The rule "everything nvcc accepts" is one a base-image bump
+# maintains for free; a hand-curated list of what we think exists is one that
+# silently rots, which is how this ARG came to say "75;86" in the first place.
+#
+# 120 and 121 are written plain and become 120a/121a through the rewrite above
+# -- deliberately; that is upstream's FP4 policy, and writing them plain keeps
+# us on that policy if upstream changes it.
+ARG LLAMACPP_CUDA_ARCHS="75-real;80-real;86-real;87-real;88-real;89-real;90-real;100-real;103-real;110-real;120-real;121-real;90-virtual"
+
+# HOW WIDE the compile runs is a different question from how many architectures
+# it emits, and widening the list above is what stopped `nproc` being a safe
+# answer to it. Every .cu is now 13 device compilations instead of 2, so each
+# -j lane holds a cicc/cudafe++/ptxas child roughly 6.5x longer: where the
+# two-architecture build's lanes were briefly heavy and then idle, all of them
+# are heavy essentially all of the time. Core count alone stopped describing
+# the peak, so -j has to answer to memory as well.
+#
+# Not a hypothesis -- this is the kernel's own OOM report from the first CI run
+# that ever attempted the full list (job 244537, 14% in). On a 12-core, 3.7 GiB
+# shared runner `-j$(nproc)` put 12 nvcc lanes in flight whose children held
+# 1921 MB resident plus 797 MB swapped, and the kernel killed buildkitd rather
+# than any compiler, taking the whole build down with it. Largest single lane:
+# one cicc at 514 MB.
+#
+# Hence one lane per 512 MiB of build memory, capped by nproc. 512 MiB is that
+# measured worst lane rounded down, not a guess at a number small enough to be
+# safe -- and being a per-lane BUDGET rather than a ceiling it is inert on any
+# machine actually built for this work: the memory term does not bind until a
+# host has less than 512 MiB per core, so the 16C/32T box the architecture list
+# was measured on still gets all 32 lanes as long as it has 16 GiB. Only a host
+# that genuinely cannot hold the build is slowed down, and slowed is the point
+# -- it used to be killed.
+#
+# The budget follows a cgroup memory limit when there is one, so capping the
+# builder (`docker buildx create --driver-opt memory=...`) narrows -j to match
+# instead of fighting it. Override both terms if you know better:
+#
+#   docker compose build --build-arg LLAMACPP_BUILD_JOBS=8 api
+ARG LLAMACPP_BUILD_JOBS=""
+
 FROM vllm/vllm-openai@${VW_BASE_DIGEST} AS llamacpp-build
 ARG LLAMACPP_BUILD
+ARG LLAMACPP_CUDA_ARCHS
+ARG LLAMACPP_BUILD_JOBS
 # nvcc, the CUDA headers, libcublas-dev, build-essential and g++ are ALREADY in
 # this image: vLLM's own Dockerfile re-adds the CUDA development toolchain to
 # its vllm-base stage for runtime JIT (FlashInfer, DeepGEMM) and it survives
@@ -57,12 +152,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # a wrong version into --version and into every log line.
 RUN git clone https://github.com/ggml-org/llama.cpp /src && \
     git -C /src checkout ${LLAMACPP_BUILD}
-# -DCMAKE_CUDA_ARCHITECTURES="75-real;86-real": exactly the two cards this
-#   deployment has -- Quadro RTX 5000 (sm_75, Turing) and RTX A4000 (sm_86,
-#   Ampere) -- as native SASS. Upstream's default would compile seven
-#   architectures and emit sm_75 as PTX only, which costs a multi-second JIT on
-#   first load and needs a writable ~/.nv cache. CUDA 13 still supports Turing;
-#   it dropped Maxwell, Pascal and Volta.
+# -DCMAKE_CUDA_ARCHITECTURES="${LLAMACPP_CUDA_ARCHS}": every architecture this
+#   image's nvcc can target, plus one PTX entry for the ones it cannot yet.
+#   The full reasoning, the measured cost and how to narrow it for a local
+#   build are on the ARG declaration near the top of this file -- read that
+#   before changing this line.
 # -DCMAKE_INSTALL_RPATH='$ORIGIN:/opt/llamacpp' + BUILD_WITH_INSTALL_RPATH: the
 #   binary finds its own .so files with no env var and from any working
 #   directory. Upstream's published images instead rely on a build-tree RUNPATH
@@ -82,15 +176,35 @@ RUN git clone https://github.com/ggml-org/llama.cpp /src && \
 #   which is incompatible with the dlopen'd backends, and libcublas_static.a
 #   alone is 119 MB. Dynamic costs zero extra bytes here because this image
 #   already ships libcudart.so.13, libcublas.so.13 and libcublasLt.so.13.
-RUN cmake -S /src -B /build \
+# -j is computed, not $(nproc) -- see the LLAMACPP_BUILD_JOBS block above for
+#   why, and for where the 512 MiB per lane comes from. The echo is deliberate:
+#   when this step is slow the first question is always "how parallel was it",
+#   and the answer should be in the build log rather than inferred afterwards.
+RUN set -e; \
+    mem_mb="$(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo)"; \
+    if [ -r /sys/fs/cgroup/memory.max ]; then \
+      lim="$(cat /sys/fs/cgroup/memory.max)"; \
+      if [ "$lim" != max ]; then \
+        lim_mb=$((lim / 1048576)); \
+        if [ "$lim_mb" -lt "$mem_mb" ]; then mem_mb="$lim_mb"; fi; \
+      fi; \
+    fi; \
+    jobs="${LLAMACPP_BUILD_JOBS}"; \
+    if [ -z "$jobs" ]; then \
+      jobs=$((mem_mb / 512)); \
+      if [ "$jobs" -gt "$(nproc)" ]; then jobs="$(nproc)"; fi; \
+      if [ "$jobs" -lt 1 ]; then jobs=1; fi; \
+    fi; \
+    echo "llama.cpp: -j${jobs} (${mem_mb} MiB build memory, $(nproc) cores) for ${LLAMACPP_CUDA_ARCHS}"; \
+    cmake -S /src -B /build \
       -DCMAKE_BUILD_TYPE=Release \
       -DGGML_NATIVE=OFF -DGGML_CUDA=ON -DGGML_BACKEND_DL=ON \
-      -DCMAKE_CUDA_ARCHITECTURES="75-real;86-real" \
+      -DCMAKE_CUDA_ARCHITECTURES="${LLAMACPP_CUDA_ARCHS}" \
       -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
       -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON \
       -DCMAKE_INSTALL_RPATH='$ORIGIN:/opt/llamacpp' \
-      -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON && \
-    cmake --build /build -j"$(nproc)" --target llama-server
+      -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON; \
+    cmake --build /build -j"${jobs}" --target llama-server
 # Collect exactly what llama-server needs into one flat directory. The other
 # *-impl.so files are for llama-cli, llama-bench and friends, which this product
 # never launches. The ldd runs from / on purpose -- that is the condition a

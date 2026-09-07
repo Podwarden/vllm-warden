@@ -12,7 +12,7 @@ There are two routes, and you should pick one before you start:
 |---|---|---|
 | What you download | ~9.3 GB of image layers | a ~9 GB CUDA base image, then source from GitHub, PyPI and npm |
 | What you compile | nothing | llama.cpp against CUDA, `@podwarden/chat-ui`, the Next.js UI |
-| Time to a running stack | the image pull, then seconds | 5 minutes on 32 cores; 20–40 minutes on 4–8 |
+| Time to a running stack | the image pull, then seconds | ~19 minutes on 32 threads; 1–3 hours on 4–8 cores — or ~5 minutes if you narrow the CUDA architectures to your own card ([B2](#b2-build-and-how-long-it-really-takes)) |
 | Disk | ~40 GB | ~40 GB, plus a BuildKit cache that reached 39 GB here |
 | Choose it if | you want to run the software | you want the binaries to be ones you built, or you need to change the CUDA architectures, the llama.cpp pin, or the chat-ui pin |
 
@@ -712,8 +712,11 @@ end    07:28:25 PM UTC
 EXIT=0
 ```
 
-**5 minutes 09 seconds, exit 0, both images built** — on 32 threads. Where it
-went:
+**5 minutes 09 seconds, exit 0, both images built** — on 32 threads, against
+the tree as it stood on 2026-09-06, when the llama.cpp compile still targeted
+two CUDA architectures. **That default has since widened to all thirteen and
+this number no longer applies — see [the table below](#the-cuda-architecture-list-is-now-the-build-argument-that-decides-this).**
+Where it went at the time:
 
 ```
    240.7s  [api llamacpp-build] cmake … -DCMAKE_CUDA_ARCHITECTURES="75-real;86-real" … --target llama-server
@@ -732,7 +735,44 @@ went:
 ```
 
 **The llama.cpp CUDA compile plus its clone is 284 s of the 309 — 92% of the
-build.** It ran `-j32`.
+build.** It ran `-j32`. That share is the durable finding; the absolute number
+is not.
+
+### The CUDA architecture list is now the build argument that decides this
+
+The compile step was re-measured on the same host (Ryzen 9 5950X, 16C/32T,
+`-j32`) across three architecture lists. Only `-DCMAKE_CUDA_ARCHITECTURES`
+changed; the apt and clone layers were cache hits, so these are the compile and
+nothing else:
+
+| `--build-arg LLAMACPP_CUDA_ARCHS=` | compile step | `/opt/llamacpp` | api image |
+| --- | --- | --- | --- |
+| `86-real` — one card | **158.3 s** | 67.7 MB | — |
+| `75-real;86-real` — the old default | **239.6 s** | 85.3 MB | 28.9 GB |
+| the current default, 12 `-real` + `90-virtual` | **1068.5 s** | 284.9 MB | 29.3 GB |
+
+The cost is linear: about 77 s of fixed C++/link work plus **81 s per
+architecture** at `-j32`. Scale by your own core count — but not past your RAM.
+Thirteen device compilations per `.cu` keep every parallel lane busy at once, so
+`-j` is capped at one lane per 512 MiB of build memory (a 4 GiB machine builds
+7-wide however many cores it has); on a memory-poor host an unbounded `-j` gets
+the *builder* OOM-killed rather than merely swapping. Override the calculation
+with `--build-arg LLAMACPP_BUILD_JOBS=N`.
+
+So a cold `docker compose build --no-cache` on that same 32-thread host is now
+**about 19 minutes** rather than 5, and on 4–8 cores the llama.cpp step alone
+is **1–3 hours**. Read that before you start it, not forty minutes in.
+
+**And this is the way out, which is why it is an argument and not a line to
+edit:**
+
+```bash
+docker compose build --build-arg LLAMACPP_CUDA_ARCHS="86-real" api
+```
+
+One architecture is *faster than this repo has ever been* — 158 s against the
+old default's 240 s. Find your card's number with
+`nvidia-smi --query-gpu=compute_cap --format=csv` and drop the dot: 8.6 → `86`.
 
 ### Do not quote 5 minutes as your number
 
@@ -746,18 +786,32 @@ Two things were warm on that host and will not be on yours:
    took 2.2 s and the two `npm ci` steps 17 s each. On a virgin host, add roughly
    1–3 minutes.
 
-So a genuinely virgin 32-core host should expect **6–8 minutes of build plus the
-base-image download**. A 4–8 core host should expect the llama.cpp step alone to
-take **15–40 minutes**, because that step is core-count bound and not
-download-bound. This is the number that varies most between machines.
+So a genuinely virgin 32-core host should expect **20–22 minutes of build plus
+the base-image download** at the current default, and a 4–8 core host should
+expect the llama.cpp step alone to run for **1–3 hours**, because that step is
+core-count bound and not download-bound. This is the number that varies most
+between machines — and the one the `LLAMACPP_CUDA_ARCHS` argument above exists
+to cut.
 
-### If your cards are not Turing or Ampere, change one line first
+### Which cards the shipped build covers
 
-`Dockerfile` pins `-DCMAKE_CUDA_ARCHITECTURES="75-real;86-real"` — Turing and
-Ampere, as native SASS with no PTX fallback. If your cards are anything else,
-edit that line before building, or the llama.cpp in your image has no kernels for
-them. vLLM is unaffected; it comes from upstream's image with upstream's
-architecture support.
+The floor is **Turing (sm_75)**. The base image is CUDA 13, which dropped
+Maxwell, Pascal and Volta — a GTX 1080 Ti, a Titan X or a V100 cannot be
+targeted at all, by this build or any rebuild of it. `nvcc --list-gpu-arch`
+inside the pinned base answers, verbatim:
+
+```
+compute_75 compute_80 compute_86 compute_87 compute_88 compute_89
+compute_90 compute_100 compute_110 compute_103 compute_120 compute_121
+```
+
+The default `LLAMACPP_CUDA_ARCHS` targets all twelve as `-real` native SASS —
+Turing, Ampere, Ada, Hopper and both Blackwell lines — plus one `90-virtual`
+PTX entry so a card newer than the release JIT-compiles on first load rather
+than finding no backend. You should not need to change it to make your card
+work; you may want to change it to make your build shorter. vLLM is unaffected
+either way; it comes from upstream's image with upstream's architecture
+support.
 
 ### The images are tagged with a registry name you cannot pull from
 

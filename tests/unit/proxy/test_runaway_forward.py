@@ -12,6 +12,7 @@ on the forward path's observable behaviour under each ``VW_RUNAWAY_MODE``:
   (never a 500); a streaming client that trips gets a terminal runaway chunk.
 """
 
+import asyncio
 import dataclasses
 import json
 import sqlite3
@@ -38,7 +39,9 @@ def test_write_entry_merges_extra_fields(tmp_path):
         content_log_path=tmp_path / "c.jsonl",
         content_log_max_chars=40000,
     )
-    content_log.write_entry(
+    # write_entry is a coroutine since the write moved off the event loop; a
+    # bare call would build a coroutine object and write nothing.
+    asyncio.run(content_log.write_entry(
         settings,
         token_id="tok1",
         model_id="qwen",
@@ -51,7 +54,7 @@ def test_write_entry_merges_extra_fields(tmp_path):
         prompt="p",
         completion="c",
         extra={"think_tokens": 88, "signal": "runaway_think"},
-    )
+    ))
     rec = json.loads((tmp_path / "c.jsonl").read_text().splitlines()[0])
     assert rec["think_tokens"] == 88
     assert rec["signal"] == "runaway_think"
