@@ -263,6 +263,7 @@ export function throttleVerdict(
   if (!throttle) return null;
   const reasons: string[] = [];
   let fault = false;
+  const idle = throttle.idle === true;
   if (throttle.hw_thermal) {
     reasons.push("HW thermal slowdown");
     fault = true;
@@ -272,7 +273,14 @@ export function throttleVerdict(
   if (throttle.hw_power_brake) {
     reasons.push("HW power brake");
     fault = true;
-  } else if (throttle.sw_power_cap) {
+  } else if (throttle.sw_power_cap && !idle) {
+    // NVML raises sw_power_cap whenever the driver is holding clocks below
+    // maximum -- including when the only reason is that there is no work to
+    // do. It says so with a dedicated GpuIdle bit, which the backend already
+    // parses. Without this guard a perfectly healthy idle card reads as
+    // "Power cap - clock held at 6%", where the 6% is nothing but the idle
+    // clock over the maximum. A soft power cap is a claim about a card under
+    // load; the hardware faults above and below are reported either way.
     reasons.push("Power cap");
   }
   // The generic HW slowdown bit is set alongside its thermal / power-brake
@@ -286,10 +294,12 @@ export function throttleVerdict(
     sm_clock_mhz !== null && sm_clock_max_mhz !== null && sm_clock_max_mhz > 0
       ? Math.round((sm_clock_mhz / sm_clock_max_mhz) * 100)
       : null;
+  // "held at N%" implied something was capping the clock; the number is only
+  // ever sm_clock/sm_clock_max, so state it as the ratio it is.
   const text =
     heldPct === null
       ? reasons.join(" + ")
-      : `${reasons.join(" + ")} — clock held at ${heldPct}%`;
+      : `${reasons.join(" + ")} — clock at ${heldPct}% of max`;
   return { reasons, text, severity: fault ? "fault" : "warn", heldPct };
 }
 

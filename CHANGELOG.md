@@ -7,6 +7,35 @@ release ships.
 
 ## [Unreleased]
 
+## [v2026.09.10.1] — 2026-09-10
+
+### Fixed
+
+- **An idle GPU is no longer reported as throttled.** The stats panel showed
+  `Power cap — clock held at 6%` on healthy, idle cards. NVML raises
+  `sw_power_cap` whenever the driver holds clocks below maximum — including
+  when the only reason is that there is no work to do — and says so with a
+  dedicated `GpuIdle` bit that `app/system/gpu.py` already parsed into
+  `throttle.idle`. The verdict never read it. The percentage compounded the
+  error: it is only ever `sm_clock / sm_clock_max`, so an idle 180 MHz of 3090
+  rendered as "held at 6%" — a number that reads as severity while measuring
+  nothing but the idle clock. A soft power cap is now suppressed when the
+  driver reports the card idle, hardware faults (`hw_thermal`,
+  `hw_power_brake`, `hw_slowdown`) still surface either way, and the ratio is
+  worded as `clock at N% of max`.
+
+- **A model's GPU indices can no longer be edited to a set the host disallows.**
+  `PATCH /api/models/{id}/settings` was the one write path that skipped the
+  setup allowlist. Creation rejects an out-of-range index with a 400 and the
+  load runner with a 422, but `_derive_patchable_model_fields` makes new
+  `ModelRow` columns patchable by default, so `gpu_indices` became writable
+  with no value check and the handler wrote the list verbatim into SQLite. The
+  row then loaded nowhere, and the complaint —
+  `gpu_indices [0, 1, 2, 3] not subset of allowed [0, 1]` — arrived at load
+  time, far from the edit that caused it, on a page that shows no allowlist.
+  The check now mirrors creation's, with the same status and wording, and
+  additionally rejects a non-list, a non-integer element and an empty list.
+
 ## [v2026.09.07.3] — 2026-09-07
 
 ### Changed

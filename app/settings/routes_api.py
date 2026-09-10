@@ -44,6 +44,7 @@ from app.auth.deps import require_jwt
 from app.db.database import open_db
 from app.db.repos.models import ModelRepo, ModelRow
 from app.db.repos.settings import SettingsRepo
+from app.db.repos.setup import SetupRepo
 from app.system.hf import validate_hf_token
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
@@ -639,6 +640,38 @@ async def patch_model_settings(
                 status_code=409,
                 detail="model must be unloaded before editing settings",
             )
+
+        # Mirror the create-time and load-time allowlist checks. Without this
+        # the PATCH surface is the one write path that can persist a GPU index
+        # the host does not permit: `_derive_patchable_model_fields` made
+        # `gpu_indices` patchable by default, and the row below writes it
+        # verbatim. The row then loads nowhere -- the operator sees
+        # "gpu_indices [...] not subset of allowed [...]" at load time, far
+        # from the edit that caused it, on a page that offers no way to see
+        # the allowlist. Same 400 and same wording as POST /api/models so the
+        # frontend's existing handling applies unchanged.
+        if "gpu_indices" in body:
+            requested = body["gpu_indices"]
+            if not isinstance(requested, list) or not all(
+                isinstance(i, int) and not isinstance(i, bool) for i in requested
+            ):
+                raise HTTPException(
+                    status_code=400, detail="gpu_indices must be a list of integers"
+                )
+            if not requested:
+                raise HTTPException(
+                    status_code=400, detail="gpu_indices must name at least one GPU"
+                )
+            allowed = set((await SetupRepo(db).get()).draft.get("allowed_gpu_indices", []))
+            if not set(requested).issubset(allowed):
+                bad = sorted(set(requested) - allowed)
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"GPU indices {bad} not in allowed_gpu_indices "
+                        f"{sorted(allowed)}"
+                    ),
+                )
 
         # Build the SET clause from the allowlist intersected with the body.
         # Iterating over `_PATCHABLE_MODEL_FIELDS` (not `body.items()`) makes

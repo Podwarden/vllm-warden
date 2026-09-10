@@ -560,10 +560,10 @@ describe("SystemConfigSection", () => {
     });
     const cards = gpuCards();
     const banners = screen.getAllByTestId("system-gpu-throttle");
-    expect(banners[0].textContent).toContain("Thermal slowdown — clock held at 64%");
-    expect(banners[1].textContent).toContain("Thermal slowdown — clock held at 74%");
-    expect(banners[2].textContent).toContain("Thermal slowdown — clock held at 62%");
-    expect(banners[3].textContent).toContain("Thermal slowdown — clock held at 57%");
+    expect(banners[0].textContent).toContain("Thermal slowdown — clock at 64% of max");
+    expect(banners[1].textContent).toContain("Thermal slowdown — clock at 74% of max");
+    expect(banners[2].textContent).toContain("Thermal slowdown — clock at 62% of max");
+    expect(banners[3].textContent).toContain("Thermal slowdown — clock at 57% of max");
     // Shape, not colour: a role=status chip with a data-state, and the card
     // itself carries the state.
     expect(banners[0].getAttribute("role")).toBe("status");
@@ -605,14 +605,14 @@ describe("SystemConfigSection", () => {
     });
     const [capped, hw] = gpuCards();
     expect(within(capped).getByTestId("system-gpu-throttle").textContent).toContain(
-      "Power cap — clock held at 64%",
+      "Power cap — clock at 64% of max",
     );
     expect(capped.getAttribute("data-state")).toBe("warning");
     // HW thermal slowdown is the silicon protecting itself: a genuine
     // fault. It subsumes the generic HW slowdown bit and outranks the SW
     // thermal one, so it is the single thermal reason named.
     const hwBanner = within(hw).getByTestId("system-gpu-throttle");
-    expect(hwBanner.textContent).toContain("HW thermal slowdown — clock held at 74%");
+    expect(hwBanner.textContent).toContain("HW thermal slowdown — clock at 74% of max");
     expect(hwBanner.textContent).not.toContain("+");
     expect(hwBanner.getAttribute("data-state")).toBe("fault");
     expect(hw.getAttribute("data-state")).toBe("fault");
